@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sistema de Tareas Inteligente — Cómo funciona</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel-2:#1c2430; --border:#2b3440;
+    --text:#e6edf3; --muted:#8b98a5; --accent:#58a6ff;
+    --users:#3fb950; --tasks:#d29922;
+    --error:#f85149; --ok:#3fb950; --warn:#d29922; --purple:#bc8cff;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#f6f8fa; --panel:#ffffff; --panel-2:#f0f3f6; --border:#d5dbe2;
+      --text:#1f2328; --muted:#5b6570; --accent:#0969da;
+      --users:#1a7f37; --tasks:#9a6700; --purple:#8250df;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font:16px/1.7 -apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+  }
+  .wrap{max-width:1000px;margin:0 auto;padding:48px 24px 96px}
+  header{border-bottom:1px solid var(--border);padding-bottom:28px;margin-bottom:40px}
+  h1{font-size:2.1rem;line-height:1.2;margin:0 0 10px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:1.02rem;margin:0}
+  .tags{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+  .tag{font:600 11px/1 var(--mono);padding:6px 10px;border-radius:999px;
+       border:1px solid var(--border);color:var(--muted);background:var(--panel)}
+  .part{margin:64px 0 36px;padding:18px 22px;border-radius:12px;
+        background:var(--panel);border:1px solid var(--border);position:relative;overflow:hidden}
+  .part::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent)}
+  .part.p2::before{background:var(--purple)}
+  .part .pnum{font:700 11px/1 var(--mono);letter-spacing:.14em;color:var(--accent);text-transform:uppercase}
+  .part.p2 .pnum{color:var(--purple)}
+  .part h2{border:none;margin:8px 0 6px;padding:0;font-size:1.5rem}
+  .part p{margin:0;color:var(--muted);font-size:.93rem}
+  h2{font-size:1.4rem;margin:56px 0 16px;letter-spacing:-.01em;
+     padding-bottom:8px;border-bottom:1px solid var(--border)}
+  h3{font-size:1.05rem;margin:28px 0 10px;color:var(--accent)}
+  h4{font-size:.98rem;margin:22px 0 8px;color:var(--text)}
+  p{margin:12px 0}
+  code{font-family:var(--mono);font-size:.88em;background:var(--panel-2);
+       padding:2px 6px;border-radius:5px;border:1px solid var(--border)}
+  pre{background:var(--panel);border:1px solid var(--border);border-radius:10px;
+      padding:16px 18px;overflow-x:auto;margin:14px 0}
+  pre code{background:none;border:none;padding:0;font-size:.82rem;line-height:1.6}
+  .c-keyword{color:#ff7b72} .c-fn{color:#d2a8ff} .c-str{color:#a5d6ff}
+  .c-cmt{color:#7d8590;font-style:italic} .c-var{color:#ffa657} .c-num{color:#79c0ff}
+  .c-prop{color:#79c0ff} .c-cls{color:#ffa657}
+  @media (prefers-color-scheme: light){
+    .c-keyword{color:#cf222e} .c-fn{color:#8250df} .c-str{color:#0a3069}
+    .c-cmt{color:#6e7781} .c-var{color:#953800} .c-num{color:#0550ae}
+    .c-prop{color:#0550ae} .c-cls{color:#953800}
+  }
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:.92rem}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+  tbody tr:last-child td{border-bottom:none}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin:18px 0}
+  .note{border-left:3px solid var(--accent);background:var(--panel);
+        padding:14px 18px;border-radius:0 8px 8px 0;margin:18px 0;color:var(--muted)}
+  .note strong{color:var(--text)}
+  .note.future{border-left-color:var(--purple)}
+  .note.danger{border-left-color:var(--error)}
+  ol.steps{counter-reset:s;list-style:none;padding:0;margin:18px 0}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 16px 44px;margin:0}
+  ol.steps li::before{content:counter(s);position:absolute;left:0;top:1px;
+    width:26px;height:26px;border-radius:50%;background:var(--panel-2);border:1px solid var(--border);
+    color:var(--accent);font:600 13px/25px var(--mono);text-align:center}
+  ol.steps li::after{content:'';position:absolute;left:13px;top:30px;bottom:0;
+    width:1px;background:var(--border)}
+  ol.steps li:last-child{padding-bottom:0}
+  ol.steps li:last-child::after{display:none}
+  ol.road{counter-reset:r;list-style:none;padding:0;margin:18px 0}
+  ol.road li{counter-increment:r;position:relative;padding:14px 16px 14px 56px;margin:0 0 10px;
+    background:var(--panel);border:1px solid var(--border);border-radius:10px}
+  ol.road li::before{content:counter(r);position:absolute;left:16px;top:14px;
+    width:26px;height:26px;border-radius:50%;background:var(--purple);border:none;
+    color:#fff;font:700 13px/26px var(--mono);text-align:center}
+  ol.road li strong{display:block;margin-bottom:3px}
+  ol.road li span{color:var(--muted);font-size:.88rem}
+
+  /* ------- Diagrama ------- */
+  .diagram{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+           padding:34px 24px;margin:24px 0;overflow-x:auto}
+  .row{display:flex;align-items:center;justify-content:center;gap:0;min-width:700px}
+  .node{border:1.5px solid var(--border);border-radius:12px;padding:16px 18px;
+        background:var(--panel-2);text-align:center;min-width:190px}
+  .node .label{font:600 10px/1 var(--mono);letter-spacing:.1em;color:var(--muted);
+               text-transform:uppercase;margin-bottom:8px}
+  .node .name{font-weight:600;font-size:.98rem;margin-bottom:4px}
+  .node .meta{font:500 11px/1.5 var(--mono);color:var(--muted)}
+  .node.client{border-color:#4a5568}
+  .node.users{border-color:var(--users)}
+  .node.users .name{color:var(--users)}
+  .node.tasks{border-color:var(--tasks)}
+  .node.tasks .name{color:var(--tasks)}
+  .link{flex:1;min-width:74px;position:relative;text-align:center;padding:0 6px}
+  .link .bar{height:2px;background:var(--border);position:relative}
+  .link .cap{font:600 10px/1 var(--mono);color:var(--muted);padding:6px 0;
+             letter-spacing:.05em;white-space:nowrap}
+  .link .cap b{display:block;color:var(--text);font-size:11px;margin-bottom:2px}
+  .link.r .bar::after{content:'';position:absolute;right:-1px;top:-4px;
+    border-left:8px solid var(--border);border-top:5px solid transparent;border-bottom:5px solid transparent}
+  .link.l .bar::after{content:'';position:absolute;left:-1px;top:-4px;
+    border-right:8px solid var(--border);border-top:5px solid transparent;border-bottom:5px solid transparent}
+  .link .tag{font:600 10px/1 var(--mono);padding:4px 7px;border-radius:4px;
+             display:inline-block;margin-top:4px}
+  .tag.t200{background:rgba(63,185,80,.15);color:var(--ok)}
+  .tag.t404{background:rgba(248,81,73,.15);color:var(--error)}
+  .tag.t201{background:rgba(63,185,80,.15);color:var(--ok)}
+  .tag.t422{background:rgba(210,153,34,.15);color:var(--warn)}
+  .db{margin-top:12px;font:600 10px/1 var(--mono);letter-spacing:.06em;
+      color:var(--muted);text-transform:uppercase}
+  .legend{display:flex;gap:18px;justify-content:center;margin-top:22px;
+          font:500 11px/1 var(--mono);color:var(--muted);flex-wrap:wrap}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+
+  /* ------- Timeline de latencia ------- */
+  .lat{display:flex;align-items:center;gap:0;margin:18px 0;overflow-x:auto;padding:4px 0}
+  .lat .step{flex:1;min-width:96px;text-align:center;font:600 11px/1 var(--mono);color:var(--muted)}
+  .lat .bar{height:26px;border-radius:5px;background:var(--panel-2);border:1px solid var(--border)}
+  .lat .bar.sync{background:linear-gradient(90deg,var(--tasks),var(--tasks))}
+  .lat .total{min-width:130px;text-align:right;font:700 12px/1 var(--mono);color:var(--warn)}
+  .lat .total.fast{color:var(--ok)}
+
+  .status{font:600 12px/1 var(--mono);padding:3px 8px;border-radius:5px;white-space:nowrap}
+  .s200,.s201{background:rgba(63,185,80,.15);color:var(--ok)}
+  .s404,.s502,.s503{background:rgba(248,81,73,.15);color:var(--error)}
+  .s422{background:rgba(210,153,34,.15);color:var(--warn)}
+  .no{color:var(--error);font-weight:600} .yes{color:var(--ok);font-weight:600}
+  .win{color:var(--ok);font-weight:600} .lose{color:var(--error);font-weight:600}
+  .foot{margin-top:64px;padding-top:20px;border-top:1px solid var(--border);
+        color:var(--muted);font-size:.85rem;text-align:center}
+  .quote{border-left:3px solid var(--purple);background:var(--panel);color:var(--muted);
+         padding:14px 18px;border-radius:0 8px 8px 0;margin:16px 0;font-size:.92rem}
+  .quote cite{display:block;margin-top:8px;font-style:normal;color:var(--text);font-size:.85rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Sistema de Tareas Inteligente</h1>
+  <p class="sub">Comunicación síncrona por HTTP entre dos microservicios Laravel independientes — y hacia dónde va desde aquí.</p>
+  <div class="tags">
+    <span class="tag">Laravel 13</span>
+    <span class="tag">PHP 8.4</span>
+    <span class="tag">user-service :8000</span>
+    <span class="tag">task-service :8001</span>
+    <span class="tag">SQLite × 2</span>
+    <span class="tag">HTTP síncrono</span>
+    <span class="tag">Blade UI</span>
+  </div>
+</header>
+
+<div class="part">
+  <div class="pnum">Cómo leer este documento</div>
+  <p>Secciones <strong>1 a 11</strong>: lo que está <strong>implementado y verificado</strong> hoy.
+     Secciones <strong>12 a 21</strong>: <strong>qué sigue después</strong> — no está implementado,
+     es una hoja de ruta con el razonamiento detrás de cada decisión.</p>
+</div>
+
+<h2>1 · El principio: cada servicio es dueño de sus datos</h2>
+
+<div class="diagram">
+  <div class="row">
+    <div class="node client">
+      <div class="label">Cliente</div>
+      <div class="name">curl / Postman / UI</div>
+    </div>
+    <div class="link r">
+      <div class="cap"><b>POST /api/tasks</b>title + user_id</div>
+      <div class="bar"></div>
+      <span class="tag t201">201 · 422 · 503</span>
+    </div>
+    <div class="node tasks">
+      <div class="label">task-service</div>
+      <div class="name">:8001</div>
+      <div class="meta">NO tiene la tabla users</div>
+      <div class="db">db_tasks.sqlite</div>
+    </div>
+    <div class="link l">
+      <div class="cap"><b>GET /api/users/{id}</b>petición interna</div>
+      <div class="bar"></div>
+      <span class="tag t200">200 · 404</span>
+    </div>
+    <div class="node users">
+      <div class="label">user-service</div>
+      <div class="name">:8000</div>
+      <div class="meta">headless · sin UI</div>
+      <div class="db">db_users.sqlite</div>
+    </div>
+  </div>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--tasks)"></i> Dueño de las tareas</span>
+    <span><i class="dot" style="background:var(--users)"></i> Dueño de los usuarios</span>
+    <span><i class="dot" style="background:var(--border)"></i> Sin base de datos compartida</span>
+  </div>
+</div>
+
+<table>
+  <thead><tr><th></th><th>user-service</th><th>task-service</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Puerto</strong></td><td><code>http://127.0.0.1:8000</code></td><td><code>http://127.0.0.1:8001</code></td></tr>
+    <tr><td><strong>Base de datos</strong></td><td><code>db_users.sqlite</code></td><td><code>db_tasks.sqlite</code></td></tr>
+    <tr><td><strong>Tablas propias</strong></td><td><code>users</code></td><td><code>tasks</code>, <code>cache</code>, <code>jobs</code></td></tr>
+    <tr><td><strong>¿Conoce usuarios?</strong></td><td class="yes">Sí, es el dueño</td><td class="no">No, solo guarda el <code>user_id</code></td></tr>
+    <tr><td><strong>¿Conoce tareas?</strong></td><td class="no">No</td><td class="yes">Sí, es el dueño</td></tr>
+    <tr><td><strong>Interfaz</strong></td><td>Ninguna (headless)</td><td class="yes">API REST + UI web Blade</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>Ninguno</strong> de los dos servicios abre la base de datos del otro. No hay JOIN,
+  no hay llave foránea, no hay modelo compartido. La única forma de que el task-service sepa
+  si un <code>user_id</code> existe es <strong>preguntándoselo al user-service por la red</strong>.
+  Eso es lo que los hace microservicios y no dos carpetas del mismo proyecto.
+</div>
+
+<div class="note">
+  <strong>Por qué <code>tasks.user_id</code> no es una llave foránea.</strong> Es un
+  <code>unsignedBigInteger</code> indexado a propósito. Una FK física exigiría que ambas tablas
+  vivieran en el mismo motor de base de datos, que es exactamente lo que rompe el aislamiento.
+</div>
+
+<h2>2 · El flujo completo, paso a paso</h2>
+
+<ol class="steps">
+  <li>El cliente hace <code>POST http://127.0.0.1:8001/api/tasks</code> con <code>{ "title": "...", "user_id": 2 }</code>.</li>
+  <li>El <strong>task-service</strong> valida el payload (<code>title</code> requerido, <code>user_id</code> requerido/entero ≥ 1). Si falla, responde <span class="status s422">422</span> sin tocar la red.</li>
+  <li>El <strong>task-service</strong> pide la lista de usuarios al <strong>user-service</strong> (<code>GET /api/users</code>) para poblar el formulario. <em>Solo en la UI web.</em></li>
+  <li>Al guardar, el <strong>task-service</strong> abre una conexión HTTP con <code>Http::get</code> hacia <code>http://127.0.0.1:8000/api/users/{id}</code>.</li>
+  <li>El <strong>user-service</strong> consulta su propia tabla <code>users</code>: <span class="status s200">200</span> con el modelo si existe, <span class="status s404">404</span> con <code>{"error":"Usuario no encontrado"}</code> si no.</li>
+  <li>Según la respuesta el task-service decide:
+    <span class="status s200">200</span> → inserta en <code>db_tasks</code> y responde <span class="status s201">201</span> ·
+    <span class="status s404">404</span> → <span class="status s422">422</span> sin escribir nada ·
+    <span class="status s503">503</span> si el user-service está caído ·
+    <span class="status s502">502</span> si responde con otro error.
+  </li>
+</ol>
+
+<p>Todo es <strong>síncrono bloqueante</strong>: el request del cliente espera a que el
+user-service conteste. Es el modelo más simple de explicar; la sección 13 explica cuándo y cómo
+dejar de hacerlo así.</p>
+
+<h2>3 · user-service — el endpoint que valida</h2>
+
+<p>El user-service es <strong>headless</strong>: no tiene UI, solo API.</p>
+
+<h3>routes/api.php</h3>
+<pre><code>Route::<span class="c-fn">get</span>(<span class="c-str">'/users'</span>, [UserController::<span class="c-keyword">class</span>, <span class="c-str">'index'</span>]);
+Route::<span class="c-fn">get</span>(<span class="c-str">'/users/{id}'</span>, [UserController::<span class="c-keyword">class</span>, <span class="c-str">'show'</span>])-&gt;<span class="c-fn">whereNumber</span>(<span class="c-str">'id'</span>);</code></pre>
+
+<h3>app/Http/Controllers/UserController.php</h3>
+<pre><code><span class="c-keyword">public function</span> <span class="c-fn">index</span>(): JsonResponse
+{
+    <span class="c-keyword">return</span> <span class="c-fn">response</span>()-&gt;<span class="c-fn">json</span>(User::<span class="c-fn">query</span>()-&gt;<span class="c-fn">orderBy</span>(<span class="c-str">'name'</span>)-&gt;<span class="c-fn">paginate</span>(<span class="c-num">50</span>));
+}
+
+<span class="c-keyword">public function</span> <span class="c-fn">show</span>(<span class="c-var">int</span> <span class="c-var">$id</span>): JsonResponse
+{
+    <span class="c-var">$user</span> = User::<span class="c-fn">query</span>()-&gt;<span class="c-fn">find</span>(<span class="c-var">$id</span>);
+
+    <span class="c-keyword">if</span> (! <span class="c-var">$user</span>) {
+        <span class="c-keyword">return</span> <span class="c-fn">response</span>()-&gt;<span class="c-fn">json</span>([<span class="c-str">'error'</span> =&gt; <span class="c-str">'Usuario no encontrado'</span>], <span class="c-num">404</span>);
+    }
+
+    <span class="c-keyword">return</span> <span class="c-fn">response</span>()-&gt;<span class="c-fn">json</span>(<span class="c-var">$user</span>, <span class="c-num">200</span>);
+}</code></pre>
+
+<h3>Contrato</h3>
+<pre><code>GET /api/users
+
+<span class="c-num">200</span>  {"current_page":1,"data":[{"id":1,"name":"Ana Torres","email":"..."}],"total":2, ...}
+
+GET /api/users/{id}
+
+<span class="c-num">200</span>  {"id":2,"name":"Luis Ramirez","email":"luis.ramirez@example.com","created_at":"...","updated_at":"..."}
+<span class="c-num">404</span>  {"error":"Usuario no encontrado"}</code></pre>
+
+<h2>4 · task-service — API REST + UI web</h2>
+
+<h3>4.1 UserServiceClient: toda la frontera de red en un solo lugar</h3>
+
+<p>Lo más importante del refactor. Antes el <code>Http::get</code> estaba pegado dentro de
+<code>store()</code>; con CRUD completo habría estado copiado tres veces.</p>
+
+<pre><code><span class="c-keyword">namespace</span> App\Services;
+
+<span class="c-keyword">class</span> <span class="c-cls">UserServiceClient</span>
+{
+    <span class="c-cmt">/** null = el usuario no existe (404) */</span>
+    <span class="c-keyword">public function</span> <span class="c-fn">find</span>(<span class="c-var">int</span> <span class="c-var">$id</span>): ?<span class="c-var">array</span>;
+
+    <span class="c-cmt">/** lista para poblar el &lt;select&gt; del formulario */</span>
+    <span class="c-keyword">public function</span> <span class="c-fn">all</span>(): <span class="c-var">array</span>;
+
+    <span class="c-keyword">private function</span> <span class="c-fn">request</span>(<span class="c-var">string</span> <span class="c-var">$uri</span>): Response;  <span class="c-cmt">// timeout + clasificación</span>
+    <span class="c-keyword">private function</span> <span class="c-fn">baseUrl</span>(): <span class="c-var">string</span>;                <span class="c-cmt">// config('services.user_service.url')</span>
+    <span class="c-keyword">private function</span> <span class="c-fn">timeout</span>(): <span class="c-var">int</span>;                   <span class="c-cmt">// config('services.user_service.timeout')</span>
+}</code></pre>
+
+<div class="note">
+  Es el patrón de un <strong>API Gateway / service client</strong>: encapsular la frontera de red
+  para que el resto de la aplicación trate al otro microservicio como si fuera una función local.
+  Los controllers no saben nada de URLs, timeouts ni códigos de error del peer.
+</div>
+
+<h3>4.2 Excepciones de dominio</h3>
+<pre><code>app/Exceptions/UserServiceUnavailableException.php   <span class="c-cmt">// no lo alcanzó → 503</span>
+app/Exceptions/UserServiceErrorException.php        <span class="c-cmt">// respondió con error → 502</span></code></pre>
+
+<p>Se renderizan <strong>una sola vez</strong>, en <code>bootstrap/app.php</code>, y no en cada endpoint:</p>
+
+<pre><code><span class="c-var">$exceptions</span>-&gt;<span class="c-fn">render</span>(<span class="c-keyword">function</span> (UserServiceUnavailableException <span class="c-var">$e</span>, Request <span class="c-var">$request</span>) {
+    <span class="c-keyword">return</span> <span class="c-var">$request</span>-&gt;<span class="c-fn">is</span>(<span class="c-str">'api/*'</span>) || <span class="c-var">$request</span>-&gt;<span class="c-fn">expectsJson</span>()
+        ? <span class="c-fn">response</span>()-&gt;<span class="c-fn">json</span>([<span class="c-str">'error'</span> =&gt; <span class="c-str">'El usuario no pudo ser validado: el user-service no está disponible.'</span>], <span class="c-num">503</span>)
+        : <span class="c-fn">response</span>()-&gt;<span class="c-fn">view</span>(<span class="c-str">'errors.user-service-down'</span>, [...], <span class="c-num">503</span>);
+});</code></pre>
+
+<div class="note">Ningún método puede olvidarse de manejarlas.</div>
+
+<h3>4.3 API REST — app/Http/Controllers/Api/TaskController.php</h3>
+
+<table>
+  <thead><tr><th>Método</th><th>Ruta</th><th>Respuesta</th></tr></thead>
+  <tbody>
+    <tr><td><code>index</code></td><td><code>GET /api/tasks</code></td><td>Lista paginada (15 por página)</td></tr>
+    <tr><td><code>store</code></td><td><code>POST /api/tasks</code></td><td><span class="status s201">201</span> con la tarea</td></tr>
+    <tr><td><code>show</code></td><td><code>GET /api/tasks/{task}</code></td><td><span class="status s200">200</span> con la tarea</td></tr>
+    <tr><td><code>update</code></td><td><code>PUT /api/tasks/{task}</code></td><td><span class="status s200">200</span> con la tarea actualizada</td></tr>
+    <tr><td><code>destroy</code></td><td><code>DELETE /api/tasks/{task}</code></td><td><span class="status s200">204</span></td></tr>
+  </tbody>
+</table>
+
+<pre><code><span class="c-cmt">// routes/api.php</span>
+Route::<span class="c-fn">apiResource</span>(<span class="c-str">'tasks'</span>, ApiTaskController::<span class="c-keyword">class</span>)-&gt;<span class="c-fn">names</span>(<span class="c-str">'api.tasks'</span>);</code></pre>
+
+<div class="note danger">
+  <strong>El <code>-&gt;names('api.tasks')</code> no es cosmético.</strong>
+  <code>Route::apiResource('tasks')</code> y <code>Route::resource('tasks')</code> registran
+  los mismos nombres (<code>tasks.index</code>, <code>tasks.store</code>…). Si no se prefija, la API
+  gana el registro y <code>route('tasks.index')</code> apunta a <code>/api/tasks</code>.
+  Es un clásico de Laravel que marca la diferencia entre un enlace roto y un 404 misterioso.
+</div>
+
+<p><code>update</code> <strong>solo revalida contra el user-service si el <code>user_id</code>
+cambió</strong>. Editar un título no gasta una llamada de red:</p>
+
+<pre><code><span class="c-keyword">if</span> (<span class="c-fn">isset</span>(<span class="c-var">$validated</span>[<span class="c-str">'user_id'</span>]) &amp;&amp; <span class="c-var">$validated</span>[<span class="c-str">'user_id'</span>] !== <span class="c-var">$task</span>-&gt;user_id) {
+    <span class="c-keyword">if</span> (<span class="c-var">$userService</span>-&gt;<span class="c-fn">find</span>(<span class="c-var">$validated</span>[<span class="c-str">'user_id'</span>]) === <span class="c-keyword">null</span>) {
+        <span class="c-keyword">return</span> <span class="c-fn">response</span>()-&gt;<span class="c-fn">json</span>([<span class="c-str">'error'</span> =&gt; <span class="c-str">'El usuario no existe en el sistema'</span>], <span class="c-num">422</span>);
+    }
+}</code></pre>
+
+<h3>4.4 UI web — app/Http/Controllers/TaskController.php</h3>
+
+<table>
+  <thead><tr><th>Método</th><th>Ruta</th><th>Vista</th></tr></thead>
+  <tbody>
+    <tr><td><code>index</code></td><td><code>GET /tasks</code></td><td><code>tasks/index</code> (tabla + paginación)</td></tr>
+    <tr><td><code>create</code></td><td><code>GET /tasks/create</code></td><td><code>tasks/create</code></td></tr>
+    <tr><td><code>store</code></td><td><code>POST /tasks</code></td><td>redirect → <code>tasks.index</code></td></tr>
+    <tr><td><code>show</code></td><td><code>GET /tasks/{task}</code></td><td><code>tasks/show</code></td></tr>
+    <tr><td><code>edit</code></td><td><code>GET /tasks/{task}/edit</code></td><td><code>tasks/edit</code></td></tr>
+    <tr><td><code>update</code></td><td><code>PUT /tasks/{task}</code></td><td>redirect → <code>tasks.index</code></td></tr>
+    <tr><td><code>destroy</code></td><td><code>DELETE /tasks/{task}</code></td><td>redirect → <code>tasks.index</code></td></tr>
+  </tbody>
+</table>
+
+<p>Ambos controllers usan <strong>el mismo <code>UserServiceClient</code></strong>. Lo único que
+cambia es cómo se renderiza el resultado: JSON en la API, redirección + error bag en la web.</p>
+
+<div class="card">
+  <h4 style="margin-top:0">Tres detalles de la UI que valen la pena</h4>
+  <ol style="margin:0;padding-left:20px">
+    <li><strong>El <code>&lt;select&gt;</code> de usuarios se puebla por HTTP.</strong>
+        <code>create</code> y <code>edit</code> llaman a <code>$userService-&gt;all()</code>. Si el
+        user-service está caído el formulario <strong>no se rompe</strong>: cae a un
+        <code>input type="number"</code> con un banner de advertencia.</li>
+    <li><strong><code>show</code> degrada con elegancia.</strong> Usa
+        <code>rescue(fn () =&gt; $userService-&gt;find(...), report: false)</code>: si el user-service
+        no responde, la tarea se muestra igual, solo sin el nombre del propietario.</li>
+    <li><strong>Cero paso de build.</strong> Las vistas llevan su CSS inline en
+        <code>layouts/app.blade.php</code> y no usan <code>@vite</code>. El proyecto no tiene
+        <code>node_modules</code> ni <code>public/build</code>, así que con Vite las páginas habrían
+        dado <em>"Unable to locate file in Vite manifest"</em>. La paginación también está escrita a
+        mano, porque las vistas de paginación de Laravel son Tailwind.</li>
+  </ol>
+</div>
+
+<h2>5 · Mapa de archivos</h2>
+
+<h3>user-service</h3>
+<table>
+  <thead><tr><th>Archivo</th><th>Rol</th></tr></thead>
+  <tbody>
+    <tr><td><code>database/migrations/0001_01_01_000000_create_users_table.php</code></td><td>Tabla <code>users</code>: <code>id</code>, <code>name</code>, <code>email</code>, <code>timestamps</code></td></tr>
+    <tr><td><code>app/Models/User.php</code></td><td><code>#[Fillable(['name','email'])]</code></td></tr>
+    <tr><td><code>database/factories/UserFactory.php</code></td><td>Factory para tests</td></tr>
+    <tr><td><code>database/seeders/DatabaseSeeder.php</code></td><td>Ana Torres (id 1), Luis Ramirez (id 2)</td></tr>
+    <tr><td><code>app/Http/Controllers/UserController.php</code></td><td><code>index()</code> y <code>show()</code></td></tr>
+    <tr><td><code>routes/api.php</code></td><td><code>GET /api/users</code>, <code>GET /api/users/{id}</code></td></tr>
+    <tr><td><code>bootstrap/app.php</code></td><td>Registra <code>routes/api.php</code> con el prefijo <code>/api</code></td></tr>
+  </tbody>
+</table>
+
+<h3>task-service</h3>
+<table>
+  <thead><tr><th>Archivo</th><th>Rol</th></tr></thead>
+  <tbody>
+    <tr><td><code>database/migrations/2026_…_create_tasks_table.php</code></td><td><code>tasks</code>: <code>title</code>, <code>user_id</code> (sin FK), <code>status</code></td></tr>
+    <tr><td><code>app/Models/Task.php</code></td><td><code>STATUS_PENDING</code> / <code>STATUS_COMPLETED</code></td></tr>
+    <tr><td><code>app/Services/UserServiceClient.php</code></td><td><strong>La frontera de red</strong></td></tr>
+    <tr><td><code>app/Exceptions/UserService*.php</code></td><td>503 / 502 tipados</td></tr>
+    <tr><td><code>app/Http/Requests/Store|UpdateTaskRequest.php</code></td><td>Validación</td></tr>
+    <tr><td><code>app/Http/Controllers/Api/TaskController.php</code></td><td>API REST (JSON)</td></tr>
+    <tr><td><code>app/Http/Controllers/TaskController.php</code></td><td>UI web (Blade)</td></tr>
+    <tr><td><code>resources/views/{layouts,tasks,errors}</code></td><td>Vistas, CSS inline, página 503</td></tr>
+    <tr><td><code>config/services.php</code></td><td>Bloque <code>user_service</code> (<code>url</code>, <code>timeout</code>)</td></tr>
+    <tr><td><code>tests/Feature/TaskApiTest.php</code></td><td>11 tests con <code>Http::fake()</code></td></tr>
+    <tr><td><code>tests/Feature/TaskUiTest.php</code></td><td>10 tests de la UI</td></tr>
+  </tbody>
+</table>
+
+<h2>6 · Cómo arrancarlo</h2>
+<pre><code><span class="c-cmt"># Terminal 1</span>
+cd user-service
+php artisan migrate:fresh --seed
+php artisan serve --port=<span class="c-num">8000</span>
+
+<span class="c-cmt"># Terminal 2</span>
+cd task-service
+php artisan migrate:fresh --seed
+php artisan serve --port=<span class="c-num">8001</span></code></pre>
+<p>Y abrir <code>http://127.0.0.1:8001/tasks</code>.</p>
+
+<h2>7 · Pruebas con cURL</h2>
+<pre><code><span class="c-cmt"># user-service: lista</span>
+curl -s http://127.0.0.1:8000/api/users
+
+<span class="c-cmt"># user-service: usuario existe -&gt; 200</span>
+curl -i http://127.0.0.1:8000/api/users/<span class="c-num">1</span>
+
+<span class="c-cmt"># user-service: no existe -&gt; 404</span>
+curl -i http://127.0.0.1:8000/api/users/<span class="c-num">999</span>
+
+<span class="c-cmt"># task-service: CRUD por API</span>
+curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H <span class="c-str">"Content-Type: application/json"</span> -H <span class="c-str">"Accept: application/json"</span> \
+  -d <span class="c-str">'{"title":"Tarea end-to-end","user_id":2}'</span>
+
+curl -s http://127.0.0.1:8001/api/tasks
+curl -s http://127.0.0.1:8001/api/tasks/<span class="c-num">1</span>
+curl -s -X PUT http://127.0.0.1:8001/api/tasks/<span class="c-num">1</span> \
+  -H <span class="c-str">"Content-Type: application/json"</span> -H <span class="c-str">"Accept: application/json"</span> \
+  -d <span class="c-str">'{"title":"Renombrada","user_id":1}'</span>
+curl -s -X DELETE http://127.0.0.1:8001/api/tasks/<span class="c-num">1</span>
+
+<span class="c-cmt"># usuario inválido -&gt; 422 y NO se guarda nada</span>
+curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H <span class="c-str">"Content-Type: application/json"</span> -H <span class="c-str">"Accept: application/json"</span> \
+  -d <span class="c-str">'{"title":"Tarea huerfana","user_id":77}'</span>
+
+<span class="c-cmt"># user-service apagado (Ctrl+C en su terminal) -&gt; 503</span>
+curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H <span class="c-str">"Content-Type: application/json"</span> -H <span class="c-str">"Accept: application/json"</span> \
+  -d <span class="c-str">'{"title":"Sin user-service","user_id":1}'</span></code></pre>
+
+<h3>Postman</h3>
+<table>
+  <thead><tr><th>#</th><th>Method</th><th>URL</th><th>Body (raw / JSON)</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>GET</td><td><code>{{user_service}}/api/users</code></td><td>—</td></tr>
+    <tr><td>2</td><td>GET</td><td><code>{{user_service}}/api/users/1</code></td><td>—</td></tr>
+    <tr><td>3</td><td>POST</td><td><code>{{task_service}}/api/tasks</code></td><td><code>{"title":"Tarea","user_id":2}</code></td></tr>
+    <tr><td>4</td><td>GET</td><td><code>{{task_service}}/api/tasks</code></td><td>—</td></tr>
+    <tr><td>5</td><td>PUT</td><td><code>{{task_service}}/api/tasks/1</code></td><td><code>{"title":"Nueva","status":"completed"}</code></td></tr>
+    <tr><td>6</td><td>DELETE</td><td><code>{{task_service}}/api/tasks/1</code></td><td>—</td></tr>
+  </tbody>
+</table>
+<pre><code>{ <span class="c-str">"user_service"</span>: <span class="c-str">"http://127.0.0.1:8000"</span>, <span class="c-str">"task_service"</span>: <span class="c-str">"http://127.0.0.1:8001"</span> }</code></pre>
+
+<h2>8 · Matriz de respuestas</h2>
+<table>
+  <thead><tr><th>Situación</th><th>user-service</th><th>task-service</th><th>¿Se guarda?</th></tr></thead>
+  <tbody>
+    <tr><td>Payload inválido</td><td>—</td><td><span class="status s422">422</span> (validación)</td><td class="no">No</td></tr>
+    <tr><td><code>user_id</code> existe</td><td><span class="status s200">200</span></td><td><span class="status s201">201</span> + tarea</td><td class="yes">Sí</td></tr>
+    <tr><td><code>user_id</code> no existe</td><td><span class="status s404">404</span></td><td><span class="status s422">422</span> "El usuario no existe en el sistema"</td><td class="no">No</td></tr>
+    <tr><td>user-service devuelve 500</td><td><span class="status s502">500</span></td><td><span class="status s502">502</span></td><td class="no">No</td></tr>
+    <tr><td>user-service apagado / timeout</td><td>—</td><td><span class="status s503">503</span></td><td class="no">No</td></tr>
+  </tbody>
+</table>
+<div class="note">En los cuatro casos de fallo <strong>no se escribe nada en <code>db_tasks</code></strong>. Ese es el invariante del flujo.</div>
+
+<h2>9 · Tests</h2>
+<pre><code>cd user-service &amp;&amp; vendor/bin/pest --compact   <span class="c-cmt"># 5 tests</span>
+cd task-service &amp;&amp; vendor/bin/pest --compact   <span class="c-cmt"># 23 tests, 68 asserts</span></code></pre>
+<p>Ninguno levanta el user-service: usan <code>Http::fake()</code> para simular 200, 404, 500 y
+conexión caída. La suite es rápida y determinista, pero el contrato queda verificado:</p>
+<pre><code>Http::<span class="c-fn">fake</span>([<span class="c-str">'*'</span> =&gt; Http::<span class="c-fn">response</span>([<span class="c-str">'error'</span> =&gt; <span class="c-str">'Usuario no encontrado'</span>], <span class="c-num">404</span>)]);
+
+<span class="c-var">$this</span>-&gt;<span class="c-fn">postJson</span>(<span class="c-str">'/api/tasks'</span>, [<span class="c-str">'title'</span> =&gt; <span class="c-str">'Tarea'</span>, <span class="c-str">'user_id'</span> =&gt; <span class="c-num">42</span>])-&gt;<span class="c-fn">assertStatus</span>(<span class="c-num">422</span>);
+
+<span class="c-fn">expect</span>(Task::<span class="c-fn">query</span>()-&gt;<span class="c-fn">count</span>())-&gt;<span class="c-fn">toBe</span>(<span class="c-num">0</span>);   <span class="c-cmt">// nada se guardó</span></code></pre>
+
+<h2>10 · La prueba que demuestra que es un sistema distribuido</h2>
+<div class="card">
+  <p>Detén el user-service (<code>Ctrl+C</code>) y manda un <code>POST /api/tasks</code>.
+  El task-service responde <span class="status s503">503</span> en milisegundos. Ninguna cantidad
+  de código dentro del task-service pudo evitarlo: la información <strong>no está en su
+  proceso</strong>, está en otro proceso, detrás de otra base de datos, al otro lado de un socket.</p>
+  <p>En la UI se ve igual de claro: el formulario de <code>/tasks/create</code> se degrada a un
+  input numérico con un banner, y <code>/tasks/{id}</code> sigue mostrando las tareas sin el
+  nombre del propietario.</p>
+  <p style="margin-bottom:0">Y a la inversa: borra <code>user-service/</code> completo y el
+  task-service <strong>sigue funcionando</strong> para listar, editar y borrar tareas. Solo pierde
+  la capacidad de crear tareas nuevas. Esa es la disponibilidad parcial que da la independencia
+  real entre servicios.</p>
+</div>
+
+<h2>11 · Limitaciones honestas de este diseño</h2>
+<ul>
+  <li><strong>Sin circuit breaker</strong>: cada petición caída espera los 3 s completos del timeout.</li>
+  <li><strong>Doble escritura sin transacción distribuida</strong>: si el user-service responde 200 y luego falla el insert, la validación "pasó" pero no hay tarea.</li>
+  <li><strong>Acoplamiento al contrato</strong>: si el user-service cambia la forma del 404, el task-service se entera al instante.</li>
+  <li><strong>Sin autenticación</strong>: cualquiera puede crear tareas. En localhost no importa.</li>
+  <li><strong>SQLite con escritura concurrente</strong>: aguanta el demo, pero no es un motor de producción con varios workers escribiendo a la vez.</li>
+</ul>
+
+<!-- ============ PARTE 2 ============ -->
+<div class="part p2">
+  <div class="pnum">Cambio de parte</div>
+  <h2>PARTE 2 — Qué sigue después</h2>
+  <p>Nada de esta sección está implementado. Es una hoja de ruta con el razonamiento detrás de cada decisión.</p>
+</div>
+
+<h2>12 · Por qué dejamos Lumen atrás</h2>
+
+<p>Lumen fue el framework "ligero" de Laravel para microservicios: menos dependencias, arranque
+más rápido. <strong>Laravel dejó de recomendarlo para proyectos nuevos en 2021</strong>, y así lo
+dice la documentación oficial:</p>
+
+<div class="quote">
+  "In the years since releasing Lumen, PHP has made a variety of wonderful performance improvements.
+  For this reason, along with the availability of Laravel Octane, we no longer support beginning
+  new projects with Lumen. Instead, we recommend always beginning new projects with Laravel."
+  <cite>— lumen.laravel.com</cite>
+</div>
+
+<p>Los números confirman el desinterés: la última versión estable es <strong>v11.2.0 de noviembre
+de 2024</strong> y el repositorio está prácticamente archivado. Lumen solo sigue vivo powering
+<strong>Laravel Vapor</strong>, su modo serverless.</p>
+
+<h3>Las tres razones por las que Lumen perdió</h3>
+<ol>
+  <li><strong>Laravel alcanzó en rendimiento.</strong> El route caching, OPcache y la gestión de
+      middleware cerraron la brecha. Lumen llegó a ser "casi igual de rápido" y bastante más incómodo.</li>
+  <li><strong>No tenía Sanctum, ni Passport, ni Blade, ni una UI decente.</strong> Para una API de
+      microservicio terminabas reinyectando a mano los componentes de Laravel… que es Lumen
+      dejando de ser Lumen.</li>
+  <li><strong>Octane resolvió el problema que Lumen venía a resolver</strong>, pero sin renunciar a nada.</li>
+</ol>
+
+<div class="note future">
+  <strong>Consecuencia práctica para nosotros:</strong> el argumento "es un microservicio, entonces
+  Lumen" ya no se sostiene. La velocidad se compra con <a href="#15-laravel-octane">Octane</a>, no
+  con un framework distinto. Si vienes de un proyecto en Lumen, el camino es copiar los archivos a
+  un Laravel limpio: Lumen corre sobre los mismos componentes <code>illuminate/*</code> que Laravel.
+</div>
+
+<h2>13 · De síncrono a asíncrono: RabbitMQ</h2>
+
+<h3>El problema con lo que tenemos</h3>
+<p>Hoy el <code>POST /tasks</code> se ve así en tiempo de respuesta:</p>
+
+<div class="lat">
+  <div class="step" style="flex:1"><div class="bar sync"></div>Cliente 20ms</div>
+  <div class="step" style="flex:1"><div class="bar sync"></div>task-service 20ms</div>
+  <div class="step" style="flex:1"><div class="bar sync"></div>user-service 20ms</div>
+  <div class="total">≈ 60 ms</div>
+</div>
+
+<p>Cada request a task-service <strong>suma</strong> la latencia de user-service. Con N servicios
+en cadena, los tiempos se suman. Peor: si user-service está lento pero no caído, el cliente espera
+igual. Y un "guardar una tarea" termina bloqueado por "consultar un nombre".</p>
+
+<h3>Qué cambia con una cola</h3>
+<p>La validación se mueve <strong>después</strong> de la escritura:</p>
+
+<div class="lat">
+  <div class="step" style="flex:1"><div class="bar" style="background:var(--ok)"></div>Cliente 5ms</div>
+  <div class="step" style="flex:1"><div class="bar" style="background:var(--ok)"></div>task-service 5ms</div>
+  <div class="step" style="flex:1"><div class="bar" style="background:var(--border)"></div>RabbitMQ → worker → user-service (async)</div>
+  <div class="total fast">≈ 10 ms</div>
+</div>
+
+<pre><code>composer <span class="c-fn">require</span> vladimir-yuldashev/laravel-queue-rabbitmq</code></pre>
+<pre><code><span class="c-var">QUEUE_CONNECTION</span>=rabbitmq
+<span class="c-var">RABBITMQ_HOST</span>=127.0.0.1
+<span class="c-var">RABBITMQ_PORT</span>=5672
+<span class="c-var">RABBITMQ_QUEUE</span>=tasks
+<span class="c-var">RABBITMQ_USER</span>=guest
+<span class="c-var">RABBITMQ_PASSWORD</span>=guest
+<span class="c-var">RABBITMQ_WORKER</span>=horizon</code></pre>
+
+<pre><code><span class="c-cmt">// app/Jobs/ValidateTaskOwner.php</span>
+<span class="c-keyword">class</span> <span class="c-cls">ValidateTaskOwner</span> <span class="c-keyword">implements</span> ShouldQueue
+{
+    <span class="c-keyword">public int</span> <span class="c-prop">$tries</span> = <span class="c-num">3</span>;
+
+    <span class="c-cmt">/** @return array&lt;int, int&gt; */</span>
+    <span class="c-keyword">public function</span> <span class="c-fn">backoff</span>(): <span class="c-var">array</span>
+    {
+        <span class="c-keyword">return</span> [<span class="c-num">10</span>, <span class="c-num">60</span>, <span class="c-num">300</span>];   <span class="c-cmt">// reintentos exponenciales</span>
+    }
+
+    <span class="c-keyword">public function</span> <span class="c-fn">handle</span>(UserServiceClient <span class="c-var">$userService</span>): <span class="c-keyword">void</span>
+    {
+        <span class="c-keyword">if</span> (<span class="c-var">$userService</span>-&gt;<span class="c-fn">find</span>(<span class="c-var">$this</span>-&gt;userId) !== <span class="c-keyword">null</span>) {
+            <span class="c-keyword">return</span>;
+        }
+
+        <span class="c-cmt">// El usuario no existe (o ya no). La tarea queda huérfana:</span>
+        Task::<span class="c-fn">query</span>()-&gt;<span class="c-fn">whereKey</span>(<span class="c-var">$this</span>-&gt;taskId)-&gt;<span class="c-fn">update</span>([<span class="c-str">'status'</span> =&gt; <span class="c-str">'orphaned'</span>]);
+    }
+}</code></pre>
+
+<h3>Lo que ganas y lo que pierdes</h3>
+<table>
+  <thead><tr><th style="width:50%"><span class="win">Ganas</span></th><th><span class="lose">Pierdes</span></th></tr></thead>
+  <tbody>
+    <tr><td>El cliente responde en ~5 ms en vez de ~40 ms</td><td><strong>El invariante "si el usuario no existe, no se guarda" desaparece</strong></td></tr>
+    <tr><td>user-service caído ya no bloquea la escritura</td><td>Consistencia eventual: la tarea existe antes de validarse</td></tr>
+    <tr><td>Reintentos automáticos y DLQ (dead letter queue)</td><td>Hay que manejar el estado "huérfana" en la UI</td></tr>
+    <tr><td>Picos de tráfico se absorben en el broker</td><td>Depurar "se guardó pero no aparece validada"</td></tr>
+    <tr><td>Escalar el worker sin tocar el web</td><td>Idempotencia obligatoria</td></tr>
+  </tbody>
+</table>
+
+<div class="note danger">
+  <strong>El punto importante:</strong> la validación síncrona da una <strong>garantía fuerte</strong>
+  (nada sucio se escribe) a cambio de latencia. La asíncrona da <strong>disponibilidad</strong> a
+  cambio de esa garantía. Depende de si es aceptable que exista una tarea sin usuario válido:
+  <ul style="margin:8px 0 0">
+    <li><strong>Notificaciones, auditorías, emails</strong> → asíncrono, sin duda. Nadie espera.</li>
+    <li><strong>Integridad crítica</strong> (no facturar a un cliente inexistente) → síncrono, o un saga con compensación.</li>
+  </ul>
+</div>
+
+<p>RabbitMQ frente a Redis como cola: Laravel trae el driver <code>redis</code> de fábrica y es más
+simple. RabbitMQ gana cuando necesitas <strong>confirmaciones de publicación, exchanges,
+prioridades, quorum queues y enrutado complejo</strong>. Si solo quieres "encolar trabajos",
+Redis + Horizon llega antes.</p>
+
+<div class="note">
+  <strong>Detalle que se olvida:</strong> <code>vladimir-yuldashev/laravel-queue-rabbitmq</code>
+  soporta Octane desde la 13.3, pero hay que <strong>declarar la conexión <code>rabbitmq</code> en
+  el <code>warm</code> de <code>config/octane.php</code></strong>. Si no, se manifiesta como
+  conexiones abiertas por request.
+</div>
+
+<h2>14 · Autenticación entre servicios: JWT, Sanctum y mTLS</h2>
+
+<p>Hoy <code>POST /api/tasks</code> es anónimo. En una red real eso no es aceptable. Hay tres
+opciones y <strong>no son equivalentes</strong> — se suelen confundir:</p>
+
+<h3>Sanctum — para usuarios finales</h3>
+<p>Lo que trae Laravel de fábrica (<code>php artisan install:api</code>). Tokens <strong>opacos</strong>
+guardados en una tabla, revocables uno por uno, con "abilities"
+(<code>tasks:create</code>, <code>tasks:delete</code>).</p>
+<pre><code>Authorization: Bearer 8|kQd3fR2mNx7pL...</code></pre>
+<p>Ideal para SPAs y móviles. <strong>No</strong> para comunicación servicio-a-servicio: el
+user-service tendría que consultar la base de datos de tokens en cada request, o el token tendría
+que vivir más de lo razonable.</p>
+
+<h3>JWT — para validadores sin base de datos</h3>
+<p><code>php-open-source-saver/jwt-auth</code> (v2.9.3, Laravel 12/13) es el fork mantenido de
+<code>tymon/jwt-auth</code>, abandonado hace años. Un JWT es autocontenido: el user-service valida
+la firma sin llamar a nadie.</p>
+<p><strong>Ventajas:</strong> stateless, horizontalmente escalable.</p>
+<p><strong>Desventajas reales:</strong></p>
+<ul>
+  <li><strong>Revocar es un problema.</strong> Hasta <code>exp</code>, el token es válido aunque lo
+      borres. La lista de revocación es una base de datos… que es justo lo que JWT iba a evitar.</li>
+  <li><strong>El payload no es secreto.</strong> Es solo base64. No pongas datos sensibles ahí.</li>
+  <li><strong>Skew de reloj</strong> entre servicios: 30 s de drift rompen la validación de <code>nbf</code>/<code>exp</code>.</li>
+  <li>Si tu servicio ya tiene base de datos, <strong>JWT no te compra nada</strong>: la tabla de
+      tokens es una fila más, y encima la tienes que mantener.</li>
+</ul>
+
+<h3>mTLS o API Gateway — la respuesta real</h3>
+<p>En la práctica, la comunicación entre microservicios internos <strong>no debería llevar el token
+de un usuario</strong>. Debería llevar un token de <em>servicio</em>, emitido por un API Gateway con
+<code>client_credentials</code> de OAuth2: vida corta (minutos), audiencia específica, revocable.</p>
+<p>Capa por debajo, <strong>mTLS</strong> (certificado por servicio) es lo más simple y lo que no
+se puede robar. Con Kubernetes, mTLS se resuelve gratis con Linkerd o Istio.</p>
+
+<div class="note future">
+  <strong>Recomendación para este proyecto:</strong> hoy ninguno (localhost). El día que haya red:
+  mTLS o gateway con credenciales de servicio. JWT solo si terceros tienen que validar tokens sin
+  poder consultar ninguna base de datos.
+</div>
+
+<h2>15 · Laravel Octane</h2>
+
+<h3>Qué es</h3>
+<p><code>php artisan serve</code> arranca el servidor de desarrollo de PHP, que <strong>bootea
+Laravel entero en cada request</strong>: lee <code>composer.json</code>, registra servicios, compila
+el contenedor, carga configuración. Octane (Swoole, OpenSwoole, FrankenPHP o RoadRunner)
+<strong>bootea la aplicación una sola vez y la deja residente en memoria</strong>, alimentándola con
+requests.</p>
+
+<pre><code>composer <span class="c-fn">require</span> laravel/octane
+php artisan octane:install --server=frankenphp
+php artisan octane:start --workers=<span class="c-num">8</span>      <span class="c-cmt"># en producción</span>
+php artisan octane:reload                 <span class="c-cmt"># tras un deploy, recarga sin downtime</span></code></pre>
+
+<h3>Ventajas reales</h3>
+<ul>
+  <li><strong>No se re-bootea Laravel por request.</strong> Ese es el 90% de la ganancia.</li>
+  <li><strong>Throughput predecible bajo carga</strong>, porque no hay pico de CPU por request.</li>
+  <li><strong>Menos memoria y GC</strong> que PHP-FPM en escenario alto.</li>
+</ul>
+
+<h3>Cuándo <strong>no</strong> hacerlo</h3>
+<div class="note danger">
+  Esto es lo que casi nadie pone en los artículos: los benchmarks públicos concluyeron que
+  <strong>por debajo de ~500 requests/minuto la diferencia entre PHP-FPM y Octane es
+  imperceptible</strong>. Una API que recibe 50 req/min no tiene un problema de rendimiento;
+  tiene un problema de diseño.
+  <br><br>
+  <strong>Octane es una optimización para cuando ya mediste que el cuello de botella es el arranque
+  de PHP</strong>, no un sustituto de medir.
+</div>
+
+<h3>Los riesgos (y son serios)</h3>
+<ol>
+  <li><strong>El estado vive entre requests.</strong> Una variable estática, un
+      <code>static::$cache</code> o un singleton con estado se <strong>comparte entre los
+      usuarios</strong> del worker. Es la fuente de bugs más común al migrar: "funcionaba en
+      <code>artisan serve</code> y en producción se filtran datos entre peticiones".</li>
+  <li><strong>El container se reinicializa.</strong> Los singletons que guarden estado se quedan viejos.</li>
+  <li><strong>Los logs se acumulan en memoria</strong> si no se rotan.</li>
+  <li><strong><code>php artisan serve</code> sigue siendo el servidor de desarrollo.</strong> Octane
+      nunca reemplaza a Valet/Herd ni a tu <code>.env</code> local.</li>
+</ol>
+
+<div class="note future">
+  En nuestro contexto: user-service recibe 1 request por cada <code>POST /tasks</code> más 1 por
+  cada <code>GET /tasks/create</code>. <strong>No justifica Octane todavía.</strong> Lo justificaría
+  si el <code>index()</code> lo convirtiéramos en una vista que golpea user-service N veces.
+</div>
+
+<h2>16 · Observabilidad: que el error se vea solo</h2>
+<p>Hoy, si el task-service tarda 2 segundos, nadie sabe por qué. Falta lo que en el mundo real se
+llama <em>distributed tracing</em>:</p>
+<ul>
+  <li><strong>Correlación de requests.</strong> Generar un ID en el borde y propagarlo:
+      <code>X-Request-Id: 8f2c…</code> en cada respuesta y en cada llamada saliente. Con eso, un
+      <code>grep</code> en los logs de los dos servicios te arma la historia completa.</li>
+  <li><strong>OpenTelemetry</strong> para trazas distribuidas: una petición del cliente se convierte
+      en un árbol de spans que cruza el límite de los servicios.</li>
+  <li><strong>Logs estructurados</strong> en JSON en vez de texto, con <code>user_id</code>,
+      <code>task_id</code>, <code>status</code>, <code>duration</code>.</li>
+  <li><strong>Métricas</strong>: p95 de latencia, tasa de error por endpoint, y <em>cuántas veces</em>
+      cae el user-service. Esa última es la que te avisa de que necesitas el circuit breaker.</li>
+</ul>
+
+<pre><code><span class="c-cmt">// app/Services/UserServiceClient.php</span>
+<span class="c-var">$response</span> = Http::<span class="c-fn">withHeaders</span>([<span class="c-str">'X-Request-Id'</span> =&gt; <span class="c-fn">request</span>()-&gt;attributes-&gt;<span class="c-fn">get</span>(<span class="c-str">'request_id'</span>)])
+    -&gt;<span class="c-fn">timeout</span>(<span class="c-var">$this</span>-&gt;<span class="c-fn">timeout</span>())
+    -&gt;<span class="c-fn">get</span>(<span class="c-var">$this</span>-&gt;<span class="c-fn">baseUrl</span>().<span class="c-var">$uri</span>);</code></pre>
+
+<h2>17 · Resiliencia: circuit breaker e idempotencia</h2>
+
+<h3>Circuit breaker</h3>
+<p>Hoy, con el user-service caído, cada <code>POST /tasks</code> <strong>espera 3 segundos</strong>
+antes de rendirse. Con 50 usuarios, son 50 hilos bloqueados 3 segundos cada uno. El servicio
+caído se convierte en una trampa que degrada al servicio sano.</p>
+<p>Un circuit breaker memoriza el fallo: tras N errores seguidos <strong>deja de llamar</strong> y
+falla inmediatamente durante M segundos. Pasa de 3 s a 3 ms.</p>
+
+<pre><code><span class="c-cmt">// pseudo-código dentro de UserServiceClient</span>
+<span class="c-keyword">if</span> (<span class="c-var">$this</span>-&gt;breaker-&gt;<span class="c-fn">isOpen</span>()) {
+    <span class="c-keyword">throw new</span> UserServiceUnavailableException(<span class="c-str">'Circuito abierto, sin intentar la llamada.'</span>);
+}</code></pre>
+
+<h3>Idempotencia</h3>
+<p><code>POST /tasks</code> no lo es: si el cliente no recibe la respuesta y reintenta, se crea una
+tarea duplicada. Con colas esto es obligatorio, no opcional.</p>
+<pre><code>Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7</code></pre>
+<p>Guardas el <code>Idempotency-Key</code> en una tabla con la respuesta. Si vuelve la misma clave,
+devuelves la respuesta guardada en lugar de reejecutar.</p>
+
+<h2>18 · Testing de contratos</h2>
+<p>Hoy los tests de cada servicio mockean al otro con <code>Http::fake()</code>. Funciona hasta el
+día en que alguien cambia el user-service y olvida actualizar el mock del task-service: los tests
+siguen en verde y producción se rompe.</p>
+<p>Los <strong>contratos del consumidor</strong> (Pest los soporta) invierten eso: el user-service
+genera un test a partir de lo que el task-service <em>realmente</em> consume, y ambos servicios
+verifican contra ese archivo compartido en CI.</p>
+<pre><code>contracts/user-service.json   <span class="c-cmt">← generado, versionado, revisado en code review</span></code></pre>
+<p>El día que cambies la forma del 404, el contrato falla en CI, en el repositorio del
+user-service, y el cambio no se puede mergear a medias.</p>
+
+<h2>19 · Despliegue en contenedores</h2>
+<p>Cada servicio en su propio contenedor, con su propia base de datos:</p>
+<pre><code>services:
+  user-service:  { ports: [<span class="c-str">"8000:8000"</span>], env_file: .env }
+  task-service:  { ports: [<span class="c-str">"8001:8001"</span>], env_file: .env, depends_on: [user-service] }</code></pre>
+
+<p>Tres cosas que hay que cuidar y que aprendes tarde:</p>
+<ol>
+  <li><strong>El orden de arranque no es el orden de disponibilidad.</strong> <code>depends_on</code>
+      solo espera el contenedor, no la migración. Por eso existen los <strong>health checks</strong>:
+      <pre><code style="margin:10px 0 0">healthcheck:
+  test: [<span class="c-str">"CMD"</span>, <span class="c-str">"php"</span>, <span class="c-str">"artisan"</span>, <span class="c-str">"db:show"</span>]     <span class="c-cmt"># o /up</span>
+  interval: 10s
+  retries: 5</code></pre></li>
+  <li><strong><code>USER_SERVICE_URL</code> no puede ser <code>localhost</code></strong> dentro de un
+      contenedor: ahí solo está el propio contenedor. Tiene que ser el nombre del servicio o del DNS interno.</li>
+  <li><strong>Un contenedor no debe escribir en el sistema de archivos.</strong>
+      <code>storage/framework/{cache,sessions,views}</code> deben ser volúmenes compartidos, o
+      <code>config:cache</code> en cada deploy y nunca cachear rutas.</li>
+</ol>
+
+<h2>20 · Roadmap sugerido (en orden)</h2>
+<ol class="road">
+  <li><strong>Métricas y <code>X-Request-Id</code></strong><span>Antes de optimizar nada, saber qué pasa</span></li>
+  <li><strong>Autenticación</strong> (mTLS o token de servicio)<span>Es lo que impide que cualquiera cree tareas</span></li>
+  <li><strong>Circuit breaker + reintentos</strong><span>Convierte una caída de 3 s en una de 3 ms</span></li>
+  <li><strong>API versioning</strong> (<code>/api/v1/...</code>)<span>Barato ahora, carísimo después</span></li>
+  <li><strong>Contratos de consumidor en CI</strong><span>Antes de que haya dos equipos</span></li>
+  <li><strong>RabbitMQ</strong><span>Solo si el punto 3 muestra que la latencia secuencial duele</span></li>
+  <li><strong>Docker + health checks</strong><span>Cuando el proyecto se compare con otros</span></li>
+  <li><strong>Octane</strong><span>Solo después de medir que el arranque es el cuello de botella</span></li>
+  <li><strong>JWT</strong><span>Probablemente nunca, si usas mTLS</span></li>
+</ol>
+
+<div class="note">
+  El orden importa: los pasos 1 a 3 cuestan horas y evitan incidentes. El paso 8 puede esperar un
+  año sin que nadie lo note.
+</div>
+
+<div class="foot">
+  user-service <code>:8000</code> · db_users.sqlite &nbsp;·&nbsp; task-service <code>:8001</code> · db_tasks.sqlite
+</div>
+
+</div>
+</body>
+</html>

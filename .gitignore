@@ -1,0 +1,117 @@
+# =============================================================
+#  Sistema de Tareas Inteligente — raíz del monorepo
+#  Contiene dos proyectos Laravel independientes.
+# =============================================================
+
+# -------------------------------------------------------------
+#  Dependencias (nunca se versionan: se reinstalan con composer)
+# -------------------------------------------------------------
+vendor/
+node_modules/
+
+# Reinstálalas con:
+#   composer install
+#   npm install
+
+# -------------------------------------------------------------
+#  Secretos — NUNCA subir el .env real
+#  SÍ se suben los .env.example (son la plantilla)
+# -------------------------------------------------------------
+.env
+.env.backup
+.env.production
+.env.*.local
+*.key
+
+# -------------------------------------------------------------
+#  Bases de datos SQLite — son datos, no código
+#  (Cada servicio tiene la suya: son el aislamiento del ejercicio)
+# -------------------------------------------------------------
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Si prefieres versionar las bases vacías como seed, descomenta:
+# !user-service/database/db_users.sqlite
+
+# -------------------------------------------------------------
+#  Cachés de Laravel y PHP
+# -------------------------------------------------------------
+/user-service/bootstrap/cache/*.php
+/task-service/bootstrap/cache/*.php
+/user-service/storage/framework/cache/*
+/task-service/storage/framework/cache/*
+/user-service/storage/framework/sessions/*
+/task-service/storage/framework/sessions/*
+/user-service/storage/framework/views/*
+/task-service/storage/framework/views/*
+/user-service/storage/logs/*
+/task-service/storage/logs/*
+/user-service/storage/pail/*
+/task-service/storage/pail/*
+/user-service/storage/app/public/*
+/task-service/storage/app/public/*
+.phpunit.result.cache
+.phpunit.cache
+.phpunit.cache/
+.php-cs-fixer.cache
+.pint.cache
+.eslintcache
+
+# -------------------------------------------------------------
+#  Frontend compilado
+# -------------------------------------------------------------
+/user-service/public/build/
+/task-service/public/build/
+/user-service/public/hot
+/task-service/public/hot
+/user-service/public/storage
+/task-service/public/storage
+
+# -------------------------------------------------------------
+#  Sistema operativo
+# -------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# -------------------------------------------------------------
+#  Editores
+# -------------------------------------------------------------
+.idea/
+.vscode/
+.zed/
+*.sublime-workspace
+*.sublime-project
+*.swp
+*.swo
+.atom/
+_ide_helper.php
+.phpactor.json
+
+# -------------------------------------------------------------
+#  Configuración personal de herramientas (opcional)
+#  Descomenta lo que NO quieras compartir.
+# -------------------------------------------------------------
+# /user-service/.mcp.json
+# /task-service/.mcp.json
+# /user-service/opencode.json
+# /task-service/opencode.json
+# /user-service/CLAUDE.md
+# /task-service/CLAUDE.md
+
+# =============================================================
+#  SÍ se versionan (por si acaso):
+#    - app/, config/, database/migrations/, routes/, resources/
+#    - tests/
+#    - *.md, *.html  (la documentación del proyecto)
+#    - .env.example
+# =============================================================
