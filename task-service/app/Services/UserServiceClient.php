@@ -22,25 +22,30 @@ use Illuminate\Support\Facades\Http;
 class UserServiceClient
 {
     /**
-     * Busca un usuario por su id.
+     * Resuelve quién es el dueño de un token opaco.
      *
-     * @return array{id: int, name: string, email: string}|null null si el usuario no existe
+     * El task-service NO tiene la tabla de tokens — vive en el user-service.
+     * Por eso cada request autenticado cuesta un salto de red. Ese es el
+     * precio de no duplicar el estado de identidad, y es exactamente el
+     * trade-off que un JWT stateless viene a evitar.
+     *
+     * @return array{id: int, name: string, email: string}|null null si el token no es válido
      *
      * @throws UserServiceUnavailableException si el user-service no está alcanzable
      * @throws UserServiceErrorException si el user-service responde con error
      */
-    public function find(int $id): ?array
+    public function authenticate(string $token): ?array
     {
-        $response = $this->request("/api/users/{$id}");
+        $response = $this->request('/api/user', ['Authorization' => "Bearer {$token}"]);
 
-        // 404 no es un error: es la respuesta esperada cuando el usuario no existe.
-        if ($response->status() === 404) {
+        // 401 no es un fallo del servicio: es "este token no vale".
+        if ($response->status() === 401) {
             return null;
         }
 
         if ($response->failed()) {
             throw new UserServiceErrorException(
-                "El user-service respondió {$response->status()} al buscar el usuario {$id}."
+                "El user-service respondió {$response->status()} al validar el token."
             );
         }
 
@@ -48,37 +53,89 @@ class UserServiceClient
     }
 
     /**
-     * Lista los usuarios disponibles. Se usa para poblar el <select> del formulario.
+     * Pide un token a cambio de credenciales. Lo usa el login del task-service.
      *
-     * @return array<int, array{id: int, name: string, email: string}>
+     * @param  array{email: string, password: string, device_name?: string}  $credentials
      *
-     * @throws UserServiceUnavailableException si el user-service no está alcanzable
-     * @throws UserServiceErrorException si el user-service responde con error
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException si las credenciales son incorrectas (401)
      */
-    public function all(): array
+    public function issueToken(array $credentials): string
     {
-        $response = $this->request('/api/users');
+        $response = $this->post('/api/tokens', $credentials);
 
         if ($response->failed()) {
             throw new UserServiceErrorException(
-                "El user-service respondió {$response->status()} al listar los usuarios."
+                "El user-service rechazó el inicio de sesión ({$response->status()})."
             );
         }
 
-        return $response->json('data', []);
+        return $response->json('token');
+    }
+
+    /**
+     * Revoca un token en el user-service.
+     *
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
+     */
+    public function revokeToken(string $token): void
+    {
+        $this->delete('/api/tokens', ['Authorization' => "Bearer {$token}"]);
     }
 
     /**
      * Ejecuta la petición HTTP con la política de timeout compartida.
      *
+     * @param  array<string, string>  $headers
+     *
      * @throws UserServiceUnavailableException
      */
-    private function request(string $uri): Response
+    private function request(string $uri, array $headers = []): Response
+    {
+        return $this->send(fn () => Http::acceptJson()
+            ->withHeaders($headers)
+            ->timeout($this->timeout())
+            ->get($this->baseUrl().$uri));
+    }
+
+    /**
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, string>  $headers
+     *
+     * @throws UserServiceUnavailableException
+     */
+    private function post(string $uri, array $payload = [], array $headers = []): Response
+    {
+        return $this->send(fn () => Http::acceptJson()
+            ->asJson()
+            ->withHeaders($headers)
+            ->timeout($this->timeout())
+            ->post($this->baseUrl().$uri, $payload));
+    }
+
+    /**
+     * @param  array<string, string>  $headers
+     *
+     * @throws UserServiceUnavailableException
+     */
+    private function delete(string $uri, array $headers = []): Response
+    {
+        return $this->send(fn () => Http::acceptJson()
+            ->withHeaders($headers)
+            ->timeout($this->timeout())
+            ->delete($this->baseUrl().$uri));
+    }
+
+    /**
+     * @param  callable(): Response  $callback
+     *
+     * @throws UserServiceUnavailableException
+     */
+    private function send(callable $callback): Response
     {
         try {
-            return Http::acceptJson()
-                ->timeout($this->timeout())
-                ->get($this->baseUrl().$uri);
+            return $callback();
         } catch (ConnectionException $exception) {
             throw new UserServiceUnavailableException(
                 'No se pudo contactar al user-service.',

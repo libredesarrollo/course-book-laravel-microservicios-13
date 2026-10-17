@@ -18,11 +18,13 @@ class DatabaseSeeder extends Seeder
         User::query()->create([
             'name' => 'Ana Torres',
             'email' => 'ana.torres@example.com',
+            'password' => 'password',
         ]);
 
         User::query()->create([
             'name' => 'Luis Ramirez',
             'email' => 'luis.ramirez@example.com',
+            'password' => 'password',
         ]);
     }
 }

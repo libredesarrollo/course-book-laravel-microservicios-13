@@ -14,13 +14,14 @@ class StoreTaskRequest extends FormRequest
     }
 
     /**
+     * Ya no se valida user_id: sale de la identidad autenticada, no del payload.
+     *
      * @return array<string, array<int, mixed>>
      */
     public function rules(): array
     {
         return [
             'title' => ['required', 'string', 'max:255'],
-            'user_id' => ['required', 'integer', 'min:1'],
             'status' => ['sometimes', Rule::in([Task::STATUS_PENDING, Task::STATUS_COMPLETED])],
         ];
     }

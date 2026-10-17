@@ -1,146 +1,148 @@
 <?php
 
 use App\Models\Task;
-use Illuminate\Support\Facades\Http;
 
-it('creates a task when the user-service confirms that the user exists', function () {
-    Http::fake([
-        '*' => Http::response(['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'], 200),
-    ]);
+/*
+| La API no tiene tabla de usuarios: cada request se autentica preguntando al
+| user-service. Estos tests comprueban las dos caras de esa moneda: que un
+| token válido abre la puerta y que sin token no se entra.
+*/
 
-    $this->postJson('/api/tasks', [
-        'title' => 'Comprar el almuerzo',
-        'user_id' => 1,
-    ])
-        ->assertCreated()
-        ->assertJson([
-            'title' => 'Comprar el almuerzo',
-            'user_id' => 1,
-            'status' => Task::STATUS_PENDING,
-        ]);
+it('rejects every endpoint without a token', function (string $method, string $uri) {
+    Http::fake();
 
-    expect(Task::query()->count())->toBe(1);
+    test()->json($method, $uri)->assertUnauthorized();
 
-    Http::assertSent(
-        fn ($request) => $request->url() === config('services.user_service.url').'/api/users/1'
-    );
-});
+    Http::assertNothingSent();
+})->with([
+    'index' => ['GET', '/api/tasks'],
+    'store' => ['POST', '/api/tasks'],
+    'show' => ['GET', '/api/tasks/1'],
+    'update' => ['PUT', '/api/tasks/1'],
+    'destroy' => ['DELETE', '/api/tasks/1'],
+]);
 
-it('does not create the task when the user-service answers 404', function () {
-    Http::fake([
-        '*' => Http::response(['error' => 'Usuario no encontrado'], 404),
-    ]);
+it('rejects a token the user-service does not recognise', function () {
+    Http::fake(['*/api/user' => Http::response(['error' => 'Unauthenticated.'], 401)]);
 
-    $this->postJson('/api/tasks', [
-        'title' => 'Tarea de un usuario inexistente',
-        'user_id' => 42,
-    ])
-        ->assertStatus(422)
-        ->assertJson(['error' => 'El usuario no existe en el sistema']);
-
-    expect(Task::query()->count())->toBe(0);
-});
-
-it('does not create the task when the user-service answers with a server error', function () {
-    Http::fake([
-        '*' => Http::response(['message' => 'Server Error'], 500),
-    ]);
-
-    $this->postJson('/api/tasks', [
-        'title' => 'Tarea con user-service roto',
-        'user_id' => 1,
-    ])
-        ->assertStatus(502);
-
-    expect(Task::query()->count())->toBe(0);
+    $this->withToken('token-falso')->getJson('/api/tasks')->assertUnauthorized();
 });
 
 it('returns 503 when the user-service is unreachable', function () {
-    Http::fake([
-        '*' => Http::failedConnection(),
-    ]);
+    fakeUserServiceDown();
 
-    $this->postJson('/api/tasks', [
-        'title' => 'Tarea con el user-service apagado',
-        'user_id' => 1,
-    ])
-        ->assertStatus(503);
-
-    expect(Task::query()->count())->toBe(0);
+    $this->withToken('test-token')->getJson('/api/tasks')->assertStatus(503);
 });
 
-it('validates the request payload before calling the user-service', function () {
-    Http::fake();
+it('asks the user-service who the caller is, on every request', function () {
+    fakeUserService(['id' => 7, 'name' => 'Luis Ramirez', 'email' => 'luis@example.com']);
 
-    $this->postJson('/api/tasks', ['title' => 'Sin user_id'])
-        ->assertStatus(422)
-        ->assertJsonValidationErrors('user_id');
-
-    Http::assertNothingSent();
-});
-
-it('lists the tasks in a paginated json response', function () {
-    Task::factory()->count(3)->create();
-
-    $response = $this->getJson('/api/tasks')->assertOk();
-
-    expect($response->json('data'))->toHaveCount(3)
-        ->and($response->json('total'))->toBe(3);
-});
-
-it('shows a single task', function () {
-    $task = Task::factory()->create(['title' => 'Tarea puntual']);
-
-    $this->getJson("/api/tasks/{$task->id}")
-        ->assertOk()
-        ->assertJson(['id' => $task->id, 'title' => 'Tarea puntual']);
-});
-
-it('updates a task without calling the user-service when the user_id does not change', function () {
-    $task = Task::factory()->create(['title' => 'Título viejo', 'status' => Task::STATUS_PENDING]);
-
-    $this->putJson("/api/tasks/{$task->id}", [
-        'title' => 'Título nuevo',
-        'status' => Task::STATUS_COMPLETED,
-    ])
-        ->assertOk()
-        ->assertJson(['title' => 'Título nuevo', 'status' => Task::STATUS_COMPLETED]);
-
-    Http::assertNothingSent();
-});
-
-it('revalidates the user over http when the user_id changes', function () {
-    $task = Task::factory()->create(['user_id' => 1]);
-
-    Http::fake([
-        '*' => Http::response(['id' => 7, 'name' => 'Luis Ramirez', 'email' => 'luis@example.com'], 200),
-    ]);
-
-    $this->putJson("/api/tasks/{$task->id}", ['user_id' => 7])
-        ->assertOk()
-        ->assertJson(['user_id' => 7]);
+    $this->withToken('test-token')->getJson('/api/tasks')->assertOk();
 
     Http::assertSent(
-        fn ($request) => $request->url() === config('services.user_service.url').'/api/users/7'
+        fn ($request) => $request->url() === config('services.user_service.url').'/api/user'
+            && $request->hasHeader('Authorization', 'Bearer test-token')
     );
 });
 
-it('rejects the update when the new user_id does not exist in the user-service', function () {
-    $task = Task::factory()->create(['user_id' => 1]);
+it('creates a task owned by the caller', function () {
+    fakeUserService(['id' => 7, 'name' => 'Luis Ramirez', 'email' => 'luis@example.com']);
 
-    Http::fake([
-        '*' => Http::response(['error' => 'Usuario no encontrado'], 404),
-    ]);
+    $this->withToken('test-token')
+        ->postJson('/api/tasks', ['title' => 'Comprar el almuerzo'])
+        ->assertCreated()
+        ->assertJson([
+            'title' => 'Comprar el almuerzo',
+            'user_id' => 7,
+            'status' => Task::STATUS_PENDING,
+        ]);
 
-    $this->putJson("/api/tasks/{$task->id}", ['user_id' => 99])->assertStatus(422);
-
-    expect($task->fresh()->user_id)->toBe(1);
+    expect(Task::query()->first()->user_id)->toBe(7);
 });
 
-it('deletes a task', function () {
-    $task = Task::factory()->create();
+it('ignores any user_id the client tries to inject', function () {
+    fakeUserService(['id' => 7, 'name' => 'Luis Ramirez', 'email' => 'luis@example.com']);
 
-    $this->deleteJson("/api/tasks/{$task->id}")->assertNoContent();
+    $this->withToken('test-token')
+        ->postJson('/api/tasks', ['title' => 'Tarea de Ana', 'user_id' => 1])
+        ->assertCreated()
+        ->assertJson(['user_id' => 7]);
+});
+
+it('lists only the tasks of the caller', function () {
+    $me = fakeUserService(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    Task::factory()->create(['title' => 'Mía', 'user_id' => $me['id']]);
+    Task::factory()->create(['title' => 'De Luis', 'user_id' => 2]);
+
+    $response = $this->withToken('test-token')->getJson('/api/tasks')->assertOk();
+
+    expect($response->json('data'))->toHaveCount(1)
+        ->and($response->json('data.0.title'))->toBe('Mía');
+});
+
+it('refuses to show a task that belongs to someone else', function () {
+    fakeUserService(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['user_id' => 2]);
+
+    $this->withToken('test-token')->getJson("/api/tasks/{$task->id}")->assertForbidden();
+});
+
+it('refuses to update a task that belongs to someone else', function () {
+    fakeUserService(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['title' => 'De Luis', 'user_id' => 2]);
+
+    $this->withToken('test-token')
+        ->putJson("/api/tasks/{$task->id}", ['title' => 'Secuestrada'])
+        ->assertForbidden();
+
+    expect($task->fresh()->title)->toBe('De Luis');
+});
+
+it('refuses to delete a task that belongs to someone else', function () {
+    fakeUserService(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['user_id' => 2]);
+
+    $this->withToken('test-token')->deleteJson("/api/tasks/{$task->id}")->assertForbidden();
+
+    expect(Task::query()->count())->toBe(1);
+});
+
+it('updates and deletes its own task', function () {
+    fakeUserService(['id' => 5, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['title' => 'Título viejo', 'user_id' => 5]);
+
+    $this->withToken('test-token')
+        ->putJson("/api/tasks/{$task->id}", [
+            'title' => 'Título nuevo',
+            'status' => Task::STATUS_COMPLETED,
+        ])
+        ->assertOk()
+        ->assertJson(['title' => 'Título nuevo', 'status' => Task::STATUS_COMPLETED]);
+
+    $this->withToken('test-token')->deleteJson("/api/tasks/{$task->id}")->assertNoContent();
 
     expect(Task::query()->count())->toBe(0);
+});
+
+it('validates the payload before touching anything', function () {
+    fakeUserService();
+
+    $this->withToken('test-token')
+        ->postJson('/api/tasks', ['status' => 'inventado'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors(['title', 'status']);
+});
+
+it('rejects a status outside the allowed set', function () {
+    fakeUserService();
+
+    $this->withToken('test-token')
+        ->postJson('/api/tasks', ['title' => 'Tarea', 'status' => 'volando'])
+        ->assertStatus(422)
+        ->assertJsonValidationErrors('status');
 });

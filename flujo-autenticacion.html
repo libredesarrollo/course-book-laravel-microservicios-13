@@ -1,0 +1,971 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Autenticación entre microservicios Laravel: flujo completo</title>
+
+<meta name="description" content="Cómo autenticar un token entre dos microservicios Laravel sin base de datos compartida: flujo, código, errores reales y el precio en latencia.">
+<meta name="keywords" content="autenticación microservicios Laravel, token API Laravel, auth entre servicios, opaco vs JWT, UserServiceClient, middleware autenticación Laravel, microservicios sin base de datos compartida">
+<meta name="author" content="desarrollolibre.net">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:site_name" content="desarrollolibre.net">
+<meta property="og:title" content="Autenticación entre microservicios Laravel: flujo completo">
+<meta property="og:description" content="Cómo autenticar un token entre dos microservicios Laravel sin base de datos compartida: flujo, código, errores reales y el precio en latencia.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Autenticación entre microservicios Laravel: flujo completo">
+<meta name="twitter:description" content="Flujo, código, errores reales y el precio en latencia de validar tokens por HTTP.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Autenticación entre microservicios Laravel: flujo completo",
+  "description": "Cómo autenticar un token entre dos microservicios Laravel sin base de datos compartida: flujo, código, errores reales y el precio en latencia.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-11",
+  "dateModified": "2026-10-11",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "Laravel",
+  "keywords": "autenticación, microservicios, Laravel, token API, JWT, middleware",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Autenticación entre microservicios Laravel: flujo completo</h1>
+
+<p><strong>Resumen:</strong> cuando dos servicios no comparten base de datos, el que quiere proteger un recurso no puede validar por su cuenta quién está llamando. La solución más simple y la más honesta es que le pregunte al servicio dueño de la identidad por HTTP. Este artículo implementa exactamente eso, muestra el código completo, y explica lo que cuesta.</p>
+
+<p>Lo construiremos sobre un proyecto real de dos servicios: <strong>user-service</strong> (dueño de los usuarios, autenticador) y <strong>task-service</strong> (dueño de las tareas). Cada uno con su base de datos, sin llaves foráneas cruzadas, hablando solo por HTTP.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema que resuelve la autenticación</a></li>
+<li><a href="#decidir">La decisión: validar por HTTP o token stateless</a></li>
+<li><a href="#flujo">El flujo, paso a paso</a></li>
+<li><a href="#tabla-tokens">La tabla api_tokens (solo hashes)</a></li>
+<li><a href="#middleware">El middleware del task-service</a></li>
+<li><a href="#propiedad">De dónde sale el user_id, y por qué ya no se valida</a></li>
+<li><a href="#ui">La UI: sesión web con token</a></li>
+<li><a href="#errores">Tres errores reales que aparecieron</a></li>
+<li><a href="#matriz">Matriz de respuestas</a></li>
+<li><a href="#verificar">Verificarlo con cURL</a></li>
+<li><a href="#precio">El precio: latencia y disponibilidad</a></li>
+<li><a href="#alternativas">Las alternativas y cuándo tienen sentido</a></li>
+<li><a href="#tercer-servicio">¿Y si hay un tercer microservicio?</a></li>
+<li><a href="#libreria-compartida">Una carpeta con clases reutilizables</a></li>
+<li><a href="#limitaciones">Limitaciones honestas</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="problema">1. El problema que resuelve la autenticación</h2>
+
+<p>Antes de añadir autenticación, el flujo era "abierto": cualquiera podía crear, editar y borrar cualquier tarea.</p>
+
+<pre><code>$ curl -X POST http://127.0.0.1:8001/api/tasks \
+    -H "Content-Type: application/json" \
+    -d '{"title":"Tarea maliciosa","user_id":42}'
+
+201 Created   # sin preguntar quién eres</code></pre>
+
+<p>Y más grave: <strong>el user_id venía en el cuerpo del request</strong>. La validación por HTTP al user-service solo comprobaba que ese usuario existiera, no que quien llamara fuera ese usuario. Cualquiera podía crear una tarea "de Ana Torres" sin ser Ana.</p>
+
+<p>Eso significa que la validación hacía la mitad del trabajo, y la mitad que faltaba era la importante. La autenticación cierra ese hueco: el user_id deja de ser un dato que el cliente afirma y pasa a ser una identidad que el sistema resuelve.</p>
+
+<h3>El punto de partida</h3>
+
+<pre><code>// ANTES: el cliente dice quién es, y hay que ir a comprobar que existe
+$validated = $request-&gt;validate(['user_id' =&gt; ['required', 'integer']]);
+
+if ($userService-&gt;find($validated['user_id']) === null) {
+    return response()-&gt;json(['error' =&gt; 'El usuario no existe en el sistema'], 422);
+}
+
+$task = Task::create([
+    'title'   =&gt; $validated['title'],
+    'user_id' =&gt; $validated['user_id'],
+]);</code></pre>
+
+<div>
+<p><strong>El bug de fondo:</strong> una validación de existencia no es una autorización. La primera responde "¿este id corresponde a alguien?", la segunda responde "¿tienes derecho a actuar en nombre de ese alguien?". Son preguntas distintas y esta implementación solo hacía la primera.</p>
+</div>
+
+
+<h2 id="decidir">2. La decisión: validar por HTTP o token stateless</h2>
+
+<p>El task-service necesita saber quién llama. Pero la tabla de usuarios y de tokens vive en el user-service. Hay dos caminos, y no son equivalentes.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Validar por HTTP (lo que hicimos)</th><th>Token stateless (JWT)</th></tr>
+<tr>
+<td><strong>Dónde se valida</strong></td>
+<td>El task-service reenvía el token al user-service</td>
+<td>El task-service verifica la firma en local, sin llamar a nadie</td>
+</tr>
+<tr>
+<td><strong>Latencia por request</strong></td>
+<td>+1 salto de red (~20 ms en local)</td>
+<td>0 saltos</td>
+</tr>
+<tr>
+<td><strong>Si el user-service cae</strong></td>
+<td>Nadie puede autenticarse: 503 en todo</td>
+<td>La API sigue funcionando con normalidad</td>
+</tr>
+<tr>
+<td><strong>Revocar un token</strong></td>
+<td>Trivial: borrar la fila</td>
+<td>Difícil: el token es válido hasta que expira</td>
+</tr>
+<tr>
+<td><strong>Escalado</strong></td>
+<td>Cada réplica del user-service recibe carga extra</td>
+<td>Totalmente horizontal</td>
+</tr>
+</table>
+
+<p><strong>Elegimos validar por HTTP.</strong> Es el diseño arquitectónicamente correcto: el estado de identidad tiene un único dueño y nadie lo replica. El costo es explícito y, sobre todo, demostrable en cinco segundos apagando un servicio.</p>
+
+<p>El downside lo conocemos antes de escribir el código: es exactamente lo que un JWT viene a evitar. Lo dejamos así a propósito, y al final del artículo comparamos las tres opciones con sus números.</p>
+
+
+<h2 id="flujo">3. El flujo, paso a paso</h2>
+
+<pre>
+  LOGIN (una vez)
+
+  Cliente ──POST /api/tokens──▶ user-service ──▶ SELECT en users
+      │         {email,           │                INSERT en api_tokens
+      │          password}        │◀── token en claro (una sola vez)
+      │◀────── 201 + token ───────┘
+
+  CADA REQUEST POSTERIOR
+
+  Cliente ──GET /api/tasks──▶ task-service ──GET /api/user──▶ user-service
+      │                        middleware                       SELECT por
+      │                            │                             hash sha256
+      │                            │◀──── {id, name, email} ─────┘
+      │                            │
+      │                            ▼  "¿quién es este token?"
+      │                        request->attributes
+      │                            │
+      │                            ▼
+      │                        db_tasks (user_id = identidad, no input)
+      │◀───── 200 / 201 / 401 / 403 ─┘
+</pre>
+
+<ol>
+<li>El cliente manda email y contraseña al user-service.</li>
+<li>El user-service verifica el hash de la contraseña y emite un token opaco.</li>
+<li>El cliente usa ese token como <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+<li>El task-service no puede validarlo (no tiene la tabla), así que se lo reenvía al user-service.</li>
+<li>El user-service responde quién es. Si el token no existe o expiró, responde 401.</li>
+<li>El task-service guarda esa identidad en la petición y sigue.</li>
+<li>El <code>user_id</code> sale de ahí. Nunca del cuerpo del request.</li>
+</ol>
+
+
+<h2 id="tabla-tokens">4. La tabla api_tokens (solo hashes)</h2>
+
+<pre><code>Schema::create('api_tokens', function (Blueprint $table) {
+    $table-&gt;id();
+    $table-&gt;foreignId('user_id')-&gt;constrained()-&gt;cascadeOnDelete();
+
+    // Solo se guarda el hash del token. Si alguien lee esta tabla,
+    // no puede suplantar a nadie: el token en claro existe una sola
+    // vez, en la respuesta del POST /api/tokens.
+    $table-&gt;string('token_hash', 64)-&gt;unique();
+
+    $table-&gt;string('name')-&gt;default('api-token');
+    $table-&gt;timestamp('last_used_at')-&gt;nullable();
+    $table-&gt;timestamp('expires_at')-&gt;nullable();
+    $table-&gt;timestamps();
+});</code></pre>
+
+<p>Aquí hay una FK, y está bien: es una integridad <em>interna</em> del user-service con su propia tabla. Lo que no existe son FKs cruzadas hacia tareas.</p>
+
+<h3>Emitir el token</h3>
+
+<pre><code>public static function issueFor(User $user, string $name = 'api-token'): array
+{
+    $plain = bin2hex(random_bytes(32));
+
+    $model = $user-&gt;tokens()-&gt;create([
+        'token_hash' =&gt; hash('sha256', $plain),
+        'name' =&gt; $name,
+    ]);
+
+    return ['token' =&gt; $plain, 'model' =&gt; $model];
+}</code></pre>
+
+<h3>Buscar un token</h3>
+
+<pre><code>public static function findByPlainText(?string $plainToken): ?self
+{
+    if ($plainToken === null || $plainToken === '') {
+        return null;
+    }
+
+    return static::query()
+        -&gt;with('user')
+        -&gt;where('token_hash', hash('sha256', $plainToken))
+        -&gt;where(fn ($query) =&gt; $query-&gt;whereNull('expires_at')
+                                   -&gt;orWhere('expires_at', '&gt;', now()))
+        -&gt;first();
+}</code></pre>
+
+<p>La consulta es un índice único sobre un hash de 64 caracteres. O sea, O(1) y sin possibility de colisión práctica.</p>
+
+<div>
+<p><strong>Por qué SHA-256 y no bcrypt/Argon2:</strong> porque el token no es una contraseña que alguien pueda escoger. Son 32 bytes de <code>random_bytes</code>, sin espacio de búsqueda que recorrer. El atacante tendría que adivinar el token entero; hashear es solo para que una fuga de la base de datos no sirva. Con una contraseña chosen por el usuario, el ataque de fuerza bruta sí es realista y ahí sí toca Argon2.</p>
+</div>
+
+
+<h2 id="middleware">5. El middleware del task-service</h2>
+
+<p>Este es el corazón del asunto. El task-service recibe un token que no puede validar, así que lo reenvía.</p>
+
+<pre><code>class AuthenticateWithUserService
+{
+    public function __construct(private readonly UserServiceClient $users) {}
+
+    public function handle(Request $request, Closure $next): Response
+    {
+        $token = $request-&gt;bearerToken()
+            ?? ($request-&gt;hasSession() ? $request-&gt;session()-&gt;get('api_token') : null);
+
+        if (! is_string($token) || $token === '') {
+            return $this-&gt;reject($request);
+        }
+
+        $user = $this-&gt;users-&gt;authenticate($token);
+
+        if ($user === null) {
+            // Token caducado o revocado: la sesión web tampoco sirve ya.
+            // Ojo: las rutas /api/* no arrancan sesión, así que hay que
+            // preguntar antes de tocarla.
+            if ($request-&gt;hasSession()) {
+                $request-&gt;session()-&gt;forget('api_token');
+            }
+
+            return $this-&gt;reject($request);
+        }
+
+        $request-&gt;attributes-&gt;set('authenticated_user', AuthenticatedUser::fromArray($user));
+
+        return $next($request);
+    }
+
+    private function reject(Request $request): Response
+    {
+        if ($request-&gt;is('api/*') || $request-&gt;expectsJson()) {
+            return response()-&gt;json([
+                'error' =&gt; 'Unauthenticated.',
+                'message' =&gt; 'Envía un token válido como: Authorization: Bearer &lt;token&gt;',
+            ], 401);
+        }
+
+        return redirect()-&gt;guest(route('login'));
+    }
+}</code></pre>
+
+<p>Ese middleware es el <strong>API Gateway de facto</strong>: decide 401 en JSON para la API y redirección al login para la UI, según quién esté llamando. Un solo lugar, ningún controller tiene que acordarse.</p>
+
+<h3>El cliente que hace el reenvío</h3>
+
+<pre><code>/**
+ * @return array{id: int, name: string, email: string}|null null si el token no es válido
+ */
+public function authenticate(string $token): ?array
+{
+    $response = $this-&gt;request('/api/user', ['Authorization' =&gt; "Bearer {$token}"]);
+
+    // 401 no es un fallo del servicio: es "este token no vale".
+    if ($response-&gt;status() === 401) {
+        return null;
+    }
+
+    if ($response-&gt;failed()) {
+        throw new UserServiceErrorException(
+            "El user-service respondió {$response-&gt;status()} al validar el token."
+        );
+    }
+
+    return $response-&gt;json();
+}</code></pre>
+
+<p>Fíjate en la distinción: <code>401</code> significa "identidad inválida" y se traduce a un <code>null</code>. Cualquier otro status es un problema del servicio y se lanza una excepción. Confundir esos dos casos es un bug clásico: termina tratando "tu token venció" como "el servidor se cayó".</p>
+
+
+<h2 id="propiedad">6. De dónde sale el user_id, y por qué ya no se valida</h2>
+
+<p>Aquí está el cambio de fondo, y conviene mirarlo de cerca porque es la lección del ejercicio.</p>
+
+<pre><code>public function store(StoreTaskRequest $request): JsonResponse
+{
+    $validated = $request-&gt;validated();
+
+    $task = Task::query()-&gt;create([
+        'title' =&gt; $validated['title'],
+        'user_id' =&gt; $this-&gt;user()-&gt;id,     // &lt;-- identidad, no input
+        'status' =&gt; $validated['status'] ?? Task::STATUS_PENDING,
+    ]);
+
+    return response()-&gt;json($task, 201);
+}</code></pre>
+
+<p>Antes, este método llamaba al user-service por HTTP para comprobar que el <code>user_id</code> fuera válido. <strong>Esa llamada ya no existe, y no es un descuido: es que se volvió redundante.</strong></p>
+
+<p>El middleware acaba de confirmar por HTTP que ese mismo usuario existe. Preguntarlo otra vez sería pagar la latencia otra vez para obtener la misma respuesta. La validación y la autenticación hacen el mismo trabajo; con autenticación, la validación quedó absorbida.</p>
+
+<p>Y el <code>user_id</code> desapareció del payload de entrada. <code>StoreTaskRequest</code> ya solo valida <code>title</code> y <code>status</code>. Si un cliente manda <code>user_id</code> a propósito, Laravel lo descarta en silencio.</p>
+
+<pre><code>$ curl -X POST .../api/tasks -d '{"title":"Tarea de Ana","user_id":999}'
+{"title":"Tarea de Ana","user_id":1, ...}   [201]   # el 999 se ignoró</code></pre>
+
+<h3>Y las tareas de otros</h3>
+
+<pre><code>protected function findOwnedTask(int $taskId): Task
+{
+    $task = Task::query()-&gt;findOrFail($taskId);
+
+    abort_unless($this-&gt;owns($task-&gt;user_id), 403, 'Esta tarea no es tuya.');
+
+    return $task;
+}</code></pre>
+
+<p>El <code>user_id</code> almacenado sí se sigue usando, pero para algo distinto: para comprobar propiedad, no para validar identidad. Esa distinción es el corazón del cambio.</p>
+
+
+<h2 id="ui">7. La UI: sesión web con token</h2>
+
+<p>La web no usa cookies de sesión para la identidad, porque no tiene usuarios. Guarda el token del user-service en su propia sesión de Laravel y el middleware lo lee de ahí.</p>
+
+<pre><code>public function store(Request $request, UserServiceClient $users): RedirectResponse
+{
+    $validated = $request-&gt;validate([
+        'email' =&gt; ['required', 'email'],
+        'password' =&gt; ['required', 'string'],
+    ]);
+
+    try {
+        $token = $users-&gt;issueToken($validated + ['device_name' =&gt; 'task-service-web']);
+    } catch (UserServiceErrorException) {
+        return back()-&gt;withInput($request-&gt;only('email'))
+                     -&gt;withErrors(['email' =&gt; 'Credenciales inválidas.']);
+    }
+
+    $request-&gt;session()-&gt;regenerate();
+    $request-&gt;session()-&gt;put('api_token', $token);
+
+    return redirect()-&gt;intended(route('tasks.index'));
+}</code></pre>
+
+<p>El task-service nunca ve una contraseña: solo la reenvía y guarda el token que le devuelven.</p>
+
+<h3>Logout que revoca de verdad</h3>
+
+<pre><code>public function destroy(Request $request, UserServiceClient $users): RedirectResponse
+{
+    $token = $request-&gt;session()-&gt;get('api_token');
+
+    // Revocar en el user-service es lo que lo hace inutilizable de verdad:
+    // si solo lo borramos de la sesión, el token sigue vivo en su tabla.
+    if (is_string($token) &amp;&amp; $token !== '') {
+        rescue(fn () =&gt; $users-&gt;revokeToken($token), report: false);
+    }
+
+    $request-&gt;session()-&gt;forget('api_token');
+    $request-&gt;session()-&gt;invalidate();
+    $request-&gt;session()-&gt;regenerateToken();
+
+    return redirect()-&gt;route('login');
+}</code></pre>
+
+<p>Muchas implementaciones olvidan el paso del <code>revokeToken</code>, y entonces el "cerrar sesión" solo borra una cookie: el token sigue sirviendo desde curl hasta que expira. Ese es un fallo de seguridad, no una molestia.</p>
+
+<div>
+<p><strong>Dos fuentes de token, una sola regla:</strong> el middleware acepta el header <code>Bearer</code> o la sesión. El código es idéntico para ambos, así que la UI y la API no pueden divergir por accidente. Un token válido presentado en la UI vale lo mismo que en la API, porque la validación ocurre siempre en el user-service.</p>
+</div>
+
+
+<h2 id="errores">8. Tres errores reales que aparecieron</h2>
+
+<p>Ninguno se detectó leyendo el código: los dos primeros los encontraron los tests, y el tercero, curl.</p>
+
+<h3>8.1 Fuga de información por route model binding</h3>
+
+<p>La primera versión usaba la resolución implícita de modelos:</p>
+
+<pre><code>public function show(Task $task): JsonResponse   // binding implícito</code></pre>
+
+<p>El test esperaba 401 y recibió 404. La causa es el orden de los middleware: <code>SubstituteBindings</code> se ejecuta <strong>antes</strong> que el de autenticación, así que la base de datos se consultaba antes de saber quién llamaba.</p>
+
+<pre><code>$ curl /api/tasks/1        # sin token
+404 Not Found    # -> "esta tarea no existe"
+
+$ curl /api/tasks/999999    # sin token
+404 Not Found    # -> indistinguible, pero...
+
+# con un token de Ana:
+$ curl /api/tasks/1        # tarea de Luis
+403 Forbidden   # -> "existe, pero no es tuya"</code></pre>
+
+<p>Un anónimo podía distinguir qué ids existen en la base de datos de otra persona solo por el código de respuesta. Eso es una fuga de información, por pequeña que parezca.</p>
+
+<p><strong>La solución:</strong> sacar la resolución del modelo del binding y hacerla dentro del controller, después de autenticar. Así un intruso solo ve 401 y nunca tiene la ocasión de preguntar por la existencia de nada.</p>
+
+<pre><code>// routes/api.php sigue igual; cambia la firma del método
+public function show(int $task): JsonResponse
+{
+    return response()-&gt;json($this-&gt;findOwnedTask($task));
+}</code></pre>
+
+<h3>8.2 Un 500 en cada request de API</h3>
+
+<pre><code>$request-&gt;session()-&gt;forget('api_token');   // RuntimeException</code></pre>
+
+<p>El grupo de middleware <code>api</code> no arranca sesión. Llamar a <code>-&gt;session()</code> ahí lanza "Session store not set on request", y ese 500 solo aparecía cuando el token era inválido, no cuando faltaba. El camino infeliz, sin cobertura.</p>
+
+<pre><code>if ($request-&gt;hasSession()) {
+    $request-&gt;session()-&gt;forget('api_token');
+}</code></pre>
+
+<h3>8.3 "Token expirado" disfrazado de "servidor caído"</h3>
+
+<p>La primera versión del cliente trataba cualquier respuesta no exitosa como error del servicio. Con un token caducado el user-service responde 401 y el cliente lo traducía a "el user-service falló", devolviendo 502 en lugar de 401. El usuario veía "error del servidor" cuando en realidad solo tenía que volver a iniciar sesión.</p>
+
+
+<h2 id="matriz">9. Matriz de respuestas</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Situación</th><th>user-service</th><th>task-service</th><th>UI</th></tr>
+<tr><td>Sin token</td><td>—</td><td><strong>401</strong></td><td>302 a /login</td></tr>
+<tr><td>Token inválido o revocado</td><td>401</td><td><strong>401</strong></td><td>302 a /login</td></tr>
+<tr><td>user-service apagado</td><td>—</td><td><strong>503</strong></td><td>página 503</td></tr>
+<tr><td>user-service responde 500</td><td>500</td><td><strong>502</strong></td><td>página 503</td></tr>
+<tr><td>Tarea de otro usuario</td><td>—</td><td><strong>403</strong></td><td>403</td></tr>
+<tr><td>Token válido y tarea propia</td><td>200</td><td><strong>200 / 201</strong></td><td>200 / 302</td></tr>
+</table>
+
+<p>La distinction importante es la fila 2 contra la 3: <strong>"no sé quién eres" y "no puedo preguntarte quién eres"</strong> son dos problemas distintos y merecen respuestas distintas. Confundirlos convierte un simple "vuelve a loguearte" en un "el sistema está roto".</p>
+
+
+<h2 id="verificar">10. Verificarlo con cURL</h2>
+
+<pre><code># 1. Login contra el user-service
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/tokens \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -d '{"email":"ana.torres@example.com","password":"password"}' \
+  | php -r 'echo json_decode(stream_get_contents(STDIN),true)["token"];')
+
+# 2. Sin token -&gt; 401
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8001/api/tasks
+
+# 3. Con token -&gt; 200
+curl -s http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+
+# 4. Intentar inyectar un user_id -&gt; se ignora
+curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Secreto de Ana","user_id":999}'
+# -&gt; {"title":"Secreto de Ana","user_id":1}  201
+
+# 5. Con otro token, la tarea de Ana -&gt; 403
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8001/api/tasks/1 -H "Authorization: Bearer $TOKEN_DE_LUIS"
+
+# 6. Revocar y reutilizar -&gt; 401
+curl -s -o /dev/null -X DELETE http://127.0.0.1:8000/api/tokens \
+  -H "Authorization: Bearer $TOKEN"
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+
+# 7. Apagar el user-service -&gt; 503 en TODO
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"</code></pre>
+
+<h3>En el navegador</h3>
+
+<pre><code>http://127.0.0.1:8001/tasks        # -&gt; 302 a /login
+# ana.torres@example.com / password
+http://127.0.0.1:8001/tasks        # -&gt; "Sesión de Ana Torres"</code></pre>
+
+
+<h2 id="precio">11. El precio: latencia y disponibilidad</h2>
+
+<p>Esta es la parte que conviene medir, no suponer.</p>
+
+<pre>
+SIN autenticación (antes)          CON autenticación por HTTP (ahora)
+
+Cliente ──── 5ms ───▶ task-svc     Cliente ─── 5ms ───▶ task-svc
+                                    ──── 20ms ───▶ user-svc
+Total ≈ 5 ms                         Total ≈ 25 ms
+</pre>
+
+<h3>La cascada de disponibilidad</h3>
+
+<p>La disponibilidad del task-service pasa a depender de la del user-service de forma directa. Si el user-service está caído:</p>
+
+<ul>
+<li>El login falla (503).</li>
+<li>La API devuelve 503 en todo, incluso para lecturas.</li>
+<li>La UI muestra una página de error explaining por qué.</li>
+</ul>
+
+<p>Ese último punto es el que hace el coste visible en lugar de abstracto. Sin esa página, el usuario ve simplemente "el sistema no funciona" y no tiene forma de saber que es el otro servicio.</p>
+
+<h3>Y lo que se ganó a cambio</h3>
+
+<ul>
+<li>El estado de identidad tiene <strong>un solo dueño</strong>. Nadie lo replica ni lo cachea.</li>
+<li>Revocar es borrar una fila. Inmediato, sin esperar expiraciones.</li>
+<li>El user-service puede aplicar sus propias reglas sin avisar a nadie.</li>
+</ul>
+
+
+<h2 id="alternativas">12. Las alternativas y cuándo tienen sentido</h2>
+
+<h3>Token stateless (JWT)</h3>
+
+<p>El user-service firma un JWT y el task-service verifica la firma en local, sin llamada de red. Resuelve exactamente el problema del apartado anterior.</p>
+
+<p><strong>A cambio:</strong></p>
+<ul>
+<li>Revocar se vuelve difícil. Hasta que expira, el token vale, lo borres o no.</li>
+<li>El payload no es secreto: es base64, no cifrado.</li>
+<li>El reloj de los servicios puede desincronizarse y romper <code>nbf</code> / <code>exp</code>.</li>
+<li>Si ya tienes base de datos, la tabla de revocación es una fila más.</li>
+</ul>
+
+<p><strong>Cuándo tiene sentido:</strong> cuando hay terceros que deben validar el token sin poder consultar tu base de datos. O cuando el user-service es el cuello de botella real.</p>
+
+<h3>mTLS o API Gateway</h3>
+
+<p>La respuesta de producción para tráfico interno. El servicio se identifica con un certificado (mTLS) o con un token de servicio emitido por un gateway con <code>client_credentials</code> de OAuth2: vida corta, audiencia específica, revocable.</p>
+
+<p>Ventaja sobre todo lo anterior: separa la identidad del <em>servicio</em> de la identidad del <em>usuario</em>. En el diseño de este artículo, el task-service reenvía el token de una persona en cada request; con mTLS, lo identifica el certificado del servidor y el token del usuario viaja dentro.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Enfoque</th><th>Latencia</th><th>Revocación</th><th>Complejidad</th><th>Cuándo</th></tr>
+<tr><td>Validar por HTTP</td><td>1 salto</td><td>Inmediata</td><td>Baja</td><td>Aprendiendo, 2-3 servicios, monolito modular</td></tr>
+<tr><td>JWT</td><td>0 saltos</td><td>Complexa</td><td>Media</td><td>Muchos servicios, terceros validando</td></tr>
+<tr><td>mTLS / Gateway</td><td>0 saltos extra*</td><td>Por rotación</td><td>Alta</td><td>Producción seria, Kubernetes</td></tr>
+</table>
+
+<p><small>* mTLS no añade saltos de red, pero sí handshake TLS y gestión de certificados, que es donde está su coste real.</small></p>
+
+<p>El orden sensato es empezar por validar por HTTP porque es la opción que te deja <em>ver</em> el problema, y saltar a la siguiente cuando ese problema te esté doliendo. Montar mTLS antes de tener dos servicios es pagar una factura que todavía no te llegó.</p>
+
+
+<h2 id="limitaciones">13. Limitaciones honestas</h2>
+
+<ul>
+<li><strong>Sin circuit breaker.</strong> Con el user-service caído, cada request espera el timeout completo (3 s) antes de rendirse. Un circuit breaker lo convertiría en un fallo inmediato.</li>
+<li><strong>Un salto de red en cada request.</strong> Multiplicado por latencia alta y concurrencia, es el techo de escalado del diseño.</li>
+<li><strong>Los tokens no expiran por defecto.</strong> La columna <code>expires_at</code> existe y el código la respeta, pero el seeder emite tokens sin caducidad. En producción, un TTL corto con renovación sería lo normal.</li>
+<li><strong>Sin refresh tokens.</strong> El cliente tiene que pedir un token nuevo con la contraseña cuando caduque. Aceptable en local, incómodo en una app real.</li>
+<li><strong>Sin rate limiting en la emisión.</strong> El login de la UI tiene <code>throttle:6,1</code>, pero <code>POST /api/tokens</code> del user-service no lo tiene. Es el endpoint que recibe contraseñas: el primero que debería estar limitado.</li>
+<li><strong>Una sola identidad.</strong> No hay roles ni permisos. Cualquier usuario autenticado puede tocar sus propias tareas, que es lo correcto, pero no hay un modelo de autorización más rico.</li>
+<li><strong>La migración de usuarios existentes.</strong> Añadir la columna de contraseña a una tabla ya poblada no tiene valor por defecto. Aquí se resolvió con <code>migrate:fresh</code> porque no había datos reales.</li>
+</ul>
+
+<h2 id="tercer-servicio">14. ¿Y si hay un tercer microservicio?</h2>
+
+<p>Metamos un <strong>tags-service</strong>: mismo patrón que tasks, su propia base de datos, hablando con el user-service. La pregunta es si hay que volver a escribir el <code>AuthController</code> de tasks, y qué alternativas existen.</p>
+
+<p>Antes de listar opciones conviene mirar qué es realmente ese <code>AuthController</code>, porque no es lo que parece.</p>
+
+<pre><code>// app/Http/Controllers/AuthController.php  (task-service)
+show()    -&gt; pinta un formulario
+store()   -&gt; POST /api/tokens al user-service, guarda el token en sesión
+destroy() -&gt; DELETE /api/tokens al user-service, borra la sesión</code></pre>
+
+<p>Ese controlador no tiene nada de dominio de tareas. Su trabajo es: <strong>"soy un cliente del proveedor de identidad, déjame canjear credenciales por un token"</strong>. Eso es un rol de OAuth client, no de servicio de tareas.</p>
+
+<div>
+<p><strong>La observación que ordena el debate:</strong> hay dos piezas de naturaleza muy distinta.</p>
+<ul>
+<li>El <strong>middleware</strong> (~40 líneas) es la frontera de seguridad. Es pequeño, casi no cambia, y su código es el mismo en cualquier servicio.</li>
+<li>El <strong>AuthController</strong> (~60 líneas) es casi todo UX: un formulario, un redirect, un mensaje de error. Es el que se va a duplicar.</li>
+</ul>
+<p>La pregunta "¿duplico el AuthController?" en realidad es "¿cuántos sitios dejamos que implementen el baile de OAuth client?"</p>
+</div>
+
+<h3>Opción A — Duplicar el AuthController en cada servicio</h3>
+
+<p>Copiar el archivo a tags-service tal cual. Es lo que haría cualquiera por defecto, y no es una mala decisión.</p>
+
+<p><strong>A favor:</strong> cada servicio se despliega y se rompe de forma independiente. Cada uno puede tener su propio diseño de login, su idioma, su flujo de "olvidé mi contraseña". Ningún servicio depende del release de otro.</p>
+
+<p><strong>En contra:</strong> N copias. Si mañana añades rate limiting al login, o manejas un caso raro de CSRF, tienes que acordarte de los N. El coste no es el tamaño del archivo: es el número de sitios donde puede olvidarse alguien de arreglar un fallo de seguridad.</p>
+
+<p><strong>Cuándo:</strong> con dos o tres servicios, y siempre que la diferencia de UX sea real. Este proyecto tiene dos, y por eso la opción A es razonable hoy.</p>
+
+<h3>Opción B — Extraer a un paquete Composer compartido</h3>
+
+<p>Un paquete local, referenciado con un <code>path repository</code> en el <code>composer.json</code>, que exporta el middleware, el controller base y el cliente HTTP del user-service.</p>
+
+<pre><code>// composer.json de cada servicio
+"repositories": [
+    { "type": "path", "url": "../packages/auth-bridge" }
+],
+"require": {
+    "acme/auth-bridge": "*"
+}</code></pre>
+
+<p>Cada servicio recibe el código y puede extenderlo si necesita. Una sola fuente de verdad, y el bug de seguridad se arregla una vez.</p>
+
+<p><strong>A favor:</strong> una copia, versionable con etiquetas de Git, y cada servicio puede ajustar la vista sin romper a los demás.</p>
+
+<p><strong>En contra, y es importante:</strong> <strong>acopla los ciclos de release</strong>. Un error en el paqueterompe los tres servicios a la vez, y cada servicio queda clavado en la versión que le funciona. Además aparece el problema clásico de "este servicio necesita un parche del paquete, y ya hay tres en producción". Es un coste que no se ve hasta el cuarto servicio.</p>
+
+<p><strong>Cuándo:</strong> cuando ya tienes más de tres o cuatro servicios <em>del mismo equipo</em> y despliegan juntos. Antes de eso es infraestructura por adelantado.</p>
+
+<h3>Opción C — Login centralizado en el user-service</h3>
+
+<p>El user-service aloja el formulario, recibe la contraseña, emite el token y devuelve al cliente a la app que lo pidió. El task-service y el tags-service <strong>no tienen ningún AuthController</strong>: solo el middleware.</p>
+
+<pre><code>Cliente ──▶ /login (en user-service)
+              │
+              ├─ POST /api/tokens  (allí mismo, sin salir del servicio)
+              │
+              └─▶ redirige a http://tasks.app.local/tasks  + el token</code></pre>
+
+<p><strong>El argumento fuerte, y es contraintuitivo:</strong> esto <strong>no añade acoplamiento nuevo</strong>. Todos los servicios ya dependen del user-service para validar cualquier request, así que movedr el login allí no crea ninguna dependencia que antes no existiera. Lo que hace es <strong>eliminar código duplicado</strong>.</p>
+
+<p><strong>A favor:</strong> una sola UX de login en toda la organización. Y cuando llegue MFA, passkeys o "login con Google", se implementa <strong>una vez</strong> y todos los servicios lo heredan sin tocar una línea.</p>
+
+<p><strong>En contra:</strong> el user-service deja de ser solo un servicio de datos y se convierte en algo con cara de aplicación. Y aparece un problema serio de transporte, que es el siguiente punto.</p>
+
+<h3>El detalle que se cuela aquí: cómo cruza el token</h3>
+
+<p>El token tiene que volver del user-service al task-service de alguna manera, y cada opción tiene un problema distinto:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Método</th><th>Cómo funciona</th><th>Riesgo</th></tr>
+<tr>
+<td><strong>Query string</strong><br><code>?token=...</code></td>
+<td>El redirect más simple</td>
+<td>El token queda en los logs del servidor, en el historial del navegador y en la cabecera <code>Referer</code> de la siguiente página. <strong>No usarlo.</strong></td>
+</tr>
+<tr>
+<td><strong>Fragment</strong><br><code>#token=...</code></td>
+<td>La parte tras el # nunca viaja al servidor</td>
+<td>Requiere JavaScript para leerlo y guardarlo. Funciona, pero mete JS en el camino crítico del login.</td>
+</tr>
+<tr>
+<td><strong>Cookie de dominio padre</strong><br><code>.app.local</code></td>
+<td>El user-service deja la cookie y <strong>todos</strong> los servicios la leen</td>
+<td>Exige que las apps compartan dominio padre. Y en realidad, ¿para qué volver al login si la cookie ya autentica a todas?</td>
+</tr>
+<tr>
+<td><strong>form_post</strong><br>(estándar OIDC)</td>
+<td>El user-service devuelve un formulario auto-enviado por POST</td>
+<td>Es el más correcto para el flujo servidor-a-servidor, y el más inusual de montar.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La observación:</strong> en cuanto pensas en cómo transporting el token entre servicios, descubres que la opción C empuja el problema hacia una respuesta más interesante, y por eso termina siendo la <strong>opción D</strong>.</p>
+</div>
+
+<h3>Opción D — API Gateway / BFF en el borde</h3>
+
+<p>Un componente delante de todos los servicios hace el login <em>una vez</em> y entrega a cada servicio una identidad ya resuelta en una cabecera. Los servicios dejan de hablar de autenticación por completo.</p>
+
+<pre><code>Cliente ──▶ Gateway ──X-Authenticated-User: {"id":1,...}──▶ task-service
+                │
+                ├─▶ tags-service
+                └─▶ user-service
+
+Los servicios ya NO llaman al user-service en cada request.</code></pre>
+
+<p><strong>A favor:</strong> elimina el salto de red por request (el problema de la sección 11, resuelto de raíz), la política queda en un solo sitio, y añadir un servicio nuevo no requiere tocar auth en absoluto.</p>
+
+<p><strong>En contra, y son graves:</strong></p>
+
+<ul>
+<li><strong>La cabecera se puede falsificar.</strong> Si alguien alcanza task-service saltándose el gateway, puede mandar <code>X-Authenticated-User</code> a mano y ser Ana. La red interna tiene que estar cerrada y verificada, o la cabecera tiene que ir firmada.</li>
+<li>El gateway pasa a ser <strong>infraestructura crítica</strong>: si se cae, no entra nadie.</li>
+<li>Introduce un componente más que operar, con su propio despliegue, sus logs y sus versiones.</li>
+</ul>
+
+<p><strong>Cuándo:</strong> en producción con Kubernetes, cuando el número de servicios hace que la latencia por request importe de verdad. No antes.</p>
+
+<h3>Opción E — Que el cliente haga el login</h3>
+
+<p>Una SPA o app móvil habla solo con el user-service (o el gateway) para autenticarse, guarda el token en su propio almacenamiento, y lo envía en cada request. Ningún servicio tiene formulario de login.</p>
+
+<p><strong>A favor:</strong> los servicios quedan sin una línea de código de UI de autenticación. Es el patrón normal en mobile.</p>
+
+<p><strong>En contra:</strong> necesitas ese cliente. Y el token vive en el navegador, lo que reabre la discusión entera de XSS vs httpOnly cookie.</p>
+
+<h3>Comparación</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr>
+<th>Opción</th>
+<th>AuthController por servicio</th>
+<th>Saltos de red por request</th>
+<th>Riesgo principal</th>
+<th>Cuándo</th>
+</tr>
+<tr>
+<td><strong>A. Duplicar</strong></td>
+<td>Sí, N copias</td>
+<td>1</td>
+<td>Olvidarse de arreglar un fallo en los N sitios</td>
+<td>2-3 servicios, UX distintos</td>
+</tr>
+<tr>
+<td><strong>B. Paquete</strong></td>
+<td>No, se hereda</td>
+<td>1</td>
+<td>Acoplar los ciclos de release</td>
+<td>4+ servicios del mismo equipo</td>
+</tr>
+<tr>
+<td><strong>C. Login central</strong></td>
+<td>No</td>
+<td>1</td>
+<td>El token viaja en la redirección</td>
+<td>Cuando el login repetido duela</td>
+</tr>
+<tr>
+<td><strong>D. Gateway</strong></td>
+<td>No, ni middleware</td>
+<td>0</td>
+<td>Cabecera falsificable si la red no está cerrada</td>
+<td>Producción seria, muchos servicios</td>
+</tr>
+<tr>
+<td><strong>E. Cliente</strong></td>
+<td>No</td>
+<td>1</td>
+<td>El token en el navegador</td>
+<td>Si ya hay SPA o app móvil</td>
+</tr>
+</table>
+
+<h3>Qué haría yo aquí</h3>
+
+<p>Con task-service y tags-service, <strong>seguiría con la opción A</strong>, pero con una disciplina mínima que la hace tolerable:</p>
+
+<ol>
+<li>El <strong>middleware</strong> se mantiene sin cambios: es la frontera de seguridad y debe ser idéntica en todas partes. Si algún día hay que cambiarlo, se cambia en todos a la vez, y los tests de los tres servicios lo cubren.</li>
+<li>El <strong>UserServiceClient</strong> también se mantiene sin cambios, por el mismo motivo.</li>
+<li>El <strong>AuthController</strong>, en cambio, es candidato natural a moverse al user-service (opción C) en cuanto exista una tercera aplicación. No antes: con dos, la duplicación es más barata que el acoplamiento.</li>
+</ol>
+
+<p>El <strong>momento exacto</strong> del cambio no lo marca el número de servicios, sino una pregunta concreta: <em>"¿cuántas veces al mes me va a doler corregir el login en todos lados a la vez?"</em> Si la respuesta es "una", quédate en A. Si es "varias", ve a C.</p>
+
+<h3>El anti-patrón a evitar</h3>
+
+<p>Existe una sexta opción que parece sensata y no lo es: <strong>convertir el user-service en el dueño de las sesiones de los demás servicios</strong>, de forma que task-service y tags-service consulten "quién es el usuario de esta sesión" directamente, sin tokens.</p>
+
+<p>Rota el aislamiento por dentro: el user-service acaba guardando estado de sesión de otras aplicaciones, y cualquier servicio que quiera saber quién es necesita hablar con él de todos modos. Se parece a la opción C pero pierde el control de la sesión, que es justo lo que hace útil al token.</p>
+
+
+<h2 id="libreria-compartida">15. Una carpeta con clases reutilizables</h2>
+
+<p>La intuición es correcta y es la respuesta que más se repite en equipos que llevan tiempo con microservicios. Pero conviene separar tres cosas que aquí van mezcladas: <em>qué conviene compartir</em>, <em>con qué mecanismo</em>, y <em>cuándo conviene hacerlo</em>.</p>
+
+<div>
+<p><strong>Esto ya está en el artículo:</strong> lo que se propone es la opción B de la sección 14, un paquete Composer local, con el riesgo de acoplar ciclos de release que allí se menciona. Lo que sigue es el detalle fino: qué se comparte, cómo se hereda y cuándo compensa.</p>
+</div>
+
+<h3>15.1 "Una carpeta" tiene tres problemas que no son de estilo</h3>
+
+<p>Antes de elegir la herramienta, hay que ver por qué el naive no funciona. Una carpeta compartida entre servicios parece inocente, pero:</p>
+
+<ul>
+<li><strong>Git no comparte historia.</strong> Si <code>shared/AuthenticateWithUserService.php</code> vive en el repo de task-service y tags-service la importa, Git no sabe que son el mismo archivo. Un <code>git blame</code> no lleva de un servicio al otro, y el historial de un cambio de seguridad no aparece en ninguno de los dos.</li>
+<li><strong>Un cambio obliga a mover todos.</strong> Si es código compartido, entonces está acoplado: tocarlo significa que todos los servicios consumidores cambian de comportamiento en el mismo momento. Eso no es una carpeta, es un despliegue coordinado disfrazado.</li>
+<li><strong>Nadie sabe qué es "compartido".</strong> En la práctica la carpeta crece hasta que contiene el 60% del framework y nadie sabe qué esAPI pública y qué es interno de un servicio.</li>
+</ul>
+
+<p>Ese último punto es el que mata las carpetas compartidas en la práctica. La frontera se diluye sola.</p>
+
+<h3>15.2 "Heredar" es el mecanismo equivocado</h3>
+
+<p>La pregunta fue si los servicios futuros podrían <em>heredar</em> de los archivos del task-service. Conviene separar dos cosas:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Herencia</th><th>Composición</th></tr>
+<tr>
+<td>tags-service <em>extends</em> AuthenticateWithUserService</td>
+<td>Cambias el middleware para los dos a la vez</td>
+<td>Nadie lo nota</td>
+</tr>
+<tr>
+<td>tags-service <em>usa</em> AuthenticateWithUserService</td>
+<td>Cambias solo un servicio, a propósito</td>
+<td>El diff lo muestra explícitamente</td>
+</tr>
+<tr>
+<td>Cambiar la autenticación a JWT en el futuro</td>
+<td>Imposible solo en uno</td>
+<td>Cambias uno, pruebas, decides</td>
+</tr>
+</table>
+
+<p><strong>El caso del JWT lo deja claro:</strong> la sección 12 de este artículo dice que el día que se pase a JWT habrá que cambiar la autenticación. Con herencia no se puede cambiar en un solo servicio sin arrastrar a todos. Con composición, se cambia en uno, se despliega, se mide, y solo después se extiende.</p>
+
+<p>La conclusión no es "nunca heredes", sino: <strong>hereda comportamiento, compone decisiones</strong>. Una clase base para "toda aplicación web con login" es razonable. Heredar de "la autenticación por HTTP contra el user-service" es casarse con una decisión que explícitamente se dejó abierta para poder cambiarla.</p>
+
+<h3>15.3 Lo que de verdad es reutilizable</h3>
+
+<p>La pregunta útil no es "¿comparto el middleware?", sino "<strong>¿qué lleva dentro cada clase: vocabulario o decisiones?</strong>"</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Candidato</th><th>¿Qué lleva dentro?</th><th>Riesgo de compartirlo</th><th>Veredicto</th></tr>
+<tr>
+<td><code>AuthenticatedUser</code></td>
+<td>Solo un DTO: id, name, email</td>
+<td>Ninguno. Es vocabulario</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td>Chequeo de propiedad (<code>owns()</code>, <code>findOwnedTask()</code>)</td>
+<td>Un patrón de autorización por dueño</td>
+<td>Bajo. Casi todos los servicios lo querrán</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td>Contrato de errores (503 / 502)</td>
+<td>La política de cómo se traduce una caída de red</td>
+<td>Bajo, y evita respuestas inconsistentes</td>
+<td><strong>Compartir ya</strong></td>
+</tr>
+<tr>
+<td><code>UserServiceClient</code></td>
+<td>URL, timeout, clasificación de errores, <em>y la decisión de validar por HTTP</em></td>
+<td>Medio. Es justo lo que se va a cambiar si se pasa a JWT</td>
+<td><strong>Compartir la interfaz, no la implementación</strong></td>
+</tr>
+<tr>
+<td><code>AuthenticateWithUserService</code></td>
+<td>La frontera de seguridad, atada a un proveedor concreto</td>
+<td>Alto. Es la decisión central del diseño</td>
+<td><strong>No compartir todavía</strong></td>
+</tr>
+<tr>
+<td><code>AuthController</code></td>
+<td>UX: formulario, redirect, mensajes</td>
+<td>Bajo técnicamente, alto en fricción de despliegue</td>
+<td><strong>No compartir</strong> (ver 15.2)</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La regla que sale de esta tabla:</strong> comparte el vocabulario, no las decisiones. "Un usuario autenticado es un <code>AuthenticatedUser</code> con id, name y email" es un concepto estable. "Para validar quién es, hay que llamar por HTTP al user-service" es una decisión de arquitectura, y las decisiones se cambian sustituyendo, no heredando.</p>
+</div>
+
+<h3>15.4 Las cinco formas de compartir de verdad</h3>
+
+<p>Una vez que se sabe qué se comparte, el mecanismo importa menos de lo que parece:</p>
+
+<h4>A. Carpeta copiada a mano</h4>
+<pre><code>cp ../user-service/app/Support/AuthenticatedUser.php app/Support/
+cp ../user-service/app/Http/Middleware/AuthenticateWithUserService.php app/Http/Middleware/</code></pre>
+<p><strong>A favor:</strong> cero acoplamiento. Cada servicio se despliega y se rompe solo, y es trivial de entender.<br>
+<strong>En contra:</strong> divergencia silenciosa. Si arreglas un fallo de seguridad, los otros se quedan con la versión vieja, y no hay nada que te avise.</p>
+
+<h4>B. Paquete Composer con path repository</h4>
+<pre><code>"repositories": [
+    { "type": "path", "url": "../packages/microservice-kit" }
+],
+"require": {
+    "acme/microservice-kit": "*"
+}</code></pre>
+<p><strong>A favor:</strong> una fuente de verdad real, y es la opción más simple de montar sin publicar nada.<br>
+<strong>En contra, y es lo que más muerde:</strong> el <code>"*"</code> significa "instala siempre la última". Un cambio en el paquete aparece en todos los servicios <strong>sin cambio de versión, sin commit en cada uno y sin que nadie lo decida</strong>. Fijar una etiqueta resuelve eso, y en cuanto la fijas estás haciendo releases: el acoplamiento vuelve por la puerta de atrás.</p>
+
+<h4>C. Git submodule</h4>
+<p><strong>A favor:</strong> un commit del submodule apunta a un punto exacto del repositorio compartido, así que la trazabilidad es perfecta.<br>
+<strong>En contra:</strong> la experiencia de desarrollo es mala. Todo el mundo odia trabajar con submodules. Clonar, actualizar, resolver conflictos, y un <code>git status</code> que no dice nada útil. Para código de aplicación es una mala señal.</p>
+
+<h4>D. Paquete en un registry privado</h4>
+<p><strong>A favor:</strong> la forma profesional. Versionado semántico real, cada servicio fija la versión que le funciona, y se actualiza cuando el equipo lo decide.<br>
+<strong>En contra:</strong> hay que publicar releases de verdad. Un paquete para tres consumidores, donde uno solo es el que produce el cambio, es mucha ceremonia para poca cobertura.</p>
+
+<h4>E. Generar en lugar de compartir</h4>
+<p>En lugar de una dependencia, una plantilla: un repositorio base, o un comando <code>php artisan make:service-template</code>, que al crear un servicio nuevo le estampa el patrón actual. A partir de ahí, cada servicio es <strong>libre</strong> y diverge sin culpa.</p>
+<pre><code>php artisan make:service tags --template=microservice
+# -&gt; crea tags-service con:
+#    - UserServiceClient (copia, editable)
+#    - AuthenticateWithUserService (copia, editable)
+#    - AuthenticatedUser (copia, editable)
+#    - AuthController (copia, editable)
+#    - tests que ya pasan contra el user-service real</code></pre>
+<p><strong>A favor:</strong> combina lo mejor de las dos cosas. Los servicios nuevos nacen consistentes y sus tests ya funcionan, pero después no hay ninguna dependencia que los ate. Un cambio en tags-service no rompe a nadie, y el siguiente servicio lo vuelve a coger con la versión mejorada.<br>
+<strong>En contra:</strong> no resuelve el bug de seguridad en los servicios ya existentes. Para eso hace falta lo de la opción B o D, pero solo para el DTO y el contrato de errores, que es donde no hay decisiones.</p>
+
+<h3>15.5 La regla de tres</h3>
+
+<p>Existe una regla empírica antigua y sigue siendo la mejor guía: <strong>no extraigas hasta la tercera copia.</strong></p>
+
+<p>Con task-service y tags-service hay <em>dos</em>. Extraer con dos instancias es prematuro por dos razones: todavía no sabes qué parte es común y cuál es propia de cada servicio, y el coste del mecanismo no se ha justificado con nadie. Cuando llegue el tercero, ya tendrás la respuesta empírica de qué se parece en la realidad, no en tu imaginación.</p>
+
+<h3>15.6 El coste invisible: los tests</h3>
+
+<p>Hay un efecto secundario que solo se nota después, y merece su propio párrafo. El código compartido sin tests compartidos es <strong>peor que el código duplicado con sus tests</strong>:</p>
+
+<ul>
+<li>Con código duplicado, cada servicio tiene sus tests y su copia. Si rompes algo, lo detectas en ese servicio. El coste es mantener copias.</li>
+<li>Con código compartido, los tests viajan con el código, pero solo se ejecutan en el CI de quien tiene el paquete. Si un servicio se actualiza a una versión nueva y el otro se queda atrás, <strong>cada uno ejecuta tests distintos sobre el mismo código, y ninguno cubre la combinación</strong>.</li>
+</ul>
+
+<p>Por eso, si se comparte algo, lo que se comparte tiene que ser <em>el código junto con sus tests</em>, y el CI de cada servicio tiene que correr la suite de ambos. Si eso no es posible, es una señal de que compartir era la decisión equivocada.</p>
+
+<h3>15.7 Mi opinión</h3>
+
+<p>Con lo que hay hoy: <strong>genera, no compartas</strong>. Es decir, la opción E para lo que viene, y no extraer todavía nada.</p>
+
+<p>El orden que propongo, en el tiempo:</p>
+
+<ol>
+<li><strong>Ahora (2 servicios):</strong> nada. Duplica si hace falta. Que tags-service tenga su propia copia del middleware, y que se llame igual. Las dos van a estar bien durante meses.</li>
+<li><strong>Con el tercer servicio:</strong> aplica la regla de tres. Mira qué se parece en la realidad y qué no, y entonces decide.</li>
+<li><strong>Lo que sí puedes compartir desde ya</strong>, y que es gratis: el <code>AuthenticatedUser</code> (un DTO, cero decisiones) y el contrato de errores 503/502 (que además evita respuestas inconsistentes entre servicios). Eso entra en un <code>path repository</code> sin ningún riesgo, porque no contiene ninguna decisión de arquitectura.</li>
+<li><strong>Lo que no debes compartir nunca:</strong> la decisión de validar por HTTP. Eso vive en cada servicio, y el día que se cambie a JWT o a gateway, se cambia en uno, se despliega, se mide, y solo después se extiende.</li>
+</ol>
+
+<p>Y la regla de oro que resume todo el capítulo: <strong>comparta el vocabulario, componga las decisiones.</strong></p>
+
+<div>
+<p><strong>La trampa de fondo:</strong> la sensación de que "compartir código" es sin coste de verdad. Compartir es la manera barata de <em>no volver a escribir</em>, pero paga en <em>no poder cambiar</em>. En un sistema que todavía está cambiando de arquitectura —y este lo está, de HTTP a JWT a gateway— esa es justo la moneda que no quieres gastar.</p>
+</div>
+
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> la implementación usa tokens opacos generados con <code>random_bytes</code> y almacenados como SHA-256, sin Sanctum ni ninguna dependencia añadida. La validación se hace por HTTP contra el user-service en cada request, de forma deliberada, para poder observar el costo en lugar de teorizarlo.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

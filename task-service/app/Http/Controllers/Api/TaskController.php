@@ -6,39 +6,40 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreTaskRequest;
 use App\Http\Requests\UpdateTaskRequest;
 use App\Models\Task;
-use App\Services\UserServiceClient;
 use Illuminate\Http\JsonResponse;
+use Symfony\Component\HttpFoundation\Response;
 
 class TaskController extends Controller
 {
     /**
-     * Display a paginated listing of the tasks.
+     * Display a paginated listing of the tasks owned by the caller.
      */
     public function index(): JsonResponse
     {
         return response()->json(
-            Task::query()->latest()->paginate(15)
+            Task::query()
+                ->where('user_id', $this->user()->id)
+                ->latest()
+                ->paginate(15)
         );
     }
 
     /**
      * Store a newly created task.
      *
-     * El task-service es dueño de sus datos, pero NO conoce la tabla users
-     * (vive en otra base de datos, en otro servicio). Antes de guardar,
-     * valida el user_id consultando al user-service por HTTP.
+     * Antes de la autenticación, este método validaba el user_id consultando
+     * al user-service por HTTP. Ya no hace falta: el middleware
+     * AuthenticateWithUserService acaba de confirmar por HTTP que ese mismo
+     * usuario existe. Una segunda llamada solo volvería a preguntar lo que ya
+     * sabemos, y a pagar la latencia otra vez.
      */
-    public function store(StoreTaskRequest $request, UserServiceClient $userService): JsonResponse
+    public function store(StoreTaskRequest $request): JsonResponse
     {
         $validated = $request->validated();
 
-        // null = el user-service respondió 404, el usuario no existe.
-        if ($userService->find($validated['user_id']) === null) {
-            return response()->json(['error' => 'El usuario no existe en el sistema'], 422);
-        }
-
         $task = Task::query()->create([
-            ...$validated,
+            'title' => $validated['title'],
+            'user_id' => $this->user()->id,
             'status' => $validated['status'] ?? Task::STATUS_PENDING,
         ]);
 
@@ -48,36 +49,29 @@ class TaskController extends Controller
     /**
      * Display the specified task.
      */
-    public function show(Task $task): JsonResponse
+    public function show(int $task): JsonResponse
     {
-        return response()->json($task);
+        return response()->json($this->findOwnedTask($task));
     }
 
     /**
      * Update the specified task.
      */
-    public function update(UpdateTaskRequest $request, Task $task, UserServiceClient $userService): JsonResponse
+    public function update(UpdateTaskRequest $request, int $task): JsonResponse
     {
-        $validated = $request->validated();
+        $model = $this->findOwnedTask($task);
 
-        // Solo se vuelve a consultar al user-service si el user_id cambió.
-        if (isset($validated['user_id']) && $validated['user_id'] !== $task->user_id) {
-            if ($userService->find($validated['user_id']) === null) {
-                return response()->json(['error' => 'El usuario no existe en el sistema'], 422);
-            }
-        }
+        $model->update($request->validated());
 
-        $task->update($validated);
-
-        return response()->json($task->fresh());
+        return response()->json($model->fresh());
     }
 
     /**
      * Remove the specified task.
      */
-    public function destroy(Task $task): JsonResponse
+    public function destroy(int $task): Response
     {
-        $task->delete();
+        $this->findOwnedTask($task)->delete();
 
         return response()->json(status: 204);
     }

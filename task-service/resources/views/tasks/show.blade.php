@@ -16,14 +16,10 @@
             <dt>Estado</dt>
             <dd><span class="badge b-{{ $task->status }}">{{ $task->status }}</span></dd>
 
-            <dt>user_id</dt>
+            <dt>Propietario</dt>
             <dd>
-                @if ($owner)
-                    {{ $owner['name'] }}
-                    <span style="color:var(--muted)">({{ $owner['email'] }})</span>
-                @else
-                    <code>#{{ $task->user_id }}</code>
-                @endif
+                {{ $currentUser->name }}
+                <span style="color:var(--muted)">({{ $currentUser->email }})</span>
             </dd>
 
             <dt>Creada</dt>
@@ -33,13 +29,6 @@
             <dd>{{ $task->updated_at?->format('d/m/Y H:i') }}</dd>
         </dl>
     </div>
-
-    @if (! $owner)
-        <div class="alert a-warn" style="margin-top:0">
-            No se pudo resolver el nombre del propietario: el user-service no respondió.
-            La tarea sigue intacta — el task-service no la necesita para nada más.
-        </div>
-    @endif
 
     <div class="row-actions" style="justify-content:flex-start;margin-top:20px">
         <a class="btn" href="{{ route('tasks.edit', $task) }}">Editar</a>

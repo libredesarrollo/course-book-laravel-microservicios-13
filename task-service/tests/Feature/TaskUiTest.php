@@ -3,130 +3,150 @@
 use App\Models\Task;
 use Illuminate\Support\Facades\Http;
 
-/**
- * La UI web usa el mismo UserServiceClient que la API: lo que se prueba aquí
- * es el renderizado, no la lógica de microservicios (esa vive en TaskApiTest).
- */
-function fakeUserService(int $userId = 1, string $name = 'Ana Torres', string $email = 'ana.torres@example.com'): void
-{
-    Http::fake([
-        '*' => Http::response(['id' => $userId, 'name' => $name, 'email' => $email], 200),
-    ]);
-}
+/*
+| La UI usa exactamente el mismo UserServiceClient que la API: lo que se
+| prueba aquí es el renderizado y el flujo de sesión, no la lógica microservicios.
+*/
 
-function fakeUserServiceDown(): void
-{
-    Http::fake(['*' => Http::failedConnection()]);
-}
+it('redirects anonymous visitors to the login page', function (string $uri) {
+    Http::fake();
 
-it('lists the stored tasks', function () {
-    Task::factory()->create(['title' => 'Hacer la compra']);
+    $this->get($uri)->assertRedirect(route('login'));
 
-    $this->get(route('tasks.index'))
+    Http::assertNothingSent();
+})->with([
+    'index' => '/tasks',
+    'create' => '/tasks/create',
+    'edit' => '/tasks/1/edit',
+]);
+
+it('shows the login form', function () {
+    $this->get(route('login'))
         ->assertOk()
-        ->assertSee('Hacer la compra');
+        ->assertSee('Iniciar sesión', escape: false);
 });
 
-it('populates the user select from the user-service', function () {
+it('logs in through the user-service and stores the returned token', function () {
     Http::fake([
-        config('services.user_service.url').'/api/users' => Http::response([
-            'data' => [
-                ['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'],
-                ['id' => 2, 'name' => 'Luis Ramirez', 'email' => 'luis.ramirez@example.com'],
-            ],
-        ], 200),
+        '*/api/tokens' => Http::response(['token' => 'token-emitido'], 201),
     ]);
 
-    $this->get(route('tasks.create'))
-        ->assertOk()
-        ->assertSee('Ana Torres')
-        ->assertSee('Luis Ramirez')
-        ->assertSee(route('tasks.store'));
+    $this->post(route('login'), [
+        'email' => 'ana.torres@example.com',
+        'password' => 'password',
+    ])
+        ->assertRedirect(route('tasks.index'))
+        ->assertSessionHas('api_token', 'token-emitido');
 
     Http::assertSent(
-        fn ($request) => $request->url() === config('services.user_service.url').'/api/users'
+        fn ($request) => $request->url() === config('services.user_service.url').'/api/tokens'
+            && $request['email'] === 'ana.torres@example.com'
     );
 });
 
-it('warns on the form when the user-service is down', function () {
-    fakeUserServiceDown();
-
-    $this->get(route('tasks.create'))
-        ->assertOk()
-        ->assertSee('user-service no disponible', escape: false);
-});
-
-it('creates a task and redirects to the list', function () {
-    fakeUserService();
-
-    $this->post(route('tasks.store'), ['title' => 'Nueva tarea', 'user_id' => 1, 'status' => Task::STATUS_PENDING])
-        ->assertRedirect(route('tasks.index'))
-        ->assertSessionHas('success');
-
-    expect(Task::query()->where('title', 'Nueva tarea')->exists())->toBeTrue();
-});
-
-it('rejects the task and shows the error under the field when the user does not exist', function () {
+it('rejects invalid credentials without creating a session', function () {
     Http::fake([
-        '*' => Http::response(['error' => 'Usuario no encontrado'], 404),
+        '*/api/tokens' => Http::response(['error' => 'Credenciales inválidas'], 401),
     ]);
 
-    $this->from(route('tasks.create'))
-        ->post(route('tasks.store'), ['title' => 'Tarea huerfana', 'user_id' => 42])
-        ->assertRedirect(route('tasks.create'))
-        ->assertSessionHasErrors('user_id');
-
-    expect(Task::query()->count())->toBe(0);
+    $this->from(route('login'))
+        ->post(route('login'), ['email' => 'ana@example.com', 'password' => 'mala'])
+        ->assertRedirect(route('login'))
+        ->assertSessionHasErrors('email')
+        ->assertSessionMissing('api_token');
 });
 
-it('returns a 503 page when the user-service is down on submit', function () {
+it('returns 503 on the login page when the user-service is down', function () {
     fakeUserServiceDown();
 
-    $this->post(route('tasks.store'), ['title' => 'Tarea imposible', 'user_id' => 1])
-        ->assertStatus(503)
-        ->assertSee('user-service no disponible', escape: false);
-
-    expect(Task::query()->count())->toBe(0);
+    $this->post(route('login'), ['email' => 'ana@example.com', 'password' => 'password'])
+        ->assertStatus(503);
 });
 
-it('updates a task', function () {
-    $task = Task::factory()->create(['title' => 'Título viejo']);
+it('logs out and revokes the token on the user-service', function () {
+    loginAs();
 
-    $this->put(route('tasks.update', $task), ['title' => 'Título nuevo', 'status' => Task::STATUS_COMPLETED])
-        ->assertRedirect(route('tasks.index'));
+    $this->post(route('logout'))
+        ->assertRedirect(route('login'))
+        ->assertSessionMissing('api_token');
 
-    expect($task->fresh())
-        ->title->toBe('Título nuevo')
-        ->status->toBe(Task::STATUS_COMPLETED);
+    Http::assertSent(
+        fn ($request) => $request->method() === 'DELETE'
+            && $request->url() === config('services.user_service.url').'/api/tokens'
+            && $request->hasHeader('Authorization', 'Bearer test-token')
+    );
 });
 
-it('deletes a task', function () {
-    $task = Task::factory()->create();
+it('lists only the tasks of the signed-in user', function () {
+    $me = loginAs(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
 
-    $this->delete(route('tasks.destroy', $task))
-        ->assertRedirect(route('tasks.index'));
+    Task::factory()->create(['title' => 'Mi tarea', 'user_id' => $me['id']]);
+    Task::factory()->create(['title' => 'Tarea de Luis', 'user_id' => 2]);
 
-    expect(Task::query()->count())->toBe(0);
-});
-
-it('resolves the owner name on the detail page via the user-service', function () {
-    $task = Task::factory()->create(['user_id' => 5]);
-
-    fakeUserService(5, 'Luis Ramirez', 'luis.ramirez@example.com');
-
-    $this->get(route('tasks.show', $task))
+    $this->get(route('tasks.index'))
         ->assertOk()
-        ->assertSee('Luis Ramirez')
-        ->assertSee('luis.ramirez@example.com');
+        ->assertSee('Mi tarea')
+        ->assertDontSee('Tarea de Luis')
+        ->assertSee('Ana');
 });
 
-it('still shows the task when the user-service is down', function () {
-    $task = Task::factory()->create(['title' => 'Tarea visible', 'user_id' => 5]);
+it('creates a task owned by the signed-in user', function () {
+    loginAs(['id' => 9, 'name' => 'Luis', 'email' => 'luis@example.com']);
 
+    $this->post(route('tasks.store'), [
+        'title' => 'Desde el formulario',
+        'status' => Task::STATUS_PENDING,
+    ])->assertRedirect(route('tasks.index'));
+
+    expect(Task::query()->first()->user_id)->toBe(9);
+});
+
+it('cannot be tricked through the form into assigning a task to someone else', function () {
+    loginAs(['id' => 9, 'name' => 'Luis', 'email' => 'luis@example.com']);
+
+    $this->post(route('tasks.store'), ['title' => 'Intrusa', 'user_id' => 1])
+        ->assertRedirect(route('tasks.index'));
+
+    expect(Task::query()->first()->user_id)->toBe(9);
+});
+
+it('updates and deletes its own task', function () {
+    loginAs(['id' => 3, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['title' => 'Vieja', 'user_id' => 3]);
+
+    $this->put(route('tasks.update', $task), ['title' => 'Nueva'])
+        ->assertRedirect(route('tasks.index'));
+
+    expect($task->fresh()->title)->toBe('Nueva');
+
+    $this->delete(route('tasks.destroy', $task))->assertRedirect(route('tasks.index'));
+
+    expect(Task::query()->count())->toBe(0);
+});
+
+it('shows a 403 when opening a task that belongs to someone else', function () {
+    loginAs(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com']);
+
+    $task = Task::factory()->create(['user_id' => 2]);
+
+    $this->get(route('tasks.show', $task))->assertForbidden();
+});
+
+it('drops the web session when the token is no longer valid upstream', function () {
+    $this->withSession(['api_token' => 'token-caducado']);
+
+    Http::fake(['*/api/user' => Http::response(['error' => 'Unauthenticated.'], 401)]);
+
+    $this->get(route('tasks.index'))
+        ->assertRedirect(route('login'))
+        ->assertSessionMissing('api_token');
+});
+
+it('returns 503 when the user-service is unreachable', function () {
     fakeUserServiceDown();
 
-    $this->get(route('tasks.show', $task))
-        ->assertOk()
-        ->assertSee('Tarea visible')
-        ->assertSee('No se pudo resolver el nombre del propietario');
+    $this->withSession(['api_token' => 'test-token'])
+        ->get(route('tasks.index'))
+        ->assertStatus(503);
 });

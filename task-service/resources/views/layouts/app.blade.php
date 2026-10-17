@@ -21,14 +21,17 @@
   body{margin:0;background:var(--bg);color:var(--text);
        font:16px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
   .wrap{max-width:940px;margin:0 auto;padding:32px 20px 72px}
-  header.top{display:flex;align-items:baseline;justify-content:space-between;
+  header.top{display:flex;align-items:center;justify-content:space-between;
              gap:16px;flex-wrap:wrap;padding-bottom:18px;border-bottom:1px solid var(--line);margin-bottom:28px}
-  header.top h1{font-size:1.35rem;margin:0;letter-spacing:-.01em}
-  header.top .svc{font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+  header.top h1{font-size:1.3rem;margin:0;letter-spacing:-.01em}
+  header.top .right{display:flex;align-items:center;gap:14px}
+  .whoami{font-size:.86rem;color:var(--muted)}
+  .whoami strong{color:var(--text)}
   h2{font-size:1.6rem;margin:0 0 6px;letter-spacing:-.02em}
   .sub{color:var(--muted);margin:0 0 24px}
   a{color:var(--accent)}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+  .card.narrow{max-width:420px;margin:40px auto}
   table{width:100%;border-collapse:collapse;font-size:.94rem}
   th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line)}
   th{font-size:.74rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
@@ -45,12 +48,11 @@
   .btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
   .btn-primary:hover{opacity:.9;color:#fff}
   .btn-danger:hover{border-color:var(--err);color:var(--err)}
-  .btn[disabled]{opacity:.4;pointer-events:none}
   .btn-sm{padding:6px 10px;font-size:.8rem}
   .row-actions{display:flex;gap:14px;justify-content:flex-end}
   .field{margin-bottom:18px}
   label{display:block;font-weight:600;font-size:.88rem;margin-bottom:6px}
-  input[type=text],input[type=number],select{width:100%;padding:10px 12px;font:inherit;
+  input[type=text],input[type=email],input[type=password],select{width:100%;padding:10px 12px;font:inherit;
        border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
   input:focus,select:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:transparent}
   .err{color:var(--err);font-size:.84rem;margin-top:6px}
@@ -67,21 +69,36 @@
          font-size:.88rem;color:var(--muted)}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.87em;
        background:var(--bg);border:1px solid var(--line);padding:1px 6px;border-radius:5px}
+  .hint{font-size:.82rem;color:var(--muted);margin:14px 0 0;line-height:1.5}
 </style>
 </head>
 <body>
 <div class="wrap">
 
+@php
+    // El middleware AuthenticateWithUserService deja aquí la identidad que
+    // confirmó el user-service por HTTP. En /login simplemente no existe.
+    $currentUser = request()->attributes->get('authenticated_user');
+@endphp
+
 <header class="top">
-  <h1>Task Service</h1>
-    <span class="svc">:8001 · db_tasks.sqlite · depende de user-service :8000</span>
+    <h1>Task Service</h1>
+    <div class="right">
+        @if ($currentUser)
+            <span class="whoami">Sesión de <strong>{{ $currentUser->name }}</strong></span>
+            <form method="POST" action="{{ route('logout') }}">
+                @csrf
+                <button type="submit" class="btn btn-sm">Salir</button>
+            </form>
+        @endif
+    </div>
 </header>
 
 @if (session('success'))
     <div class="alert a-ok">{{ session('success') }}</div>
 @endif
 
-@if ($errors->any() && ! isset($suppressErrorSummary))
+@if ($errors->any())
     <div class="alert a-err">
         <strong>Revisa el formulario:</strong>
         <ul style="margin:8px 0 0;padding-left:20px">

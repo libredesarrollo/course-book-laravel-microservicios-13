@@ -2,6 +2,7 @@
 
 use App\Exceptions\UserServiceErrorException;
 use App\Exceptions\UserServiceUnavailableException;
+use App\Http\Middleware\AuthenticateWithUserService;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -15,7 +16,9 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        $middleware->alias([
+            'auth.user-service' => AuthenticateWithUserService::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->shouldRenderJsonWhen(

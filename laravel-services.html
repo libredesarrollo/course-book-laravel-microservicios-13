@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Servicios en Laravel: qué son, cuándo usarlos y cuándo no</title>
+
+<meta name="description" content="Qué son los services en Laravel, por qué importan y cuándo crearlos (y cuándo es sobre-ingeniería). Guía con código, errores comunes y checklist.">
+<meta name="keywords" content="servicios Laravel, service classes Laravel, arquitectura Laravel, contenedor de servicios Laravel, inyección de dependencias, clean code Laravel, cuando usar un service Laravel">
+<meta name="author" content="desarrollolibre.net">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:site_name" content="desarrollolibre.net">
+<meta property="og:title" content="Servicios en Laravel: qué son, cuándo usarlos y cuándo no">
+<meta property="og:description" content="Qué son los services en Laravel, por qué importan y cuándo crearlos (y cuándo es sobre-ingeniería). Guía con código, errores comunes y checklist.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Servicios en Laravel: qué son, cuándo usarlos y cuándo no">
+<meta name="twitter:description" content="Guía práctica sobre service classes en Laravel: qué son, por qué importan y cuándo crearlas.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Servicios en Laravel: qué son, cuándo usarlos y cuándo no",
+  "description": "Qué son los services en Laravel, por qué importan y cuándo crearlos (y cuándo es sobre-ingeniería). Guía con código, errores comunes y checklist.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-11",
+  "dateModified": "2026-10-11",
+  "proficiencyLevel": "Beginner",
+  "articleSection": "Laravel",
+  "keywords": "Laravel, servicios, service classes, arquitectura, inyección de dependencias",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Servicios en Laravel: qué son, cuándo usarlos y cuándo no</h1>
+
+<p><strong>Resumen:</strong> un servicio en Laravel es una clase sin estado que encapsula lógica de negocio y se inyecta donde se necesita. Sirve para que tus controllers se limiten a pedir y devolver, tu lógica quede testeable sin pasar por HTTP, y el mismo código sirva desde la web, la consola y las colas. Pero no todos los controllers merecen un servicio: crearlos sin un motivo claro produce capas vacías que solo complican el código.</p>
+
+<p>En esta guía verás qué son, por qué importan, cómo los crea el contenedor de servicios de Laravel, las reglas prácticas para decidir cuándo crear uno, los errores más comunes y una checklist para el final.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#que-es">Qué es un servicio en Laravel</a></li>
+<li><a href="#por-que">Por qué importan</a></li>
+<li><a href="#anatomia">Anatomía de un servicio bien escrito</a></li>
+<li><a href="#contenedor">El contenedor de servicios</a></li>
+<li><a href="#cuando-si">Cuándo SÍ usar un servicio</a></li>
+<li><a href="#cuando-no">Cuándo NO usar un servicio</a></li>
+<li><a href="#errores">Los 7 errores más comunes</a></li>
+<li><a href="#comparativa">Servicio vs. las demás piezas de Laravel</a></li>
+<li><a href="#ejemplo">Ejemplo completo, con interfaz y test</a></li>
+<li><a href="#checklist">Checklist antes de crear uno</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="que-es">1. Qué es un servicio en Laravel</h2>
+
+<p>Un <strong>service</strong> es una clase PHP, sin estado, que encapsula una porción de lógica de negocio. No sabe de HTTP, no sabe de rutas y no sabe de la base de datos más allá de lo que le inyectes.</p>
+
+<p>La analogía más útil: un controller es el <em>mesero</em> y un service es la <em>cocina</em>. El mesero recibe el pedido y lo lleva; la cocina decide cómo se prepara. Un mesero que cocina termina quemándose, igual que un controller con 300 líneas de reglas.</p>
+
+<p>Tecnicamente, un servicio:</p>
+<ul>
+<li>Vive normalmente en <code>app/Services/</code>.</li>
+<li>Se instancia mediante el <a href="#contenedor">contenedor de servicios</a>, nunca con <code>new</code>.</li>
+<li>Recibe sus dependencias por el constructor (inyección de dependencias).</li>
+<li>No guarda estado entre llamadas: dos peticiones simultáneas no deben poder pisarse.</li>
+<li>Se puede probar de forma aislada, sin levantar la aplicación.</li>
+</ul>
+
+<p>Se crean con <code>php artisan make:class</code>:</p>
+
+<pre><code>php artisan make:class Services/OrderService</code></pre>
+
+<p>No hay un comando <code>make:service</code> en Laravel, y es a propósito: un servicio es una clase cualquiera. La única diferencia con un <code>make:class</code> es la intención que proyecta en quien lo lee.</p>
+
+
+<h2 id="por-que">2. Por qué importan</h2>
+
+<h3>2.1 Los controllers dejan de ser cuellos de botella</h3>
+
+<p>Un controller que recibe, valida, decide y guarda es difícil de leer y más difícil de probar. Separando la decisión del transporte, cada pieza hace una sola cosa.</p>
+
+<pre><code>// Antes: la lógica vive en el controller
+public function store(StoreOrderRequest $request): JsonResponse
+{
+    $order = Order::create($request-&gt;validated());
+
+    if ($order-&gt;total() &gt; 1000 &amp;&amp; ! $request-&gt;user()-&gt;hasDiscount()) {
+        $order-&gt;update(['status' =&gt; 'manual_review']);
+    }
+
+    foreach ($order-&gt;items as $item) {
+        Inventory::where('sku', $item-&gt;sku)-&gt;decrement('stock', $item-&gt;quantity);
+    }
+
+    return response()-&gt;json($order, 201);
+}</code></pre>
+
+<p>Ese método tiene validación, reglas de negocio y efectos secundarios. Probar la regla del
+<code>&gt; 1000</code> exige armar un request HTTP completo y una base de datos con inventario.</p>
+
+<pre><code>// Después: el controller coordina, el service decide
+public function store(StoreOrderRequest $request, OrderService $orders): JsonResponse
+{
+    $order = $orders-&gt;place(
+        items: $request-&gt;validated('items'),
+        customer: $request-&gt;user(),
+    );
+
+    return response()-&gt;json($order, 201);
+}</code></pre>
+
+<p>Ahora probar la regla es llamar a un método. Sin HTTP, sin request, sin magia.</p>
+
+<h3>2.2 La lógica deja de depender del canal de entrada</h3>
+
+<p>Este es el argumento más fuerte a favor de los servicios, y el que casi nunca se menciona. La misma regla de negocio rara vez vive en un solo lugar:</p>
+
+<ul>
+<li>Un usuario la dispara desde un formulario web.</li>
+<li>Un comando de <code>artisan</code> la necesita para un script de migración de datos.</li>
+<li>Un job encolado la reintenta cuando algo falla.</li>
+<li>Un test la necesita para verificar el comportamiento.</li>
+</ul>
+
+<p>Si la regla está metida en un controller, para reutilizarla en el comando tendrías que duplicarla o inventar un truco para llamar al controller desde consola. Si está en un servicio, los cuatro la llaman igual.</p>
+
+<h3>2.3 Se prueban sin HTTP ni base de datos</h3>
+
+<p>Un test de un servicio es una función normal: le das datos, verificas el resultado.</p>
+
+<pre><code>it('revisa manualmente los pedidos que superan los 1000', function () {
+    $service = new OrderService(new DiscountPolicy());
+
+    expect($service-&gt;requiresReview(total: 1500, hasDiscount: false))-&gt;toBeTrue();
+});</code></pre>
+
+<p>Ese test corre en milisegundos, no necesita base de datos y nunca se rompe porque cambiaste una
+ruta. Es la diferencia entre una suite que tarda 3 minutos y una que tarda 4 segundos.</p>
+
+<h3>2.4 El dominio queda aislado de Laravel</h3>
+
+<p>Un servicio bien escrito solo usa tipos de PHP. Si mañana cambias de framework, ese archivo no se toca. El <em>framework</em> está en el borde (rutas, controllers, jobs); la lógica de negocio está en el centro.</p>
+
+
+<h2 id="anatomia">3. Anatomía de un servicio bien escrito</h2>
+
+<pre><code>&lt;?php
+
+namespace App\Services;
+
+use App\Contracts\InventoryGateway;
+use App\Exceptions\InsufficientStock;
+use Throwable;
+
+class OrderService
+{
+    public function __construct(
+        private readonly InventoryGateway $inventory,
+    ) {
+    }
+
+    /**
+     * Coloca un pedido y descuenta el inventario.
+     *
+     * @param  array&lt;int, array{sku: string, quantity: int}&gt;  $items
+     */
+    public function place(array $items, Customer $customer): Order
+    {
+        $this-&gt;inventory-&gt;reserve($items);
+
+        try {
+            return Order::create([
+                'customer_id' =&gt; $customer-&gt;id,
+                'items' =&gt; $items,
+            ]);
+        } catch (Throwable $exception) {
+            $this-&gt;inventory-&gt;release($items);
+
+            throw $exception;
+        }
+    }
+}</code></pre>
+
+<p>Cuatro cosas a destacar:</p>
+
+<ol>
+<li><strong>Promoción de propiedades con <code>readonly</code>.</strong> El constructor es un
+    constructor real y el objeto es inmutable desde fuera.</li>
+<li><strong>Tipos explícitos en todo.</strong> La firma <em>es</em> la documentación.</li>
+<li><strong>Dependencias por contrato, no por implementación.</strong>
+    <code>InventoryGateway</code> es una interfaz: el test injecta un doble, producción injecta el real.</li>
+<li><strong>No hay <code>request()</code>, ni <code>response()</code>, ni <code>session()</code>.</strong>
+    Nada de lo que aparece aquí depende de que haya una petición HTTP en curso.</li>
+</ol>
+
+<p>Los contratos (interfaces) se crean con <code>php artisan make:interface</code>:</p>
+
+<pre><code>php artisan make:interface Contracts/InventoryGateway</code></pre>
+
+
+<h2 id="contenedor">4. El contenedor de servicios</h2>
+
+<p>El contenedor de Laravel es el que decide qué objeto inyectar cuando pides una clase.</p>
+
+<h3>4.1 Resolución automática</h3>
+
+<p>Si el constructor pide clases concretas y ninguna tiene argumentos que el contenedor no pueda
+resolver, no hay que registrar nada:</p>
+
+<pre><code>public function __construct(private Mailer $mailer, private LoggerInterface $logger)
+{
+}
+
+// El contenedor los crea solo al resolver OrderService.</code></pre>
+
+<p>Funciona porque las clases del framework tienen tipos en sus constructores, así que el
+contenedor puede deducir las dependencias recursivamente.</p>
+
+<h3>4.2 Contratos: el binding explícito</h3>
+
+<p>Cuando dependes de una interfaz, tienes que decirle al contenedor qué implementación usar.
+Se hace en <code>bootstrap/providers.php</code> o en un service provider:</p>
+
+<pre><code>&lt;?php
+
+namespace App\Providers;
+
+use App\Contracts\InventoryGateway;
+use App\Services\HttpInventoryGateway;
+use Illuminate\Support\ServiceProvider;
+
+class AppServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this-&gt;app-&gt;singleton(InventoryGateway::class, HttpInventoryGateway::class);
+    }
+}</code></pre>
+
+<p>Hay tres formas de registrar, y la diferencia importa:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Método</th><th>Instancias</th><th>Úsalo cuando</th></tr>
+<tr>
+<td><code>bind()</code></td>
+<td>Una nueva por cada vez que se resuelve</td>
+<td>El servicio es barato y no guarda estado. <strong>Este es el valor por defecto correcto.</strong></td>
+</tr>
+<tr>
+<td><code>singleton()</code></td>
+<td>Una sola, compartida en toda la aplicación</td>
+<td>El servicio es caro de construir (un cliente HTTP, un cliente de AWS) o mantiene una caché.</td>
+</tr>
+<tr>
+<td><code>scoped()</code></td>
+<td>Una por ciclo de vida / petición</td>
+<td>Ligado a la petición: con Swoole, Octane o colas de larga duración, evita fugas entre peticiones.</td>
+</tr>
+</table>
+
+<p><strong>La trampa clásica:</strong> un <code>singleton</code> que acumula estado muta de forma silenciosa. Se escribe, funciona en local con una sola petición, y a las 50 peticiones simultáneas los datos se mezclan. Si el servicio guarda estado, no lo hagas singleton.</p>
+
+<h3>4.3 Inyección en el método</h3>
+
+<p>Cuando la dependencia solo se usa en un método, se pide ahí y no se guarda:</p>
+
+<pre><code>public function store(StoreOrderRequest $request, OrderService $orders): JsonResponse</code></pre>
+
+<p>Laravel lo inyecta sin que hagas nada. Útil para mantener las dependencias de un controller en
+la lista visible de argumentos.</p>
+
+<h3>4.4 Binding contextual</h3>
+
+<p>Cuando una interfaz tiene varias implementaciones y la elección depende de quién la pide:</p>
+
+<pre><code>$this-&gt;app-&gt;when(OrderService::class)
+    -&gt;needs(InventoryGateway::class)
+    -&gt;give(SandboxInventoryGateway::class);</code></pre>
+
+
+<h2 id="cuando-si">5. Cuándo SÍ usar un servicio</h2>
+
+<p>Si al menos una de estas es cierta, probablemente lo necesitas:</p>
+
+<ol>
+<li><strong>La lógica la van a usar más de un canal.</strong> Web, comando de consola, job de cola,
+    test, o una mezcla. Es la señal más fuerte.</li>
+<li><strong>Tiene reglas de negocio con condiciones encadenadas.</strong> En cuanto un método pasa
+    de unos pocos <code>if</code> y empieza a leer como un párrafo, extráelo.</li>
+<li><strong>Necesitas testearla sin pasar por HTTP.</strong> Si el test se vuelve incómodo
+    (request falso, base de datos completa, factorías encadenadas), es señal de que esa lógica
+    debería ser un servicio.</li>
+<li><strong>Se va a reutilizar en varios modelos o varias rutas.</strong> Si tres controllers
+    necesitan el mismo cálculo, ese cálculo es un servicio.</li>
+<li><strong>Es una pieza de infraestructura con dos implementaciones.</strong> Si vas a tener una
+    versión real y otra de pruebas (sandbox, fake, cache), necesitas un contrato.</li>
+<li><strong>Quiero poder nombrarlo.</strong> Si el método necesita un comentario de dos líneas para
+    explicar qué hace, casi siempre es un servicio esperando ser creado.</li>
+</ol>
+
+
+<h2 id="cuando-no">6. Cuándo NO usar un servicio</h2>
+
+<p>Aquí es donde se comete el error más común. Estas son las señales de que has creado un servicio
+de más:</p>
+
+<h3>6.1 Un CRUD disfrazado</h3>
+
+<pre><code>// No es un servicio. Es un método de Eloquent con más pasos.
+class UserService
+{
+    public function find(int $id): User
+    {
+        return User::findOrFail($id);
+    }
+
+    public function create(array $data): User
+    {
+        return User::create($data);
+    }
+}</code></pre>
+
+<p>Esto no es lógica de negocio: es una capa de indirección. Aquí ya tenías
+<code>User::findOrFail()</code> y ya tenías validación (Form Request). No ganaste nada.</p>
+
+<h3>6.2 El servicio anémico</h3>
+
+<p>Si tu servicio no decide nada y solo mueve datos de un sitio a otro, la decisión se quedó en el
+controller. El nombre del síntoma: la clase se llama algo como <code>DataService</code>,
+<code>BaseService</code>, <code>AppService</code> o <code>HelperService</code>.</p>
+
+<p>Un buen nombre de servicio describe <strong>una intención de negocio</strong>:
+<code>SubscriptionService</code>, <code>PricingService</code>, <code>ReportService</code>.
+Si el nombre describe un sustantivo genérico, probablemente sobra.</p>
+
+<h3>6.3 Un condicional suelto</h3>
+
+<pre><code>// Un if no necesita su propia clase
+if ($order-&gt;total() &gt; 0) {
+    $order-&gt;update(['status' =&gt; 'paid']);
+}</code></pre>
+
+<h3>6.4 La cadena de envoltorios</h3>
+
+<pre><code>// Este service solo llama a otro service. Borralo.
+class CreateOrderService
+{
+    public function __construct(private PlaceOrderService $place) {}
+
+    public function execute(array $data): Order
+    {
+        return $this-&gt;place-&gt;handle($data);
+    }
+}</code></pre>
+
+<h3>6.5 La prueba de fuego</h3>
+
+<p>Antes de dejar el servicio, hazte esta pregunta:</p>
+
+<p><strong>Si borrara este archivo, ¿el código dejaría de funcionar igual de bien?</strong></p>
+
+<ul>
+<li>Si la respuesta es "sí, pero más lento de escribir": probablemente sobra.</li>
+<li>Si la respuesta es "no, se duplicaría en tres sitios": probablemente hace falta.</li>
+</ul>
+
+
+<h2 id="errores">7. Los 7 errores más comunes</h2>
+
+<h3>7.1 Poner HTTP dentro del servicio</h3>
+
+<p>Un servicio no debería conocer <code>response()-&gt;json()</code> ni <code>request()-&gt;input()</code>.
+Si necesitas distinguir "no encontrado" de "no autorizado", lanza una excepción de dominio
+(<code>OrderNotFound</code>) y deja que el controller la traduzca a un status HTTP.</p>
+
+<p>Esto tiene un matiz importante en sistemas distribuidos: si el servicio llama a otro por HTTP,
+conviene encapsular esa llamada en un <strong>cliente dedicado</strong> con su propia política de
+tiempos de espera y de clasificación de errores. Así el resto de la aplicación no necesita saber
+que hay una red de por medio, y "el otro servicio está caído" deja de ser un <code>null</code>
+ambiguo y pasa a ser una excepción con nombre.</p>
+
+<h3>7.2 Inyectar modelos Eloquent por el constructor</h3>
+
+<pre><code>// Peligroso: el modelo queda cargado y potencialmente obsoleto.
+public function __construct(private Order $order) {}</code></pre>
+
+<p>Los modelos se recargan por identidad: el constructor se ejecuta una vez y ese
+<code>Order</code> puede quedar desactualizado. Pasa el identificador o el modelo como argumento
+del <em>método</em>, no del constructor.</p>
+
+<h3>7.3 Estado mutable en un singleton</h3>
+
+<p>Ver la tabla de arriba. Es el error más caro de diagnosticar porque funciona en local con tráfico
+bajo y falla en producción.</p>
+
+<h3>7.4 Nombrar por estructura en lugar de por intención</h3>
+
+<p><code>UserServiceV2</code>, <code>UserNewService</code>, <code>UserService2</code>: la
+duplicación se resolvió con sufijos. Si dos servicios se parecen, casi siempre la respuesta es
+extraer la parte común, no clonar.</p>
+
+<h3>7.5 Capturar excepciones y tragárselas</h3>
+
+<pre><code>// Nunca. Estás ocultando un fallo real al llamador.
+try {
+    return $this-&gt;inventory-&gt;reserve($items);
+} catch (Throwable $e) {
+    return null;
+}</code></pre>
+
+<p>Si necesitas registrar, registra; si necesitas compensar, compensa; si necesitas traducir,
+traduce. Lo que nunca debes es <code>return null</code>.</p>
+
+<h3>7.6 Confundir "servicio" con "helper"</h3>
+
+<p>Un helper es una función sin estado, sin dependencias y sin identidad. Si tu servicio no tiene
+dependencias inyectadas y no representa una intención de negocio, probablemente es una función
+suelta en <code>app/Support/</code>.</p>
+
+<h3>7.7 No testearlo</h3>
+
+<p>El servicio es justo la parte más barata de testear de toda tu aplicación. Si tiene lógica de
+negocio y no tiene tests, es la parte más expuesta.</p>
+
+
+<h2 id="comparativa">8. Servicio vs. las demás piezas de Laravel</h2>
+
+<p>Cada pieza resuelve un problema distinto. La confusión entre ellas es una de las fuentes más
+comunes de código sobrediseñado.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Pieza</th><th>Responsabilidad</th><th>Ejemplo</th></tr>
+<tr>
+<td><strong>Form Request</strong></td>
+<td>Validar y tipar la entrada HTTP. No contiene reglas de negocio.</td>
+<td>Que <code>title</code> no exceda 255 caracteres</td>
+</tr>
+<tr>
+<td><strong>Controller</strong></td>
+<td>Traducir HTTP a una llamada y la respuesta de vuelta a HTTP.</td>
+<td>Recibir, delegar, responder 201</td>
+</tr>
+<tr>
+<td><strong>Resource</strong></td>
+<td>Decidir qué se serializa y con qué formato.</td>
+<td>Ocultar <code>password</code> del JSON</td>
+</tr>
+<tr>
+<td><strong>Middleware</strong></td>
+<td>Cosas transversales que pasan por todas las peticiones.</td>
+<td>Autenticación, CORS, logs, throttling</td>
+</tr>
+<tr>
+<td><strong>Policy</strong></td>
+<td>Responder "¿este usuario puede hacer esto?"</td>
+<td><code>Gate::allows('update', $task)</code></td>
+</tr>
+<tr>
+<td><strong>Event / Listener</strong></td>
+<td>Reaccionar a algo que ya ocurrió, desacoplado.</td>
+<td>Enviar un email al cambiar el estado</td>
+</tr>
+<tr>
+<td><strong>Job (cola)</strong></td>
+<td>Trabajo diferible, con reintentos y backoff.</td>
+<td>Generar un PDF de 200 páginas</td>
+</tr>
+<tr>
+<td><strong>Action</strong></td>
+<td>Una única operación invocable.</td>
+<td><code>CloseOrderAction</code></td>
+</tr>
+<tr>
+<td><strong>Service</strong></td>
+<td>Lógica de negocio reutilizable entre canales.</td>
+<td>Calcular descuentos y decidir el precio final</td>
+</tr>
+</table>
+
+<p><strong>La diferencia con un Job:</strong> un Job hace algo <em>más tarde</em>. Un Service
+decide algo <em>ahora</em>. Un Job suele contener un Service, no al revés.</p>
+
+<p><strong>La diferencia con un Action:</strong> una Action es un caso de uso puntual y suele tener
+pocos métodos. Un Service agrupa lógica de negocio relacionada y suele exponer varios métodos.
+Si tienes una sola operación y no se reutiliza, una Action es más honesto.</p>
+
+
+<h2 id="ejemplo">9. Ejemplo completo, con interfaz y test</h2>
+
+<h3>El contrato</h3>
+
+<pre><code>&lt;?php
+
+namespace App\Contracts;
+
+interface InventoryGateway
+{
+    public function reserve(array $items): void;
+
+    public function release(array $items): void;
+}</code></pre>
+
+<h3>La implementación real</h3>
+
+<pre><code>&lt;?php
+
+namespace App\Services;
+
+use App\Contracts\InventoryGateway;
+use Illuminate\Support\Facades\Http;
+
+class HttpInventoryGateway implements InventoryGateway
+{
+    public function reserve(array $items): void
+    {
+        $response = Http::post(config('services.warehouse.url').'/reservations', ['items' =&gt; $items]);
+
+        $response-&gt;throw();
+    }
+
+    public function release(array $items): void
+    {
+        Http::post(config('services.warehouse.url').'/reservations/release', ['items' =&gt; $items])-&gt;throw();
+    }
+}</code></pre>
+
+<h3>El servicio de negocio</h3>
+
+<pre><code>&lt;?php
+
+namespace App\Services;
+
+use App\Contracts\InventoryGateway;
+use App\Exceptions\InsufficientStock;
+use App\Models\Customer;
+use App\Models\Order;
+use Throwable;
+
+class OrderService
+{
+    public function __construct(private readonly InventoryGateway $inventory)
+    {
+    }
+
+    /**
+     * @param  array&lt;int, array{sku: string, quantity: int}&gt;  $items
+     *
+     * @throws InsufficientStock
+     */
+    public function place(array $items, Customer $customer): Order
+    {
+        try {
+            $this-&gt;inventory-&gt;reserve($items);
+        } catch (Throwable $exception) {
+            throw new InsufficientStock(previous: $exception);
+        }
+
+        return Order::create([
+            'customer_id' =&gt; $customer-&gt;id,
+            'items' =&gt; $items,
+            'total' =&gt; $this-&gt;calculateTotal($items),
+        ]);
+    }
+
+    /**
+     * @param  array&lt;int, array{sku: string, quantity: int, price: int}&gt;  $items
+     */
+    public function calculateTotal(array $items): int
+    {
+        return array_reduce(
+            $items,
+            fn (int $carry, array $item): int =&gt; $carry + ($item['price'] * $item['quantity']),
+            0,
+        );
+    }
+}</code></pre>
+
+<h3>El binding</h3>
+
+<pre><code>public function register(): void
+{
+    $this-&gt;app-&gt;singleton(InventoryGateway::class, HttpInventoryGateway::class);
+}</code></pre>
+
+<h3>El test</h3>
+
+<pre><code>&lt;?php
+
+use App\Exceptions\InsufficientStock;
+use App\Models\Customer;
+use App\Services\OrderService;
+
+it('crea un pedido y reserva el inventario', function () {
+    $gateway = Mockery::mock(InventoryGateway::class);
+    $gateway-&gt;shouldReceive('reserve')-&gt;once()-&gt;with([
+        ['sku' =&gt; 'ABC-1', 'quantity' =&gt; 2, 'price' =&gt; 500],
+    ]);
+
+    $order = (new OrderService($gateway))-&gt;place(
+        items: [['sku' =&gt; 'ABC-1', 'quantity' =&gt; 2, 'price' =&gt; 500]],
+        customer: Customer::factory()-&gt;create(),
+    );
+
+    expect($order-&gt;total)-&gt;toBe(1000);
+});
+
+it('traduce un fallo de inventario a una excepcion de dominio', function () {
+    $gateway = Mockery::mock(InventoryGateway::class);
+    $gateway-&gt;shouldReceive('reserve')-&gt;andThrow(new RuntimeException('timeout'));
+
+    expect(fn () =&gt; (new OrderService($gateway))-&gt;place([], Customer::factory()-&gt;create()))
+        -&gt;toThrow(InsufficientStock::class);
+});</code></pre>
+
+<p>Ninguno de esos tests toca HTTP, ni rutas, ni el contenedor de servicios. Por eso corren rápido
+y por eso fallan de forma útil cuando algo se rompe.</p>
+
+
+<h2 id="checklist">10. Checklist antes de crear un servicio</h2>
+
+<p>Antes de escribir el archivo, pregúntate:</p>
+
+<ul>
+<li>¿Esta lógica la van a usar más de un canal de entrada?</li>
+<li>¿Sabría testearla sin montar una petición HTTP completa?</li>
+<li>¿El nombre del servicio describe una <strong>intención de negocio</strong>, no un sustantivo
+    genérico como "Data" o "Helper"?</li>
+<li>¿Tiene más de una razón para cambiar por separado?</li>
+<li>¿Puedo explicar su responsabilidad en una frase, sin usar la palabra "y"?</li>
+</ul>
+
+<p>Si respondiste "no" a las dos primeras, probablemente no necesitas un servicio todavía.</p>
+
+<p>Si la respuesta es sí a todas, créalo. Y cuando lo crees, no olvides la parte que más se pasa
+por alto: <strong>pruébalo aislado</strong>. Un servicio sin tests es una capa que nadie va a
+atreverse a tocar.</p>
+
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> los ejemplos usan <code>php artisan make:class Services/...</code> y
+<code>php artisan make:interface Contracts/...</code>, los comandos disponibles en Laravel 11, 12
+y 13. No existe un <code>make:service</code> ni un <code>make:contract</code>: un servicio es una
+clase normal, y la intención la pone el nombre y la carpeta.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

@@ -1,13 +1,13 @@
 @extends('layouts.app')
 
-@section('title', 'Tareas')
+@section('title', 'Mis tareas')
 
 @section('content')
     <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap">
         <div>
-            <h2>Tareas</h2>
+            <h2>Mis tareas</h2>
             <p class="sub" style="margin:0">
-                Cada tarea guarda un <code>user_id</code> que fue validado contra el user-service por HTTP.
+                Solo ves las tuyas. Cada request se autenticó contra el user-service por HTTP.
             </p>
         </div>
         <a class="btn btn-primary" href="{{ route('tasks.create') }}">+ Nueva tarea</a>
@@ -16,7 +16,7 @@
     <div class="card" style="margin-top:22px">
         @if ($tasks->isEmpty())
             <div class="empty">
-                <p style="margin:0 0 14px">Todavía no hay tareas.</p>
+                <p style="margin:0 0 14px">Todavía no tienes tareas.</p>
                 <a class="btn btn-primary" href="{{ route('tasks.create') }}">Crear la primera</a>
             </div>
         @else
@@ -25,7 +25,6 @@
                 <tr>
                     <th style="width:52px">#</th>
                     <th>Título</th>
-                    <th style="width:92px">Usuario</th>
                     <th style="width:118px">Estado</th>
                     <th style="width:140px"></th>
                 </tr>
@@ -37,7 +36,6 @@
                         <td>
                             <a href="{{ route('tasks.show', $task) }}">{{ $task->title }}</a>
                         </td>
-                        <td><code>#{{ $task->user_id }}</code></td>
                         <td>
                             <span class="badge b-{{ $task->status }}">{{ $task->status }}</span>
                         </td>

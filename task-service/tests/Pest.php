@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
 /*
@@ -17,6 +18,58 @@ use Tests\TestCase;
 pest()->extend(TestCase::class)
     ->use(RefreshDatabase::class)
     ->in('Feature');
+
+/*
+|--------------------------------------------------------------------------
+| Helpers de autenticación
+|--------------------------------------------------------------------------
+|
+| El task-service autentica preguntando al user-service por HTTP, así que
+| ningún test necesita levantar el otro servicio: basta con que Http::fake()
+| responda como lo haría.
+|
+*/
+
+/**
+ * Simula que el user-service está vivo y devuelve esta identidad en /api/user.
+ *
+ * @param  array{id: int, name: string, email: string}|null  $user
+ * @return array{id: int, name: string, email: string}
+ */
+function fakeUserService(?array $user = null): array
+{
+    $user ??= ['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'];
+
+    Http::fake([
+        '*/api/user' => Http::response($user),
+        '*/api/tokens' => Http::response(['token' => 'issued-token'], 201),
+    ]);
+
+    return $user;
+}
+
+/**
+ * Simula que el user-service está caído.
+ */
+function fakeUserServiceDown(): void
+{
+    Http::fake(['*' => Http::failedConnection()]);
+}
+
+/**
+ * Inicia sesión en la UI web con el token ya resuelto.
+ *
+ * @param  array{id: int, name: string, email: string}|null  $user
+ * @return array{id: int, name: string, email: string}
+ */
+function loginAs(?array $user = null): array
+{
+    $user = fakeUserService($user);
+
+    test()->withSession(['api_token' => 'test-token']);
+
+    return $user;
+}
 
 /*
 |--------------------------------------------------------------------------

@@ -14,13 +14,15 @@ class UpdateTaskRequest extends FormRequest
     }
 
     /**
+     * Ni title, ni user_id, ni status se toman del payload para cambiar el
+     * propietario: una tarea pertenece a quien la creó y no se traspasa.
+     *
      * @return array<string, array<int, mixed>>
      */
     public function rules(): array
     {
         return [
             'title' => ['sometimes', 'required', 'string', 'max:255'],
-            'user_id' => ['sometimes', 'required', 'integer', 'min:1'],
             'status' => ['sometimes', Rule::in([Task::STATUS_PENDING, Task::STATUS_COMPLETED])],
         ];
     }
