@@ -22,6 +22,7 @@ class ApiTokenFactory extends Factory
             'user_id' => User::factory(),
             'token_hash' => hash('sha256', bin2hex(random_bytes(32))),
             'name' => fake()->words(2, true),
+            'expires_at' => now()->addHour(),
         ];
     }
 

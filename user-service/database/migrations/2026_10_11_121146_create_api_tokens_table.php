@@ -22,7 +22,11 @@ return new class extends Migration
 
             $table->string('name')->default('api-token');
             $table->timestamp('last_used_at')->nullable();
-            $table->timestamp('expires_at')->nullable();
+
+            // NOT NULL a propósito: un token sin caducidad sirve para siempre,
+            // así que el esquema impide que exista ese caso por accidente.
+            // ApiToken::issueFor() exige la fecha como parámetro.
+            $table->timestamp('expires_at');
             $table->timestamps();
         });
     }

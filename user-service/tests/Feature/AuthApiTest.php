@@ -5,7 +5,7 @@ use App\Models\User;
 
 function issueTokenFor(User $user): string
 {
-    return ApiToken::issueFor($user)['token'];
+    return ApiToken::issueFor($user, 'test', now()->addHour())['token'];
 }
 
 it('issues a token for valid credentials', function () {
@@ -83,7 +83,7 @@ it('rejects an unknown token', function () {
 
 it('rejects an expired token', function () {
     $user = User::factory()->create();
-    $issued = ApiToken::issueFor($user)['model'];
+    $issued = ApiToken::issueFor($user, 'test', now()->subMinute())['model'];
     $issued->update(['expires_at' => now()->subMinute()]);
 
     $this->withToken($issued->token_hash)
@@ -111,7 +111,7 @@ it('revokes the token that was used', function () {
 
 it('stamps last_used_at when the token is used', function () {
     $user = User::factory()->create();
-    $issued = ApiToken::issueFor($user);
+    $issued = ApiToken::issueFor($user, 'test', now()->addHour());
 
     expect($issued['model']->last_used_at)->toBeNull();
 

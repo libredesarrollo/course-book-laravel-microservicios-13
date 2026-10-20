@@ -4,8 +4,9 @@ use App\Http\Controllers\AuthController;
 use App\Http\Controllers\UserController;
 use Illuminate\Support\Facades\Route;
 
-// Público: emitir tokens.
-Route::post('/tokens', [AuthController::class, 'store']);
+// Público: emitir tokens. throttle:login protege contra fuerza bruta con dos
+// contadores (por IP y por cuenta); ver AppServiceProvider.
+Route::post('/tokens', [AuthController::class, 'store'])->middleware('throttle:login');
 
 // Protegido con token de API. El task-service llama a /api/user en cada
 // request del cliente para resolver la identidad.

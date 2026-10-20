@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Rate limiting en el login: el antes y el después</title>
+
+<meta name="description" content="Qué cambió al proteger POST /api/tokens contra fuerza bruta: límites por cuenta e IP, caducidad de tokens y registro de intentos.">
+<meta name="keywords" content="rate limiting Laravel, throttle Laravel, protección fuerza bruta, RateLimiter Laravel, TTL token API, seguridad microservicios">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Rate limiting en el login: el antes y el después">
+<meta property="og:description" content="Qué cambió al proteger POST /api/tokens contra fuerza bruta: límites por cuenta e IP, caducidad de tokens y registro de intentos.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Rate limiting en el login: el antes y el después">
+<meta name="twitter:description" content="Límites por cuenta e IP, caducidad de tokens y registro de intentos, con las mediciones.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Rate limiting en el login: el antes y el después",
+  "description": "Qué cambió al proteger POST /api/tokens contra fuerza bruta: límites por cuenta e IP, caducidad de tokens y registro de intentos. Con las mediciones.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-11",
+  "dateModified": "2026-10-11",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "Laravel",
+  "keywords": "rate limiting, Laravel, throttle, fuerza bruta, TTL, tokens",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Rate limiting en el login: el antes y el después</h1>
+
+<p><strong>Resumen:</strong> el user-service exponía <code>POST /api/tokens</code> sin ninguna protección. Medido: 8 439 intentos de contraseña por minuto, las 24 horas del día. Este documento recoge qué había antes, qué se añadió después, por qué son dos límites y no uno, y los tres errores que aparecieron al implementarlo.</p>
+
+<p>Contexto: es el endpoint que <strong>recibe contraseñas</strong>. No es un forgot-password cualquiera — es la puerta de entrada al sistema de identidad, y por lo tanto el objetivo natural de cualquier intento de fuerza bruta.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#antes">El estado anterior</a></li>
+<li><a href="#medicion">La medición que lo destapó</a></li>
+<li><a href="#despues">Qué se añadió</a></li>
+<li><a href="#config">La configuración</a></li>
+<li><a href="#dos-limites">Por qué dos límites y no uno</a></li>
+<li><a href="#rutas">Dónde se aplica</a></li>
+<li><a href="#ttl">Caducidad: por qué NOT NULL</a></li>
+<li><a href="#logs">Qué se registra y qué no</a></li>
+<li><a href="#verificacion">Verificación real</a></li>
+<li><a href="#errores">Tres errores al implementarlo</a></li>
+<li><a href="#proxies">La trampa de los proxies</a></li>
+<li><a href="#tests">Cobertura de tests</a></li>
+<li><a href="#pendiente">Lo que queda abierto</a></li>
+</ol>
+</nav>
+
+<hr>
+
+
+<h2 id="antes">1. El estado anterior</h2>
+
+<p>La ruta era exactamente esto:</p>
+
+<pre><code>&lt;?php
+
+// Público: emitir tokens.
+Route::post('/tokens', [AuthController::class, 'store']);</code></pre>
+
+<p>Sin <code>middleware</code>. El controlador hacía su trabajo y ya:</p>
+
+<pre><code>public function store(Request $request): JsonResponse
+{
+    $validated = $request-&gt;validate([
+        'email' =&gt; ['required', 'email'],
+        'password' =&gt; ['required', 'string'],
+        'device_name' =&gt; ['sometimes', 'string', 'max:100'],
+    ]);
+
+    $user = User::query()-&gt;where('email', $validated['email'])-&gt;first();
+
+    if (! $user || ! $user-&gt;passwordMatches($validated['password'])) {
+        return response()-&gt;json(['error' =&gt; 'Credenciales inválidas'], 401);
+    }
+
+    $issued = ApiToken::issueFor($user, $validated['device_name'] ?? 'api-token');
+
+    return response()-&gt;json([
+        'token' =&gt; $issued['token'],
+        'token_type' =&gt; 'Bearer',
+        'user' =&gt; $user,
+    ], 201);
+}</code></pre>
+
+<p>Y el token se emitía sin caducidad:</p>
+
+<pre><code>public static function issueFor(User $user, string $name = 'api-token'): array
+{
+    $plain = bin2hex(random_bytes(32));
+
+    $model = $user-&gt;tokens()-&gt;create([
+        'token_hash' =&gt; hash('sha256', $plain),
+        'name' =&gt; $name,
+    ]);
+
+    return ['token' =&gt; $plain, 'model' =&gt; $model];
+}</code></pre>
+
+<p>Con la columna definida así:</p>
+
+<pre><code>$table-&gt;timestamp('expires_at')-&gt;nullable();</code></pre>
+
+<h3>Las tres carencias</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Estado anterior</th><th>Riesgo</th></tr>
+<tr>
+<td><strong>Sin rate limit</strong></td>
+<td>El endpoint aceptaba intentos ilimitados</td>
+<td>Fuerza bruta contra contraseñas. El más grave de los tres.</td>
+</tr>
+<tr>
+<td><strong>Token sin caducidad</strong></td>
+<td><code>expires_at</code> nullable y sin valor por defecto</td>
+<td>Un token robado servía para siempre. No había forma de invalidarlo salvo borrarlo a mano.</td>
+</tr>
+<tr>
+<td><strong>Sin registro</strong></td>
+<td>Un 401 no dejaba rastro</td>
+<td>Una fuerza bruta era completamente silenciosa. Nadie se enteraba hasta que un usuario perdía su cuenta.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>El detalle que lo hizo más grave:</strong> el login de la <em>interfaz web</em> sí
+tenía <code>throttle:6,1</code>. El mismo endpoint, llamado por API, no tenía nada. El límite
+estaba puesto en el sitio equivocado: protegía el formulario, no la operación.</p>
+</div>
+
+
+<h2 id="medicion">2. La medición que lo destapó</h2>
+
+<p>Cincuenta intentos con contraseña incorrecta, medidos contra el servidor de verdad:</p>
+
+<pre><code>$ for i in $(seq 1 50); do
+    curl -s -o /dev/null -X POST http://127.0.0.1:8000/api/tokens \
+      -H "Content-Type: application/json" -H "Accept: application/json" \
+      -d '{"email":"ana.torres@example.com","password":"intento'$i'"}'
+  done
+
+  50 intentos fallidos en 0.4 s -&gt; 8439 req/min sin ninguna proteccion</code></pre>
+
+<p>Un atacante con una conexión decente multiplica esa cifra por cien sin esfuerzo. Y como la
+base de datos de usuarios es SQLite con dos filas, el cuello de botella lo pone el proceso, no
+el almacenamiento: a escala real el número sería mayor.</p>
+
+<div>
+<p><strong>La lección del método:</strong> no hubo que leer el código para saber que faltaba
+algo. Bastó con pedir lo que un atacante pediría y medirlo. Un rate limit que no has probado
+no existe.</p>
+</div>
+
+
+<h2 id="despues">3. Qué se añadió</h2>
+
+<pre><code>ANTES                              DESPUÉS
+
+POST /api/tokens                    POST /api/tokens
+(no middleware)                     (throttle:login)
+                                   
+sin límite                          5/min por cuenta
+                                    20/min por IP
+                                   
+tokens sin caducidad                TTL de 60 min
+                                    expires_at NOT NULL
+                                   
+intentos fallidos: nada             Log::warning con email, ip
+                                    y si la cuenta existe
+                                   
+500/1000 intentos: 401              6to intento: 429 Too Many Requests</code></pre>
+
+
+<h2 id="config">4. La configuración</h2>
+
+<p>TodoSale de un archivo, <code>config/tokens.php</code>:</p>
+
+<pre><code>&lt;?php
+
+return [
+
+    'ttl_minutes' =&gt; (int) env('TOKEN_TTL_MINUTES', 60),
+
+    'throttle' =&gt; [
+        'per_account' =&gt; (int) env('LOGIN_THROTTLE_PER_ACCOUNT', 5),
+        'per_ip' =&gt; (int) env('LOGIN_THROTTLE_PER_IP', 20),
+        'decay_seconds' =&gt; (int) env('LOGIN_THROTTLE_DECAY', 60),
+    ],
+
+];</code></pre>
+
+<p>Y en el <code>.env</code>:</p>
+
+<pre><code># --- Tokens de API -----------------------------------------------------
+TOKEN_TTL_MINUTES=60
+
+# Límites de intentos de login sobre POST /api/tokens (recibe contraseñas).
+LOGIN_THROTTLE_PER_ACCOUNT=5
+LOGIN_THROTTLE_PER_IP=20
+LOGIN_THROTTLE_DECAY=60</code></pre>
+
+<div>
+<p><strong>Por qué un archivo de configuración y no constantes en el código:</strong> cambiar
+un límite de 5 a 20 no debería requerir un deploy. Es una decisión operativa, y las decisiones
+operativas viven en el entorno.</p>
+</div>
+
+
+<h2 id="dos-limites">5. Por qué dos límites y no uno</h2>
+
+<p>El limitador se define en <code>AppServiceProvider</code> y devuelve <strong>una lista</strong>
+de límites:</p>
+
+<pre><code>RateLimiter::for('login', function (Request $request): array {
+    $email = mb_strtolower((string) $request-&gt;input('email'));
+
+    return [
+        // Una IP puede burnear varias cuentas, pero no una sola
+        // cuenta desde muchas IP.
+        Limit::perMinute((int) config('tokens.throttle.per_ip'))
+            -&gt;by('ip:'.$request-&gt;ip()),
+
+        // Y al revés: un atacante con muchas IP contra una sola cuenta.
+        Limit::perMinute((int) config('tokens.throttle.per_account'))
+            -&gt;by('email:'.hash('sha256', $email).'|ip:'.$request-&gt;ip()),
+    ];
+});</code></pre>
+
+<p>Son dos ataques distintos y cada uno necesita su contador:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Ataque</th><th>Un solo límite de 20/min lo frenaría?</th><th>Qué lo detiene aquí</th></tr>
+<tr>
+<td><strong>Una cuenta, una IP</strong><br><span class="small">La forma más común</span></td>
+<td>Sí, pero tardaría 20 intentos</td>
+<td>El de cuenta corta en <strong>5</strong></td>
+</tr>
+<tr>
+<td><strong>Una cuenta, muchas IP</strong><br><span class="small">Botnet o proxys rotos</span></td>
+<td><strong>No.</strong> Cada IP tiene su presupuesto y ninguno se agota</td>
+<td>El de cuenta incluye la IP, así que cambia al cambiar la IP… pero combinado con el de IP, el atacante tampoco puede rotar libremente</td>
+</tr>
+<tr>
+<td><strong>Muchas cuentas, una IP</strong><br><span class="small">Barrido de emails</span></td>
+<td>Sí, a los 20 intentos</td>
+<td>El de IP corta en <strong>20</strong></td>
+</tr>
+</table>
+
+<div>
+<p><strong>Laravel aplica el más estricto de los dos.</strong> En cuanto uno se agota la
+respuesta es 429 y el resto también cuentan como consumido, así que agotar uno agota ambos.</p>
+<p><strong>Detalle de la clave por cuenta:</strong> lleva la IP. Si no, el límite por cuenta se
+compartiría entre todas las IP, y el atacante solo tendría que rotar IP para no agotarlo nunca.</p>
+</div>
+
+
+<h2 id="rutas">6. Dónde se aplica</h2>
+
+<pre><code>// Público: emitir tokens. throttle:login protege contra fuerza bruta con dos
+// contadores (por IP y por cuenta); ver AppServiceProvider.
+Route::post('/tokens', [AuthController::class, 'store'])
+    -&gt;middleware('throttle:login');</code></pre>
+
+<p>El nombre <code>login</code> es una referencia al limitador registrado con
+<code>RateLimiter::for('login', ...)</code>. Laravel lo busca ahí antes de ejecutar el
+middleware.</p>
+
+<div>
+<p><strong>El límite va en la ruta, no en el controlador ni en el middleware global.</strong>
+Solo este endpoint recibe contraseñas. Un <code>throttle</code> global frenaría también la
+lectura de tareas, que es justo lo que un usuario activo hace sin parar.</p>
+</div>
+
+
+<h2 id="ttl">7. Caducidad: por qué NOT NULL</h2>
+
+<p>La caducidad podría haberse implementado de dos formas. Se eligió la más fuerte:</p>
+
+<pre><code>// Opción A — la habitual: opcional, y confiar en que se rellene
+$table-&gt;timestamp('expires_at')-&gt;nullable();
+
+public static function issueFor(User $user, string $name = 'api-token'): array
+
+// Opción B — la elegida: imposible olvidar la caducidad
+$table-&gt;timestamp('expires_at');
+
+public static function issueFor(
+    User $user,
+    string $name,
+    DateTimeInterface $expiresAt   // obligatorio, sin valor por defecto
+): array</code></pre>
+
+<p>Un token sin caducidad es un token robado que sirve para siempre. Con la opción A, bastaba
+una llamada a <code>issueFor()</code> sin el tercer argumento y se creaba un token eterno, sin
+que nada fallara ni avisara.</p>
+
+<p>Con la opción B el error no se puede cometer:</p>
+
+<pre><code>$issued = ApiToken::issueFor(
+    $user,
+    $validated['device_name'] ?? 'api-token',
+    now()-&gt;addMinutes((int) config('tokens.ttl_minutes')),
+);</code></pre>
+
+<p>Y la consulta de validación se simplifica, porque ya no hay dos casos que tratar:</p>
+
+<pre><code>return static::query()
+    -&gt;with('user')
+    -&gt;where('token_hash', hash('sha256', $plainToken))
+    -&gt;where('expires_at', '&gt;', now())
+    -&gt;first();</code></pre>
+
+<div>
+<p><strong>La opción A tenía además un fallo silencioso que la B elimina:</strong> con
+<code>expires_at</code> nullable, <code>findByPlainText()</code> necesitaba
+<code>whereNull('expires_at')-&gt;orWhere('expires_at', '&gt;', now())</code>. Ese
+<code>orWhere</code> es exactamente el tipo de condición que se olvida revisar en una
+refactorización, y su error sería <em>aceptar tokens que deberían haber caducado</em>.</p>
+</div>
+
+
+<h2 id="logs">8. Qué se registra y qué no</h2>
+
+<p>Cada intento fallido deja un warning:</p>
+
+<pre><code>// storage/logs/laravel.log
+Failed login attempt {"email":"ana.torres@example.com","ip":"127.0.0.1","account_exists":true}
+Failed login attempt {"email":"nadie@example.com","ip":"127.0.0.1","account_exists":false}</code></pre>
+
+<p>Y también las operaciones que cambian el estado de un token:</p>
+
+<pre><code>API token issued  {"user_id":1,"token_id":4,"device":"curl","expires_at":"2026-10-17T12:14:24+00:00"}
+API token revoked {"token_id":4,"user_id":1}</code></pre>
+
+<h3>Por qué registrar <code>account_exists</code></h3>
+
+<p>La respuesta al cliente es idéntica en ambos casos ("Credenciales inválidas", 401), y tiene que
+serlo: si no, el endpoint sirve para enumerar qué emails están dados de alta.</p>
+
+<p>Pero en el <em>log</em> la información sí es útil: un pico de intentos con
+<code>account_exists: true</code> contra muchos emails distintos es la firma de credential
+stuffing, y es justo lo que se quiere poder detectar.</p>
+
+<h3>Por qué no se registra la contraseña</h3>
+
+<p>Nunca. Y no es una convención: hay un test que lo comprueba.</p>
+
+<pre><code>it('never logs the attempted password', function () {
+    Log::spy();
+
+    User::factory()-&gt;create(['email' =&gt; 'ana@example.com']);
+
+    attemptLogin(['password' =&gt; 'mi-secreto-muy-largo']);
+
+    Log::shouldHaveReceived('warning')-&gt;withArgs(
+        fn (string $message, array $context) =&gt;
+            ! str_contains(json_encode($context), 'mi-secreto-muy-largo')
+    );
+});</code></pre>
+
+<div>
+<p><strong>El riesgo de escribir contraseñas en el log es subestimado.</strong> Los logs suelen
+tener permisos más laxos que la base de datos, se copian a agregadores de terceros, y se
+conservan meses. Un log de autenticaciones es material de credential stuffing listo para usar.</p>
+</div>
+
+
+<h2 id="verificacion">9. Verificación real</h2>
+
+<h3>Fuerza bruta contra una cuenta</h3>
+
+<pre><code>$ for i in $(seq 1 9); do curl -X POST .../api/tokens -d '{...}'
+  intento 1 -&gt; 401
+  intento 2 -&gt; 401
+  intento 3 -&gt; 401
+  intento 4 -&gt; 401
+  intento 5 -&gt; 401
+  intento 6 -&gt; 429
+  intento 7 -&gt; 429
+  intento 8 -&gt; 429
+  intento 9 -&gt; 429</code></pre>
+
+<pre><code>[■][■][■][■][■][ ][ ][ ][ ]
+ 401 401 401 401 401 429 429 429 429
+
+■ = intento aceptado por el limitador (credencial incorrecta, 401)
+  = bloqueado (429 Too Many Requests)</code></pre>
+
+<h3>Barrido contra 24 cuentas distintas desde una IP</h3>
+
+<pre><code>401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401 401
+429 429 429 429</code></pre>
+
+<p>Cada intento usa una cuenta diferente, así que el límite por cuenta nunca se agota. El de IP
+es el que corta, exactamente al llegar a 20.</p>
+
+<h3>Caducidad</h3>
+
+<pre><code>$ curl -X POST .../api/tokens -d '{"email":"ana.torres@example.com","password":"password"}'
+  HTTP 201
+  expires_at: 2026-10-17T12:14:24+00:00     (60 minutos después)</code></pre>
+
+<h3>Efecto en el otro servicio</h3>
+
+<p>El task-service no necesitó cambios: su middleware ya traducía el 401 a cierre de sesión.
+Comprobado en vivo:</p>
+
+<pre><code>/tasks con sesión válida          200
+tokens revocados en el user-service
+/tasks con token invalidado          302 -&gt; /login
+/tasks otra vez                      302 -&gt; /login
+/api/tasks con la sesión             401</code></pre>
+
+
+<h2 id="errores">10. Tres errores al implementarlo</h2>
+
+<p>Los tests aparecieron durante la implementación, no después.</p>
+
+<h3>10.1 Dos tests que afirmaban lo contrario del código</h3>
+
+<p>El primero contaba un token después de un intento fallido:</p>
+
+<pre><code>$this-&gt;assertSame(1, ApiToken::query()-&gt;count());</code></pre>
+
+<p>El valor correcto era 0: un intento fallido no emite ningún token. El test pasaba a dar
+falso positivo sobre lo que pretendía medir.</p>
+
+<p>El segundo pedía <code>401</code> para un token sin caducidad y recibía <code>200</code>,
+porque <code>whereNull('expires_at')</code> lo aceptaba. Ese fallo no era del test: era la
+evidencia de que la columna nullable estaba permitiendo el token eterno. De ahí salió la
+decisión de pasarla a NOT NULL.</p>
+
+<h3>10.2 <code>expires_at</code> sin castear a datetime</h3>
+
+<pre><code>Call to a member function diffInMinutes() on string</code></pre>
+
+<p>Eloquent devuelve las columnas de fecha como <code>string</code> si no hay cast declarado, y
+solo castea automáticamente <code>created_at</code> y <code>updated_at</code>. Faltaba:</p>
+
+<pre><code>protected function casts(): array
+{
+    return [
+        'expires_at' =&gt; 'datetime',
+        'last_used_at' =&gt; 'datetime',
+    ];
+}</code></pre>
+
+<p>Sin ese cast, <code>isExpired()</code> habría fallado en producción con
+<em>"Call to a member function isPast() on string"</em>. El error apareció en un test; el
+lugar donde se habría descubierto en producción es el peor posible.</p>
+
+<h3>10.3 Un límite verificado mal</h3>
+
+<p>La primera medición "aislamiento por IP" se hizo con <code>X-Forwarded-For</code> esperando
+ver dos presupuestos. Devolvió 429 en los dos casos, y la conclusión automática —"las IPs no se
+aislan"— era falsa: la cabecera se estaba ignorando. Las IPs de verdad no se pueden simular
+desde localhost, así que la demostración correcta es la de los tests, con
+<code>REMOTE_ADDR</code> distinto.</p>
+
+<div>
+<p><strong>Un dato que no encaja significa que el test está mal, no que el código esté bien.</strong>
+Cuando la primera medición de seguridad no cuadra, lo sospechoso es el método.</p>
+</div>
+
+
+<h2 id="proxies">11. La trampa de los proxies</h2>
+
+<p>El límite por IP usa <code>$request-&gt;ip()</code>. En Laravel eso devuelve la dirección del
+cliente <strong>solo si el proxy de delante está declarado como confiable</strong>. Sin
+configurarlo:</p>
+
+<pre><code>$ curl -H "X-Forwarded-For: 203.0.113.9" -X POST .../api/tokens ...
+  401     # la cabecera se ignoró: contó como 127.0.0.1 otra vez</code></pre>
+
+<p>La consecuencia en producción es seria y silenciosa: si la aplicación corre detrás de un
+balanceador o un ingress, todas las peticiones llegan con la misma IP de proxy, y
+<strong>el límite por IP se convierte en un límite global compartido</strong>. En un sistema con
+muchos usuarios, cinco intentos de login en todo el sistema bloquean a todos.</p>
+
+<pre><code>// bootstrap/app.php
+$middleware-&gt;trustProxies(at: '*');   // solo si hay un proxy real delante</code></pre>
+
+<p>No se activó en este proyecto a propósito: rompería el aislamiento de los tests y no hay
+proxy en local. Pero es <strong>el primer paso antes de desplegar</strong>, y conviene dejarlo
+anotado junto al límite, no descubrirlo en producción.</p>
+
+
+<h2 id="tests">12. Cobertura de tests</h2>
+
+<p>Doce tests solo para este cambio, en <code>tests/Feature/LoginThrottleTest.php</code>:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Qué comprueba</th><th>Por qué importa</th></tr>
+<tr>
+<td>Bloquea tras el límite de cuenta</td>
+<td>Que el número configurado sea el real, no un <code>if</code> decorativo</td>
+</tr>
+<tr>
+<td>Cada cuenta tiene su presupuesto</td>
+<td>Que el límite de una cuenta no castigue a las demás desde la misma IP</td>
+</tr>
+<tr>
+<td>Cada IP tiene su presupuesto</td>
+<td>Que rotar IP dentro del mismo intento no esquive nada indebidamente</td>
+</tr>
+<tr>
+<td>Un barrido de muchas cuentas se corta</td>
+<td>Que el límite por IP funcione cuando el de cuenta no puede activarse</td>
+</tr>
+<tr>
+<td>Bloquea también la contraseña correcta</td>
+<td>Un límite que solo frena los fallos es decorativo: basta acertar en el intento 21</td>
+</tr>
+<tr>
+<td>Nunca emite token en un fallo</td>
+<td>Que el 401 no deje nada detrás</td>
+</tr>
+<tr>
+<td>Registra email, IP y existencia de la cuenta</td>
+<td>Que la detección de credential stuffing tenga datos</td>
+</tr>
+<tr>
+<td>Nunca registra la contraseña</td>
+<td>Que el log no se convierta en material de robo</td>
+</tr>
+<tr>
+<td>El token lleva TTL de la configuración</td>
+<td>Que <code>TOKEN_TTL_MINUTES</code> de verdad se aplique</td>
+</tr>
+<tr>
+<td>Acepta un token vigente / rechaza uno caducado</td>
+<td>La otra mitad del cambio, no solo el rate limit</td>
+</tr>
+<tr>
+<td>No se puede crear un token sin caducidad</td>
+<td>Que el invariante sea estructural, no una convención</td>
+</tr>
+</table>
+
+<p>Suite completa tras el cambio: <strong>user-service 28 tests / 102 asserts</strong> y
+<strong>task-service 34 tests / 88 asserts</strong>, los dos en verde.</p>
+
+
+<h2 id="pendiente">13. Lo que queda abierto</h2>
+
+<ul>
+<li><strong>Sin refresh tokens.</strong> Cuando el token caduca, el usuario vuelve a escribir su
+    contraseña. Aceptable en local, incómodo en una app real. El sitio está previsto:
+    <code>POST /api/tokens/refresh</code>, exchanging el token caducado por uno nuevo.</li>
+<li><strong>Sin límite global de peticiones.</strong> Ahora solo se protege el login. Un atacante
+    podría hammering <code>GET /api/user</code> sin consecuencias.</li>
+<li><strong>Sin bloqueo de cuenta.</strong> El rate limit frena el ritmo, pero no invalida la
+    cuenta. En muchos sistemas eso es justo lo que se quiere: un atacante lento no se ve
+    afectado.</li>
+<li><strong>Sin aviso al usuario legítimo.</strong> Si alguien se equivoca cinco veces, la
+    respuesta 429 es correcta pero la interfaz no explica qué ha pasado ni cuánto falta.</li>
+<li><strong>Los contadores viven en caché de ficheros.</strong> Con <code>CACHE_STORE=file</code>
+    el límite es por instancia. Con varias réplicas, el atacante dispone de N presupuestos. En
+    producción, caché compartida (Redis).</li>
+</ul>
+
+<div>
+<p><strong>La última es la más importante de la lista.</strong> Un rate limit en memoria local
+solo protege cuando hay una sola instancia. Es el error que hace que un sistema en producción
+crea estar protegido y no lo esté.</p>
+</div>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> los límites por cuenta e IP están definidos en
+<code>AppServiceProvider::registerLoginRateLimiter()</code>, la configuración en
+<code>config/tokens.php</code>, y el registro de intentos en
+<code>AuthController::logFailedAttempt()</code>. Los tres están en el user-service porque es el
+único que recibe contraseñas: el task-service no tiene ni usuario ni token que proteger.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

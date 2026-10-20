@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Database\Factories\ApiTokenFactory;
+use DateTimeInterface;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
@@ -22,6 +23,22 @@ class ApiToken extends Model
     use HasFactory;
 
     /**
+     * Get the attributes that should be cast.
+     *
+     * Sin esto, expires_at vuelve del driver como string y isExpired()
+     * explotaría con "Call to a member function isPast() on string".
+     *
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'expires_at' => 'datetime',
+            'last_used_at' => 'datetime',
+        ];
+    }
+
+    /**
      * @return BelongsTo<User, $this>
      */
     public function user(): BelongsTo
@@ -35,15 +52,19 @@ class ApiToken extends Model
      * El plano se entrega una sola vez, en la respuesta HTTP. Aquí solo
      * sobrevive su hash, que es lo que se busca en cada request.
      *
+     * $expiresAt es obligatorio: la columna no admite NULL, y con razón. Un
+     * token sin caducidad es un token robado que sirve para siempre.
+     *
      * @return array{token: string, model: self}
      */
-    public static function issueFor(User $user, string $name = 'api-token'): array
+    public static function issueFor(User $user, string $name, DateTimeInterface $expiresAt): array
     {
         $plain = bin2hex(random_bytes(32));
 
         $model = $user->tokens()->create([
             'token_hash' => hash('sha256', $plain),
             'name' => $name,
+            'expires_at' => $expiresAt,
         ]);
 
         return ['token' => $plain, 'model' => $model];
@@ -61,12 +82,15 @@ class ApiToken extends Model
         return static::query()
             ->with('user')
             ->where('token_hash', hash('sha256', $plainToken))
-            ->where(fn ($query) => $query->whereNull('expires_at')->orWhere('expires_at', '>', now()))
+            ->where('expires_at', '>', now())
             ->first();
     }
 
+    /**
+     * ¿Este token ya no sirve?
+     */
     public function isExpired(): bool
     {
-        return $this->expires_at !== null && $this->expires_at->isPast();
+        return $this->expires_at->isPast();
     }
 }

@@ -25,7 +25,7 @@ class AuthenticateWithUserService
 
     public function handle(Request $request, Closure $next): Response
     {
-  
+
         $token = $request->bearerToken()
             ?? ($request->hasSession() ? $request->session()->get('api_token') : null);
 
