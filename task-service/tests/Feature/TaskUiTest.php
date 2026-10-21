@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\Task;
+use Demo\Microservices\UserServiceClient\TokenSession;
 use Illuminate\Support\Facades\Http;
 
 /*
@@ -36,7 +37,7 @@ it('logs in through the user-service and stores the returned token', function ()
         'password' => 'password',
     ])
         ->assertRedirect(route('tasks.index'))
-        ->assertSessionHas('api_token', 'token-emitido');
+        ->assertSessionHas(TokenSession::SESSION_KEY, 'token-emitido');
 
     Http::assertSent(
         fn ($request) => $request->url() === config('user-service-client.url').'/api/tokens'
@@ -53,7 +54,7 @@ it('rejects invalid credentials without creating a session', function () {
         ->post(route('login'), ['email' => 'ana@example.com', 'password' => 'mala'])
         ->assertRedirect(route('login'))
         ->assertSessionHasErrors('email')
-        ->assertSessionMissing('api_token');
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
 
 it('returns 503 on the login page when the user-service is down', function () {
@@ -68,7 +69,7 @@ it('logs out and revokes the token on the user-service', function () {
 
     $this->post(route('logout'))
         ->assertRedirect(route('login'))
-        ->assertSessionMissing('api_token');
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
 
     Http::assertSent(
         fn ($request) => $request->method() === 'DELETE'
@@ -134,19 +135,19 @@ it('shows a 403 when opening a task that belongs to someone else', function () {
 });
 
 it('drops the web session when the token is no longer valid upstream', function () {
-    $this->withSession(['api_token' => 'token-caducado']);
+    $this->withSession([TokenSession::SESSION_KEY => 'token-caducado']);
 
     Http::fake(['*/api/user' => Http::response(['error' => 'Unauthenticated.'], 401)]);
 
     $this->get(route('tasks.index'))
         ->assertRedirect(route('login'))
-        ->assertSessionMissing('api_token');
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
 
 it('returns 503 when the user-service is unreachable', function () {
     fakeUserServiceDown();
 
-    $this->withSession(['api_token' => 'test-token'])
+    $this->withSession([TokenSession::SESSION_KEY => 'test-token'])
         ->get(route('tasks.index'))
         ->assertStatus(503);
 });

@@ -76,9 +76,10 @@
 <div class="wrap">
 
 @php
-    // El middleware AuthenticateWithUserService deja aquí la identidad que
-    // confirmó el user-service por HTTP. En /login simplemente no existe.
-    $currentUser = request()->attributes->get('authenticated_user');
+    // El middleware AuthenticateWithUserService (paquete del cliente) deja
+    // aquí la identidad que confirmó el user-service por HTTP. En /login
+    // simplemente no existe.
+    $currentUser = \Demo\Microservices\UserServiceClient\AuthenticatedUser::fromRequest(request());
 @endphp
 
 <header class="top">

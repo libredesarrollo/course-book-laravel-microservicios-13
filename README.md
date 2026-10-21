@@ -177,8 +177,8 @@ en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
 ## Tests
 
 ```bash
-cd user-service && vendor/bin/pest --compact   # 33 tests, 114 asserts
-cd task-service && vendor/bin/pest --compact   # 50 tests, 114 asserts
+cd user-service && vendor/bin/pest --compact   # 34 tests, 119 asserts
+cd task-service && vendor/bin/pest --compact   # 60 tests, 142 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
@@ -186,9 +186,11 @@ conexión caída. Hay tests que intentan inyectar `user_id` por API y por formul
 que se ignora.
 
 Los paquetes de `packages/` también tienen cobertura propia, en
-`task-service/tests/Feature/UserServiceClientPackageTest.php`: 11 tests sobre el cliente HTTP
-del user-service (resolución de token válido, token inválido, error del peer, servicio caído,
-emisión, revocación, propagación del `X-Request-Id` y el binding del contrato).
+`task-service/tests/Feature/UserServiceClientPackageTest.php`: tests sobre el cliente HTTP del
+user-service (resolución de token válido, token inválido, error del peer, servicio caído, emisión,
+revocación, propagación del `X-Request-Id` y el binding del contrato) y sobre el middleware
+empaquetado (alias registrado, `401` en API, redirect en web, sesión descartada con token
+inválido) y el ciclo de vida de `TokenSession` (login, logout y logout con el peer caído).
 
 ---
 
@@ -209,10 +211,15 @@ no hay espacio de búsqueda.
 `401` significa "token inválido" y se traduce a `null`; cualquier otro status es un fallo del peer
 y lanza excepción.
 
-**El código compartido está empaquetado, no copiado.** Los middlewares de observabilidad y el
-cliente HTTP del user-service viven en `packages/` como paquetes Composer con repositorio `path`.
-El `task-service` consume el **contrato** `IdentityProvider`, no la clase concreta, así que
-cambiar la implementación no obliga a tocar los controllers.
+**El código compartido está empaquetado, no copiado.** Los middlewares de observabilidad, el
+health check y el cliente HTTP del user-service viven en `packages/` como paquetes Composer con
+repositorio `path`. El `task-service` consume el **contrato** `IdentityProvider`, no la clase
+concreta, así que cambiar la implementación no obliga a tocar los controllers.
+
+**La frontera con el user-service está completa en el paquete.** No solo el cliente HTTP: también
+el middleware que autentica, la identidad que devuelve y el ciclo de vida de la sesión con token
+remoto. Lo que queda en la aplicación es lo que es de la aplicación: las vistas, las validaciones
+y las redirecciones.
 
 **`findOwnedTask()` en vez de route model binding.** `SubstituteBindings` corre antes del
 middleware de autenticación, así que con binding implícito un anónimo veía `404` para "no existe"
@@ -247,31 +254,32 @@ demo-microservicios/
 │   └── laravel-services.html             ← services en Laravel: qué son y cuándo usarlos
 │
 ├── packages/                         ← código compartido, empaquetado con Composer
-│   ├── microservices-observability/          ← correlation ID + contexto de logs
-│   │   └── src/Http/Middleware/{EnsureRequestId,AttachLogContext}.php
+│   ├── microservices-observability/          ← correlation ID + contexto de logs + health check
+│   │   └── src/
+│   │       ├── Http/Middleware/{EnsureRequestId,AttachLogContext}.php
+│   │       └── Http/Controllers/HealthController.php
 │   └── microservices-user-service-client/    ← la frontera de red con el user-service
 │       ├── src/Contracts/IdentityProvider.php
 │       ├── src/UserServiceClient.php
+│       ├── src/AuthenticatedUser.php        ← la identidad que confirmó el peer
+│       ├── src/TokenSession.php             ← sesión web respaldada por token remoto
+│       ├── src/Http/Middleware/AuthenticateWithUserService.php
 │       ├── src/Exceptions/
 │       └── config/user-service-client.php
 │
 ├── user-service/                     ← :8000 · db_users.sqlite
 │   ├── app/Models/ApiToken.php               ← emitir y buscar tokens
 │   ├── app/Http/Controllers/AuthController.php
-│   ├── app/Http/Controllers/HealthController.php
 │   ├── app/Http/Middleware/AuthenticateApiToken.php
 │   ├── database/migrations/…_create_api_tokens_table.php
 │   └── tests/Feature/AuthApiTest.php
 │
 └── task-service/                     ← :8001 · db_tasks.sqlite
-    ├── app/Http/Middleware/AuthenticateWithUserService.php
-    ├── app/Support/AuthenticatedUser.php      ← identidad, solo durante el request
     ├── app/Http/Controllers/AuthController.php
-    ├── app/Http/Controllers/HealthController.php
     ├── app/Http/Controllers/TaskController.php        ← UI web
     ├── app/Http/Controllers/Api/TaskController.php   ← API REST
     ├── resources/views/{layouts,auth,tasks,errors}/
-    └── tests/Feature/{TaskApiTest,TaskUiTest,UserServiceClientPackageTest}.php
+    └── tests/Feature/{TaskApiTest,TaskUiTest,UserServiceClientPackageTest,ObservabilityPackageTest}.php
 ```
 
 ### Paquetes compartidos
@@ -301,6 +309,24 @@ $middleware->appendToGroup('api', 'log.context');
 El paquete **no** decide en qué grupos se aplican: eso sigue en el
 `bootstrap/app.php` de cada servicio, a la vista.
 
+El paquete del cliente hace lo mismo con su middleware, bajo el alias
+`auth.user-service`. Y expone tres piezas que antes vivían en el `task-service`:
+el propio middleware, la identidad (`AuthenticatedUser`) y el ciclo de vida de la
+sesión con token remoto (`TokenSession`).
+
+```php
+// bootstrap/app.php
+$middleware->alias(['auth.user-service' => \Demo\Microservices\UserServiceClient\Http\Middleware\AuthenticateWithUserService::class]);
+```
+
+En realidad **no hace falta escribir eso**: el paquete registra el alias si la
+aplicación no ha declarado otro con el mismo nombre. La línea de arriba solo está
+si quieres un nombre distinto.
+
+El `HealthController` también viene en el paquete de observabilidad, así que los
+dos servicios responden el health check exactamente igual. Lo que decide cada
+aplicación es la ruta en la que lo monta.
+
 
 ## Configuración
 
@@ -309,9 +335,16 @@ El paquete **no** decide en qué grupos se aplican: eso sigue en el
 ```dotenv
 USER_SERVICE_URL=http://127.0.0.1:8000
 USER_SERVICE_TIMEOUT=3
+USER_SERVICE_LOGIN_ROUTE=login
 ```
 
 Nada de URLs hardcodeadas: si el user-service cambia de host, solo tocas el `.env`.
+
+`USER_SERVICE_LOGIN_ROUTE` es la ruta a la que el middleware manda cuando el
+request viene de la web y no de la API. La pone la aplicación porque el paquete
+no puede saber cómo se llama su pantalla de login. A `null` significa "no
+redirijas nunca": el middleware responde `401` en JSON, que es lo que necesita una
+aplicación que solo expone API.
 
 > Ojo: `php artisan serve` **no propaga variables de entorno arbitrarias** al proceso hijo. Si
 > lanzas el servicio con `USER_SERVICE_URL=... php artisan serve`, seguirá leyendo el `.env`.

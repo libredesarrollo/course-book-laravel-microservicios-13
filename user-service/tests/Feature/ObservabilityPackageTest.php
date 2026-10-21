@@ -56,3 +56,13 @@ it('adds the request id to the log context', function () {
             && array_key_exists('method', $context)
             && array_key_exists('path', $context));
 });
+
+it('answers the health check with the same payload in every service', function () {
+    $this->getJson('/api/health')
+        ->assertOk()
+        ->assertJson([
+            'status' => 'ok',
+            'service' => config('app.name'),
+        ])
+        ->assertJsonStructure(['status', 'service', 'timestamp']);
+});

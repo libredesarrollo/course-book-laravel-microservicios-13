@@ -127,19 +127,27 @@ coste de publicar nada.</p>
 │   │   ├── README.md
 │   │   └── src/
 │   │       ├── MicroservicesObservabilityServiceProvider.php
-│   │       └── Http/Middleware/
-│   │           ├── AttachLogContext.php
-│   │           └── EnsureRequestId.php
+│   │       └── Http/
+│   │           ├── Controllers/
+│   │           │   └── HealthController.php
+│   │           └── Middleware/
+│   │               ├── AttachLogContext.php
+│   │               └── EnsureRequestId.php
 │   │
 │   └── microservices-user-service-client/
 │       ├── composer.json
 │       ├── README.md
+│       ├── config/
+│       │   └── user-service-client.php
 │       └── src/
 │           ├── UserServiceClientServiceProvider.php
 │           ├── UserServiceClient.php
+│           ├── AuthenticatedUser.php
+│           ├── TokenSession.php
 │           ├── Contracts/
 │           ├── Exceptions/
-│           └── Http/Clients/
+│           └── Http/Middleware/
+│               └── AuthenticateWithUserService.php
 │
 ├── user-service/
 │   ├── composer.json      &lt;- + repositories, + require
@@ -208,7 +216,7 @@ que solo usa un servicio no es un paquete: es código que se mudó de sitio sin 
 <tr>
 <td><code>require</code></td>
 <td>Solo <code>illuminate/support</code>, <code>illuminate/http</code> e <code>illuminate/routing</code></td>
-<td>El paquete usa <code>Str</code>, <code>Log</code>, <code>Request</code>, <code>Response</code> y el <code>Router</code> (para registrar los alias de middleware). <strong>No depende de <code>laravel/framework</code></strong>, así que podría usarse en Lumen o en un proyecto con Lumen.</td>
+<td>El paquete usa <code>Str</code>, <code>Log</code>, <code>Request</code>, <code>Response</code> y el <code>Router</code> (para registrar los alias de middleware). <strong>No exige <code>laravel/framework</code></strong> en sus dependencias, así que no obliga a instalar el framework completo.</td>
 </tr>
 <tr>
 <td><code>extra.laravel.providers</code></td>
@@ -236,6 +244,22 @@ framework completo. Aquí la diferencia no se nota porque las aplicaciones ya lo
 en un paquete publicado la diferencia importa.</p>
 </div>
 
+<div>
+<p><strong>Con un matiz, porque la verdad incomoda:</strong> que el paquete no <em>declare</em>
+<code>laravel/framework</code> no significa que no lo <em>use</em>. Los helpers
+<code>config()</code> y <code>request()</code> no viven en
+<code>illuminate/support</code>: viven en <code>Illuminate\Foundation</code>. El código nuevo
+del paquete evita depender de ellos siempre que puede —el controller de health check construye
+su <code>JsonResponse</code> a mano en vez de usar <code>response()</code>, y el middleware
+recibe el <code>Redirector</code> y el <code>UrlGenerator</code> inyectados en vez de llamar a
+<code>redirect()</code>—, pero el <code>UserServiceClient</code> ya usaba
+<code>request()</code> y <code>config()</code> antes de esta refactorización.</p>
+<p>La diferencia práctica: si mañana estos paquetes se quisieran usar en Lumen, o en un proyecto
+que no tire de Foundation, habría que quitar esos tres o cuatro helpers. Es un trabajo
+pequeño, pero no es cero, y decir "no depende de Laravel" cuando en realidad depende de
+Foundation es una forma elegante de mentir.</p>
+</div>
+
 <h3>El paquete del cliente HTTP</h3>
 
 <p>El segundo paquete tiene la misma forma, con su propio namespace:</p>
@@ -249,7 +273,8 @@ en un paquete publicado la diferencia importa.</p>
   "require": {
     "php": "^8.2",
     "illuminate/support": "^13.0",
-    "illuminate/http": "^13.0"
+    "illuminate/http": "^13.0",
+    "illuminate/routing": "^13.0"
   },
   "autoload": {
     "psr-4": {
@@ -266,6 +291,10 @@ en un paquete publicado la diferencia importa.</p>
   "minimum-stability": "dev",
   "prefer-stable": true
 }</code></pre>
+
+<p><code>illuminate/routing</code> se añadió cuando el paquete pasó a registrar su propio
+middleware: hacen falta el <code>Router</code> para declarar el alias y el
+<code>Redirector</code> para mandar al usuario a la pantalla de login.</p>
 
 <h2 id="provider">5. El ServiceProvider</h2>
 
@@ -321,21 +350,26 @@ comportamiento silencioso. Si el día de mañana el <code>user-service</code> qu
 (<code>bootstrap/app.php</code>) y no dentro de un <code>vendor/</code> que no controlas.</p>
 </div>
 
-<h3>5.2 El provider del cliente HTTP: enlazar la implementación</h3>
+<h3>5.2 El provider del cliente HTTP: enlazar implementaciones y publicar el alias</h3>
 
 <p>El del cliente HTTP tiene un trabajo distinto: registrar el cliente como <strong>singleton</strong>
-en el contenedor, de forma que se comparta la instancia y su configuración, y enlazar la
-implementación con el contrato que consume la aplicación:</p>
+en el contenedor, de forma que se comparta la instancia y su configuración, enlazar la
+implementación con el contrato que consume la aplicación, y publicar su middleware bajo
+un alias:</p>
 
 <pre><code>&lt;?php
 
 namespace Demo\Microservices\UserServiceClient;
 
 use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
+use Demo\Microservices\UserServiceClient\Http\Middleware\AuthenticateWithUserService;
+use Illuminate\Routing\Router;
 use Illuminate\Support\ServiceProvider;
 
 class UserServiceClientServiceProvider extends ServiceProvider
 {
+    public const ALIAS_AUTHENTICATE = 'auth.user-service';
+
     public function register(): void
     {
         $this-&gt;mergeConfigFrom(
@@ -348,10 +382,19 @@ class UserServiceClientServiceProvider extends ServiceProvider
         // El contrato es lo que consumen la aplicación; la implementación
         // concreta es un detalle que puede cambiar sin tocar a nadie.
         $this-&gt;app-&gt;bind(IdentityProvider::class, UserServiceClient::class);
+
+        $this-&gt;app-&gt;singleton(TokenSession::class);
     }
 
-    public function boot(): void
+    public function boot(Router $router): void
     {
+        // Solo se registra si la aplicación no ha declarado el alias con
+        // otro nombre. Así el paquete ofrece un valor por defecto y la
+        // aplicación conserva la última palabra.
+        if (! array_key_exists(self::ALIAS_AUTHENTICATE, $router-&gt;getMiddleware())) {
+            $router-&gt;aliasMiddleware(self::ALIAS_AUTHENTICATE, AuthenticateWithUserService::class);
+        }
+
         if ($this-&gt;app-&gt;runningInConsole()) {
             $this-&gt;publishes([
                 __DIR__.'/../config/user-service-client.php' =&gt; config_path('user-service-client.php'),
@@ -363,10 +406,43 @@ class UserServiceClientServiceProvider extends ServiceProvider
 
 <div>
 <p><strong>Resumen de los dos providers:</strong> el de observabilidad publica <em>aliases</em>
-(la API pública del paquete), el del cliente <em>enlaza implementaciones</em> y <em>publica
-configuración</em>. Son trabajos distintos y por eso los dos existen. Un provider vacío, en
-cambio, no hace ninguno de los dos.</p>
+(la API pública del paquete), el del cliente <em>enlaza implementaciones</em>, <em>publica
+configuración</em> y además registra su propio alias. Son trabajos distintos y por eso los
+dos existen. Un provider vacío, en cambio, no hace ninguno de los dos.</p>
 </div>
+
+<h3>5.3 El middleware, también en el paquete</h3>
+
+<p>El middleware que autentica preguntando al user-service es la última pieza de la
+frontera: el cliente HTTP habla con el peer, el contrato abstrae esa frontera y el
+middleware la engancha al ciclo de vida de una petición de Laravel. Si se quedara en
+la aplicación, cualquier otro consumidor del paquete tendría que reescribirlo.</p>
+
+<p>Por eso también viaja <code>AuthenticatedUser</code> (la identidad ya tipada) y
+<code>TokenSession</code> (el ciclo de vida de la sesión web respaldada por un token
+remoto). La aplicación conserva lo que es suyo: las vistas y las redirecciones.</p>
+
+<pre><code>// task-service/app/Http/Controllers/AuthController.php
+public function store(Request $request, TokenSession $session): RedirectResponse
+{
+    $credentials = $request-&gt;validate([
+        'email' =&gt; ['required', 'email'],
+        'password' =&gt; ['required', 'string'],
+    ]);
+
+    try {
+        $session-&gt;login($request, $credentials, 'task-service-web');
+    } catch (UserServiceErrorException) {
+        return back()
+            -&gt;withInput($request-&gt;only('email'))
+            -&gt;withErrors(['email' =&gt; 'Credenciales inválidas.']);
+    }
+
+    return redirect()-&gt;intended(route('tasks.index'));
+}
+</code></pre>
+
+<p>El paquete no renderiza nada: eso sigue siendo de la aplicación.</p>
 
 
 <h2 id="composer-app">6. El composer.json de la aplicación</h2>
@@ -560,8 +636,13 @@ más.</p>
 </tr>
 <tr>
 <td><code>AuthenticateWithUserService</code></td>
-<td><strong>No</strong></td>
-<td>Solo tiene sentido en los servicios <em>consumidores</em>: reenvía el token por HTTP al user-service.</td>
+<td><strong>Sí</strong></td>
+<td>Es la última pieza de la frontera con el user-service: sin ella, cada consumidor del paquete tendría que reescribir el middleware.</td>
+</tr>
+<tr>
+<td><code>HealthController</code></td>
+<td><strong>Sí</strong></td>
+<td>Idéntico en ambos servicios (94% de líneas en común). Si cada uno escribiera el suyo, acabarían respondiendo de forma distinta.</td>
 </tr>
 <tr>
 <td>Rate limiting y <code>config/tokens.php</code></td>
@@ -570,8 +651,8 @@ más.</p>
 </tr>
 <tr>
 <td>DTO <code>AuthenticatedUser</code></td>
-<td><strong>Por decidir</strong></td>
-<td>Es genérico, pero solo lo usa un servicio. Se empaquetará cuando lo use un segundo.</td>
+<td><strong>Sí</strong></td>
+<td>Va de la mano del middleware que lo produce: es la identidad que el user-service confirmó por HTTP.</td>
 </tr>
 </table>
 
@@ -660,6 +741,7 @@ archivo:</p>
 return [
     'url' =&gt; env('USER_SERVICE_URL', 'http://127.0.0.1:8000'),
     'timeout' =&gt; (int) env('USER_SERVICE_TIMEOUT', 3),
+    'login_route' =&gt; env('USER_SERVICE_LOGIN_ROUTE', 'login'),
 ];</code></pre>
 
 <p>Y el <code>ServiceProvider</code> lo fusiona y lo hace publicable:</p>
@@ -676,6 +758,12 @@ $this-&gt;publishes([
 <p>Las variables de entorno <strong>no cambian</strong>: sigue siendo
 <code>USER_SERVICE_URL</code> y <code>USER_SERVICE_TIMEOUT</code>. Los ficheros
 <code>.env</code> de los servicios siguen siendo válidos sin tocar nada.</p>
+
+<p>La clave <code>login_route</code> sí es nueva, y es necesaria: el middleware
+vive en el paquete y el paquete no puede saber cómo se llama la pantalla de login
+de cada aplicación. Si se pone a <code>null</code>, el middleware responde siempre
+<code>401</code> en JSON, sin redirigir: es lo que necesita una aplicación que solo
+expone API.</p>
 
 <h3>12.3 Lo que se borró del task-service</h3>
 
@@ -701,10 +789,23 @@ $this-&gt;publishes([
 <td><code>app/Http/Middleware/AttachLogContext.php</code></td>
 <td><code>packages/microservices-observability/src/Http/Middleware/</code></td>
 </tr>
+<tr>
+<td><code>app/Http/Middleware/AuthenticateWithUserService.php</code></td>
+<td><code>packages/microservices-user-service-client/src/Http/Middleware/</code></td>
+</tr>
+<tr>
+<td><code>app/Support/AuthenticatedUser.php</code></td>
+<td><code>packages/microservices-user-service-client/src/AuthenticatedUser.php</code></td>
+</tr>
+<tr>
+<td><code>app/Http/Controllers/HealthController.php</code> (en ambos servicios)</td>
+<td><code>packages/microservices-observability/src/Http/Controllers/</code></td>
+</tr>
 </table>
 
-<p>El directorio <code>app/Exceptions/</code> del task-service quedó vacío y se eliminó
-por completo.</p>
+<p>Los directorios <code>app/Exceptions/</code>, <code>app/Services/</code>,
+<code>app/Support/</code> y <code>app/Http/Middleware/</code> del task-service
+quedaron vacíos y se eliminaron por completo.</p>
 
 <h3>12.4 El user-service no necesita el cliente</h3>
 

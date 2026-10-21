@@ -1,11 +1,12 @@
 <?php
 
 use App\Http\Controllers\AuthController;
-use App\Http\Controllers\HealthController;
 use App\Http\Controllers\UserController;
+use Demo\Microservices\Observability\Http\Controllers\HealthController;
 use Illuminate\Support\Facades\Route;
 
-// Health check (operabilidad). Público.
+// Health check (operabilidad). Público. El controller viene del paquete de
+// observabilidad: es la misma respuesta en todos los microservicios.
 Route::get('/health', [HealthController::class, 'index']);
 
 // Público: emitir tokens. throttle:login protege contra fuerza bruta con dos

@@ -1,15 +1,14 @@
 # demo/microservices-observability
 
-Correlation ID y contexto de logs para microservicios Laravel.
+Correlation ID, contexto de logs y health checks para microservicios Laravel.
 
 ## Qué hace
 
-Dos middlewares que resuelven el problema de la trazabilidad entre microservicios:
-
-| Middleware | Qué hace |
+| Pieza | Qué hace |
 | --- | --- |
 | `EnsureRequestId` | Genera un `X-Request-Id` si no viene del cliente, lo guarda en los atributos del request y lo devuelve en la respuesta. |
 | `AttachLogContext` | Añade `request_id`, `service`, `ip`, `method` y `path` al contexto de todos los logs de la petición. |
+| `HealthController` | Responde al health check con el mismo payload en todos los microservicios. |
 
 ## Instalación
 
@@ -45,6 +44,43 @@ aplicación y vive en su `bootstrap/app.php`, visible y versionado.
 
 Si una aplicación define un alias con el mismo nombre, el suyo gana: el
 provider solo registra los alias que todavía no existen.
+
+## Health check
+
+El controller viene en el paquete, pero **la ruta la declara la aplicación**,
+porque el paquete no decide en qué rutas se aplica nada:
+
+```php
+// routes/api.php
+use Demo\Microservices\Observability\Http\Controllers\HealthController;
+
+Route::get('/health', [HealthController::class, 'index']);
+```
+
+La respuesta es siempre la misma en todos los servicios:
+
+```json
+{
+  "status": "ok",
+  "service": "User Service",
+  "timestamp": "2026-10-21T14:38:05+00:00"
+}
+```
+
+El payload es estático a propósito: un health check no debe depender de la base
+de datos, porque el caso interesante es justo el de la base de datos caída. Si un
+servicio necesita comprobar dependencias, puede extender el controller del paquete
+y añadir sus propias comprobaciones.
+
+## Formateo
+
+El paquete se formatea con el preset de Laravel. No lleva su propio `pint.json`
+para no duplicar la configuración, así que se formatea desde el servicio que lo
+consume:
+
+```bash
+cd task-service && vendor/bin/pint ../packages
+```
 
 ## Resultado
 

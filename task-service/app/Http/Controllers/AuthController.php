@@ -2,8 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
+use Demo\Microservices\UserServiceClient\TokenSession;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
@@ -20,8 +20,13 @@ class AuthController extends Controller
      *
      * El task-service nunca ve una contraseña: solo la reenvía al user-service
      * y guarda el token que le devuelven.
+     *
+     * La lógica de la sesión (emitir el token, regenerar el identificador de
+     * sesión, guardarlo) vive en el paquete: es la misma en cualquier
+     * consumidor del user-service. Aquí solo se validan las credenciales y se
+     * decide a dónde ir.
      */
-    public function store(Request $request, IdentityProvider $users): RedirectResponse
+    public function store(Request $request, TokenSession $session): RedirectResponse
     {
         $credentials = $request->validate([
             'email' => ['required', 'email'],
@@ -29,15 +34,12 @@ class AuthController extends Controller
         ]);
 
         try {
-            $token = $users->issueToken($credentials + ['device_name' => 'task-service-web']);
+            $session->login($request, $credentials, 'task-service-web');
         } catch (UserServiceErrorException) {
             return back()
                 ->withInput($request->only('email'))
                 ->withErrors(['email' => 'Credenciales inválidas.']);
         }
-
-        $request->session()->regenerate();
-        $request->session()->put('api_token', $token);
 
         return redirect()->intended(route('tasks.index'));
     }
@@ -45,19 +47,9 @@ class AuthController extends Controller
     /**
      * Cierra sesión y revoca el token en el user-service.
      */
-    public function destroy(Request $request, IdentityProvider $users): RedirectResponse
+    public function destroy(Request $request, TokenSession $session): RedirectResponse
     {
-        $token = $request->session()->get('api_token');
-
-        // Revocar en el user-service es lo que lo hace inutilizable de verdad:
-        // si solo lo borramos de la sesión, el token sigue vivo en su tabla.
-        if (is_string($token) && $token !== '') {
-            rescue(fn () => $users->revokeToken($token), report: false);
-        }
-
-        $request->session()->forget('api_token');
-        $request->session()->invalidate();
-        $request->session()->regenerateToken();
+        $session->logout($request);
 
         return redirect()->route('login');
     }

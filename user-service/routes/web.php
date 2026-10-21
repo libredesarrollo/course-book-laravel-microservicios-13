@@ -1,6 +1,6 @@
 <?php
 
-use App\Http\Controllers\HealthController;
+use Demo\Microservices\Observability\Http\Controllers\HealthController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {

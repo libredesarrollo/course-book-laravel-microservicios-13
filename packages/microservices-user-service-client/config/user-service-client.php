@@ -30,4 +30,21 @@ return [
 
     'timeout' => (int) env('USER_SERVICE_TIMEOUT', 3),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Ruta de login
+    |--------------------------------------------------------------------------
+    |
+    | Nombre de la ruta a la que el middleware de autenticación manda cuando
+    | el request viene de la web y no de la API. Un paquete no puede saber
+    | cómo se llama la pantalla de login de cada aplicación, así que lo
+    | declara la aplicación.
+    |
+    | Ponlo a null si la aplicación solo expone API: entonces el middleware
+    | responde siempre 401 en JSON, sin intentar ninguna redirección.
+    |
+    */
+
+    'login_route' => env('USER_SERVICE_LOGIN_ROUTE', 'login'),
+
 ];

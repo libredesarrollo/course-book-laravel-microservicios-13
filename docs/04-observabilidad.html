@@ -148,29 +148,48 @@ class EnsureRequestId
 
 <p>Se han añadido endpoints para comprobar la disponibilidad sin pasar por autenticación.</p>
 
-<h3>user-service</h3>
-
-<pre><code>// routes/api.php
-Route::get('/health', [HealthController::class, 'index']);
-</code></pre>
+<p>El controller vive en el paquete de observabilidad, así que los dos servicios
+responden exactamente lo mismo. Lo único que decide cada aplicación es <strong>en qué
+ruta</strong> lo monta:</p>
 
 <pre><code>&lt;?php
 
-namespace App\Http\Controllers;
+namespace Demo\Microservices\Observability\Http\Controllers;
 
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Routing\Controller;
 
 class HealthController extends Controller
 {
     public function index(): JsonResponse
     {
-        return response()-&gt;json([
+        return new JsonResponse([
             'status' =&gt; 'ok',
-            'service' =&gt; config('app.name', 'user-service'),
-            'timestamp' =&gt; now()-&gt;toIso8601String(),
+            'service' =&gt; config('app.name'),
+            'timestamp' =&gt; Carbon::now()-&gt;toIso8601String(),
         ]);
     }
 }
+</code></pre>
+
+<div>
+<p><strong>El payload es estático a propósito.</strong> Un health check no debe depender de
+la base de datos, porque el caso interesante es justo el de la base de datos caída: si
+consultara la base de datos para saber si está bien, no podría distinguir "estoy vivo pero
+sin base de datos" de "estoy muerto", y el balanceador necesita esa diferencia.</p>
+</div>
+
+<h3>user-service</h3>
+
+<pre><code>// routes/api.php
+use Demo\Microservices\Observability\Http\Controllers\HealthController;
+
+Route::get('/health', [HealthController::class, 'index']);
+</code></pre>
+
+<pre><code>// routes/web.php
+Route::get('/health', [HealthController::class, 'index']);
 </code></pre>
 
 <h3>task-service</h3>
@@ -402,6 +421,11 @@ la petición completa:</p>
 <td>Añade <code>request_id</code>, <code>service</code>, <code>ip</code>, <code>method</code> y <code>path</code> al contexto del log</td>
 </tr>
 <tr>
+<td><code>src/Http/Controllers/HealthController.php</code></td>
+<td>Añadido</td>
+<td>Respuesta de health check idéntica en todos los servicios</td>
+</tr>
+<tr>
 <td><code>src/MicroservicesObservabilityServiceProvider.php</code></td>
 <td>Añadido</td>
 <td>Registra los alias <code>request.id</code> y <code>log.context</code> en el Router</td>
@@ -413,19 +437,14 @@ la petición completa:</p>
 <table border="1" cellpadding="6" cellspacing="0">
 <tr><th>Archivo</th><th>Acción</th><th>Descripción</th></tr>
 <tr>
-<td><code>app/Http/Controllers/HealthController.php</code></td>
-<td>Añadido</td>
-<td><code>GET /api/health</code> JSON y <code>GET /health</code> JSON en la raíz</td>
-</tr>
-<tr>
 <td><code>routes/api.php</code></td>
 <td>Modificado</td>
-<td>Ruta pública <code>/health</code></td>
+<td>Ruta pública <code>/api/health</code> con el controller del paquete</td>
 </tr>
 <tr>
 <td><code>routes/web.php</code></td>
 <td>Modificado</td>
-<td>Ruta pública <code>/health</code> en la raíz</td>
+<td>Ruta pública <code>/health</code> en la raíz, con el controller del paquete</td>
 </tr>
 <tr>
 <td><code>bootstrap/app.php</code></td>
@@ -435,7 +454,7 @@ la petición completa:</p>
 <tr>
 <td><code>tests/Feature/ObservabilityPackageTest.php</code></td>
 <td>Añadido</td>
-<td>Fija el contrato del paquete: alias registrados, cabeceras y contexto de log</td>
+<td>Fija el contrato del paquete: alias registrados, cabeceras, contexto de log y health check</td>
 </tr>
 </table>
 
@@ -444,14 +463,9 @@ la petición completa:</p>
 <table border="1" cellpadding="6" cellspacing="0">
 <tr><th>Archivo</th><th>Acción</th><th>Descripción</th></tr>
 <tr>
-<td><code>app/Http/Controllers/HealthController.php</code></td>
-<td>Añadido</td>
-<td><code>GET /api/health</code> JSON</td>
-</tr>
-<tr>
 <td><code>routes/api.php</code></td>
 <td>Modificado</td>
-<td>Ruta pública <code>/health</code> (montada como <code>/api/health</code>)</td>
+<td>Ruta pública <code>/api/health</code> con el controller del paquete</td>
 </tr>
 <tr>
 <td><code>routes/web.php</code></td>
@@ -466,7 +480,7 @@ la petición completa:</p>
 <tr>
 <td><code>tests/Feature/ObservabilityPackageTest.php</code></td>
 <td>Añadido</td>
-<td>Fija el contrato del paquete: alias registrados, cabeceras y contexto de log</td>
+<td>Fija el contrato del paquete: alias registrados, cabeceras, contexto de log y health check</td>
 </tr>
 </table>
 

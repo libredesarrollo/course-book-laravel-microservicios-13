@@ -20,7 +20,7 @@ class AttachLogContext
         if (! is_string($requestId) || $requestId === '') {
             $requestId = null;
         }
-        
+
         Log::withContext([
             'request_id' => $requestId,
             'service' => config('app.name'),

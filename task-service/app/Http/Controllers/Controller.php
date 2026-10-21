@@ -3,7 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Task;
-use App\Support\AuthenticatedUser;
+use Demo\Microservices\UserServiceClient\AuthenticatedUser;
 use Symfony\Component\HttpKernel\Exception\HttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
@@ -14,7 +14,7 @@ abstract class Controller
      */
     protected function user(): AuthenticatedUser
     {
-        return request()->attributes->get('authenticated_user');
+        return AuthenticatedUser::fromRequest(request());
     }
 
     /**

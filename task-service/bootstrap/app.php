@@ -1,6 +1,5 @@
 <?php
 
-use App\Http\Middleware\AuthenticateWithUserService;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
 use Illuminate\Foundation\Application;
@@ -23,9 +22,9 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->appendToGroup('api', 'request.id');
         $middleware->appendToGroup('api', 'log.context');
 
-        $middleware->alias([
-            'auth.user-service' => AuthenticateWithUserService::class,
-        ]);
+        // 'auth.user-service' también lo registra el paquete del cliente:
+        // el middleware que autentica preguntando al user-service es parte
+        // de esa frontera, no de esta aplicación.
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->shouldRenderJsonWhen(

@@ -146,12 +146,13 @@
             "dist": {
                 "type": "path",
                 "url": "../packages/microservices-observability",
-                "reference": "f3dff73a7e2735a6ba4298034f73c71d222cc89c"
+                "reference": "3b618a16eab3fe24cdf48d0915fb47ba341b41a3"
             },
             "require": {
                 "illuminate/http": "^13.0",
                 "illuminate/routing": "^13.0",
                 "illuminate/support": "^13.0",
+                "nesbot/carbon": "^3.0",
                 "php": "^8.2"
             },
             "type": "library",
@@ -170,9 +171,10 @@
             "license": [
                 "MIT"
             ],
-            "description": "Correlation ID + log context para microservicios Laravel",
+            "description": "Correlation ID, log context y health checks para microservicios Laravel",
             "keywords": [
                 "correlation-id",
+                "health-check",
                 "laravel",
                 "logging",
                 "microservices",

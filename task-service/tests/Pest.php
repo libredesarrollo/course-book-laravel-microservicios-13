@@ -1,6 +1,8 @@
 <?php
 
+use Demo\Microservices\UserServiceClient\TokenSession;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Tests\TestCase;
 
@@ -66,9 +68,27 @@ function loginAs(?array $user = null): array
 {
     $user = fakeUserService($user);
 
-    test()->withSession(['api_token' => 'test-token']);
+    test()->withSession([TokenSession::SESSION_KEY => 'test-token']);
 
     return $user;
+}
+
+/**
+ * Construye una request con sesión, para probar el paquete sin pasar por
+ * el ciclo de vida de una petición HTTP completa.
+ *
+ * @param  array<string, mixed>  $sessionData
+ */
+function requestWithSession(array $sessionData = []): Request
+{
+    $store = app('session.store');
+    $store->start();
+    $store->put($sessionData);
+
+    $request = Request::create('/');
+    $request->setLaravelSession($store);
+
+    return $request;
 }
 
 /*

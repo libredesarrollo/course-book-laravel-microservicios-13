@@ -2,6 +2,9 @@
 
 namespace Demo\Microservices\UserServiceClient\Contracts;
 
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
+
 /**
  * Contrato de un proveedor de identidad remoto.
  *
@@ -18,8 +21,8 @@ interface IdentityProvider
      *
      * @return array{id: int, name: string, email: string}|null null si el token no es válido
      *
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
      */
     public function authenticate(string $token): ?array;
 
@@ -28,16 +31,16 @@ interface IdentityProvider
      *
      * @param  array{email: string, password: string, device_name?: string}  $credentials
      *
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
      */
     public function issueToken(array $credentials): string;
 
     /**
      * Revoca un token en el user-service.
      *
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException
-     * @throws \Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
      */
     public function revokeToken(string $token): void;
 }
