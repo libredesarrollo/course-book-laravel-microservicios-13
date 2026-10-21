@@ -35,9 +35,10 @@ return [
         ],
     ],
 
-    'user_service' => [
-        'url' => env('USER_SERVICE_URL', 'http://127.0.0.1:8000'),
-        'timeout' => (int) env('USER_SERVICE_TIMEOUT', 3),
-    ],
+    /*
+     * La configuración del user-service (url, timeout) vive ahora en el
+     * paquete demo/microservices-user-service-client, que publica su propio
+     * archivo de configuración en config/user-service-client.php.
+     */
 
 ];

@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Exceptions;
+namespace Demo\Microservices\UserServiceClient\Exceptions;
 
 use RuntimeException;
 

@@ -1,10 +1,8 @@
 <?php
 
-use App\Exceptions\UserServiceErrorException;
-use App\Exceptions\UserServiceUnavailableException;
-use App\Http\Middleware\AttachLogContext;
 use App\Http\Middleware\AuthenticateWithUserService;
-use App\Http\Middleware\EnsureRequestId;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -18,15 +16,15 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        $middleware->appendToGroup('web', EnsureRequestId::class);
-        $middleware->appendToGroup('web', AttachLogContext::class);
-        $middleware->appendToGroup('api', EnsureRequestId::class);
-        $middleware->appendToGroup('api', AttachLogContext::class);
+        // 'request.id' y 'log.context' los registra el paquete de observabilidad.
+        // Se referencian por nombre para no atar la app a sus clases internas.
+        $middleware->appendToGroup('web', 'request.id');
+        $middleware->appendToGroup('web', 'log.context');
+        $middleware->appendToGroup('api', 'request.id');
+        $middleware->appendToGroup('api', 'log.context');
 
         $middleware->alias([
             'auth.user-service' => AuthenticateWithUserService::class,
-            'request.id' => EnsureRequestId::class,
-            'log.context' => AttachLogContext::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
@@ -45,7 +43,7 @@ return Application::configure(basePath: dirname(__DIR__))
             return $request->is('api/*') || $request->expectsJson()
                 ? response()->json(['error' => 'El usuario no pudo ser validado: el user-service no está disponible.'], 503)
                 : response()->view('errors.user-service-down', [
-                    'message' => 'El user-service no está disponible en http://'.config('services.user_service.url').'. Arráncalo con: php artisan serve --port=8000',
+                    'message' => 'El user-service no está disponible en '.config('user-service-client.url').'. Arráncalo con: php artisan serve --port=8000',
                 ], 503);
         });
 

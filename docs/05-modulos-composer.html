@@ -1,0 +1,812 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Empaquetar módulos con Composer en microservicios Laravel</title>
+
+<meta name="description" content="Cómo extraer el código compartido de dos microservicios Laravel a paquetes Composer locales con repositorios path, symlinks y autoload PSR-4.">
+<meta name="keywords" content="composer path repository, paquetes composer, monorepo php, microservicios laravel, psr-4, symlink composer, vendor demo">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Empaquetar módulos con Composer en microservicios Laravel">
+<meta property="og:description" content="Cómo extraer el código compartido de dos microservicios Laravel a paquetes Composer locales con repositorios path, symlinks y autoload PSR-4.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Empaquetar módulos con Composer en microservicios Laravel">
+<meta name="twitter:description" content="Repositorios path, symlinks y PSR-4 para compartir código entre microservicios.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Empaquetar módulos con Composer en microservicios Laravel",
+  "description": "Cómo extraer el código compartido de dos microservicios Laravel a paquetes Composer locales con repositorios path, symlinks y autoload PSR-4.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-21",
+  "dateModified": "2026-10-21",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "PHP",
+  "keywords": "composer, path repository, monorepo, microservicios, laravel",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Empaquetar módulos con Composer: microservicios Laravel con paquetes locales</h1>
+
+<p><strong>Resumen:</strong> Cuando dos microservicios comparten código, hay tres caminos: copiar y pegar, un paquete en Packagist, o un <strong>paquete local con repositorio <code>path</code></strong>. Este artículo explica el tercero: cómo se extrae el código compartido a <code>packages/</code>, cómo se declara el <code>composer.json</code> de un paquete, cómo lo consumen las aplicaciones, y por qué el resultado es un <strong>symlink</strong> en lugar de una copia.</p>
+
+<p>Aplicado en el proyecto <code>demo-microservicios</code>, que tiene <code>user-service</code> y <code>task-service</code> con código duplicado de observabilidad.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: código duplicado</a></li>
+<li><a href="#opciones">Las tres opciones y por qué esta</a></li>
+<li><a href="#estructura">Estructura resultante</a></li>
+<li><a href="#composer-paquete">El composer.json del paquete</a></li>
+<li><a href="#provider">El ServiceProvider</a></li>
+<li><a href="#composer-app">El composer.json de la aplicación</a></li>
+<li><a href="#symlink">Por qué un symlink y no una copia</a></li>
+<li><a href="#migracion">Migración paso a paso</a></li>
+<li><a href="#namespace">El cambio de namespace</a></li>
+<li><a href="#lo-que-no-se-empaqueta">Lo que NO se empaquetó (y por qué)</a></li>
+<li><a href="#verificacion">Verificación</a></li>
+<li><a href="#siguiente">12. El segundo paquete: el cliente del user-service</a></li>
+<li><a href="#verificacion-final">13. Verificación final</a></li>
+<li><a href="#siguiente-paso">14. Siguiente paso</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="problema">1. El problema: código duplicado</h2>
+
+<p>En el capítulo anterior de observabilidad se añadieron dos middlewares a <strong>ambos</strong> servicios. El resultado fue esto:</p>
+
+<pre><code>user-service/app/Http/Middleware/EnsureRequestId.php     (18 lineas)
+user-service/app/Http/Middleware/AttachLogContext.php    (32 lineas)
+task-service/app/Http/Middleware/EnsureRequestId.php     (18 lineas)  &lt;- identico
+task-service/app/Http/Middleware/AttachLogContext.php    (32 lineas)  &lt;- identico</code></pre>
+
+<p>Cuatro archivos donde bastaban dos. Y el problema real no es el tamaño:</p>
+
+<div>
+<p><strong>El problema real es la divergencia.</strong> Si mañana hay que cambiar el formato
+del <code>request_id</code>, hay que recordar cambiarlo en dos sitios. Si se cambia en uno y
+no en el otro, el <code>task-service</code> genera IDs con un formato y el
+<code>user-service</code> con otro. Y el síntoma aparece en producción, un martes, sin
+ningún test que lo detecte.</p>
+</div>
+
+<p>Ese es el momento en que el código duplicado deja de ser "un poco feo" y pasa a ser un
+<strong>riesgo operativo</strong>.</p>
+
+<h2 id="opciones">2. Las tres opciones y por qué esta</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Opción</th><th>Ventajas</th><th>Inconvenientes</th></tr>
+<tr>
+<td><strong>A. Copiar y pegar</strong></td>
+<td>Cero infraestructura, funciona siempre</td>
+<td>Divergencia silenciosa. Es lo que acabamos de tener.</td>
+</tr>
+<tr>
+<td><strong>B. Paquete en Packagist</strong></td>
+<td>Instalable desde cualquier sitio, versionado de verdad</td>
+<td>Requiere una cuenta, tokens, CI para publicar. Innecesario para un monorepo de 2 servicios.</td>
+</tr>
+<tr>
+<td><strong>C. Paquete local con repositorio <code>path</code></strong></td>
+<td>Versionable con Git, sin publicar nada, los cambios se ven al instante</td>
+<td>Hay que declararlo en el <code>composer.json</code> de cada consumidor</td>
+</tr>
+</table>
+
+<p>Elegimos la <strong>C</strong>. En un monorepo es la opción estándar: se obtiene el
+beneficio de la modularidad (una sola copia del código, un solo sitio que cambiar) sin el
+coste de publicar nada.</p>
+
+<h2 id="estructura">3. Estructura resultante</h2>
+
+<pre><code>demo-microservicios/
+├── packages/
+│   ├── microservices-observability/
+│   │   ├── composer.json
+│   │   ├── README.md
+│   │   └── src/
+│   │       ├── MicroservicesObservabilityServiceProvider.php
+│   │       └── Http/Middleware/
+│   │           ├── AttachLogContext.php
+│   │           └── EnsureRequestId.php
+│   │
+│   └── microservices-user-service-client/
+│       ├── composer.json
+│       ├── README.md
+│       └── src/
+│           ├── UserServiceClientServiceProvider.php
+│           ├── UserServiceClient.php
+│           ├── Contracts/
+│           ├── Exceptions/
+│           └── Http/Clients/
+│
+├── user-service/
+│   ├── composer.json      &lt;- + repositories, + require
+│   └── app/
+│       └── Http/Middleware/
+│           └── AuthenticateApiToken.php   (se queda: es especifico del servicio)
+│
+└── task-service/
+    ├── composer.json      &lt;- + repositories, + require
+    └── app/
+        └── Http/Middleware/
+            └── AuthenticateWithUserService.php   (se queda: es especifico del servicio)</code></pre>
+
+<div>
+<p><strong>El principio de la estructura:</strong> en <code>packages/</code> va lo que es
+<em>compartido</em>; en <code>app/</code> va lo que es <em>de cada servicio</em>. Un paquete
+que solo usa un servicio no es un paquete: es código que se mudó de sitio sin ganancia.</p>
+</div>
+
+<h2 id="composer-paquete">4. El composer.json del paquete</h2>
+
+<p>Este es el <code>composer.json</code> de <code>packages/microservices-observability</code>:</p>
+
+<pre><code>{
+  "name": "demo/microservices-observability",
+  "description": "Correlation ID + log context para microservicios Laravel",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["laravel", "microservices", "observability", "correlation-id", "x-request-id", "logging"],
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^13.0",
+    "illuminate/http": "^13.0",
+    "illuminate/routing": "^13.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Demo\\Microservices\\Observability\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Demo\\Microservices\\Observability\\MicroservicesObservabilityServiceProvider"
+      ]
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}</code></pre>
+
+<h3>Qué significa cada clave</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Clave</th><th>Valor</th><th>Por qué</th></tr>
+<tr>
+<td><code>type</code></td>
+<td><code>library</code></td>
+<td>Distingue un paquete de código de un proyecto. Composer lo usa para decidir cómo tratarlo.</td>
+</tr>
+<tr>
+<td><code>autoload.psr-4</code></td>
+<td><code>Demo\\Microservices\\Observability\\</code> -&gt; <code>src/</code></td>
+<td>El <strong>namespace</strong> del paquete. Determina dónde busca PHP las clases.</td>
+</tr>
+<tr>
+<td><code>require</code></td>
+<td>Solo <code>illuminate/support</code>, <code>illuminate/http</code> e <code>illuminate/routing</code></td>
+<td>El paquete usa <code>Str</code>, <code>Log</code>, <code>Request</code>, <code>Response</code> y el <code>Router</code> (para registrar los alias de middleware). <strong>No depende de <code>laravel/framework</code></strong>, así que podría usarse en Lumen o en un proyecto con Lumen.</td>
+</tr>
+<tr>
+<td><code>extra.laravel.providers</code></td>
+<td>El ServiceProvider</td>
+<td>Es lo que hace que Laravel <strong>descubra</strong> el paquete automáticamente. Sin esto, el provider hay que registrarlo a mano en <code>bootstrap/providers.php</code>.</td>
+</tr>
+<tr>
+<td><code>minimum-stability</code></td>
+<td><code>dev</code></td>
+<td>Necesario para que Composer acepte la versión <code>@dev</code> del paquete local.</td>
+</tr>
+<tr>
+<td><code>prefer-stable</code></td>
+<td><code>true</code></td>
+<td>Prefiere versiones estables de las demás dependencias aunque se permita <code>dev</code>.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>Detalle sobre las dependencias:</strong> el paquete declara
+<code>illuminate/support</code> e <code>illuminate/http</code> en lugar de
+<code>laravel/framework</code>. Es una práctica real: un paquete pequeño que solo necesita
+el contenedor y las utilidades de HTTP <strong>no debería obligar</strong> a instalar el
+framework completo. Aquí la diferencia no se nota porque las aplicaciones ya lo tienen, pero
+en un paquete publicado la diferencia importa.</p>
+</div>
+
+<h3>El paquete del cliente HTTP</h3>
+
+<p>El segundo paquete tiene la misma forma, con su propio namespace:</p>
+
+<pre><code>{
+  "name": "demo/microservices-user-service-client",
+  "description": "Cliente HTTP para comunicarse con user-service desde otros microservicios",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["laravel", "microservices", "http-client", "user-service"],
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^13.0",
+    "illuminate/http": "^13.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Demo\\Microservices\\UserServiceClient\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Demo\\Microservices\\UserServiceClient\\UserServiceClientServiceProvider"
+      ]
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}</code></pre>
+
+<h2 id="provider">5. El ServiceProvider</h2>
+
+<p>Un <code>ServiceProvider</code> vacío es ruido: existe la convención de que todo paquete
+Laravel tenga uno, pero un provider que no hace nada no aporta nada. La pregunta correcta no es
+"¿debe el paquete tener un provider?", sino <strong>"¿qué trabajo tiene que hacer el paquete que
+la aplicación no debería tener que hacer?"</strong></p>
+
+<h3>5.1 El provider de observabilidad: registrar la API pública</h3>
+
+<p>El trabajo del paquete de observabilidad es publicar sus middlewares bajo un <em>alias</em>
+concreto. La aplicación lo referencia por nombre y así queda atada al nombre, no a la clase
+concreta. Si el paquete renombra <code>EnsureRequestId</code> o lo mueve de namespace, las
+aplicaciones no se tocan.</p>
+
+<pre><code>&lt;?php
+
+namespace Demo\Microservices\Observability;
+
+use Demo\Microservices\Observability\Http\Middleware\AttachLogContext;
+use Demo\Microservices\Observability\Http\Middleware\EnsureRequestId;
+use Illuminate\Routing\Router;
+use Illuminate\Support\ServiceProvider;
+
+class MicroservicesObservabilityServiceProvider extends ServiceProvider
+{
+    public const ALIAS_REQUEST_ID = 'request.id';
+
+    public const ALIAS_LOG_CONTEXT = 'log.context';
+
+    public function boot(Router $router): void
+    {
+        $router-&gt;aliasMiddleware(self::ALIAS_REQUEST_ID, EnsureRequestId::class);
+        $router-&gt;aliasMiddleware(self::ALIAS_LOG_CONTEXT, AttachLogContext::class);
+    }
+}
+</code></pre>
+
+<p>Y en la aplicación desaparece todo import de clases del paquete:</p>
+
+<pre><code>// bootstrap/app.php
+$middleware-&gt;appendToGroup('api', 'request.id');
+$middleware-&gt;appendToGroup('api', 'log.context');
+</code></pre>
+
+<div>
+<p><strong>Decisión deliberada:</strong> el provider de observabilidad <strong>no</strong> aplica
+los middlewares a los grupos <code>api</code> o <code>web</code> automáticamente. Se deja esa
+decisión en el <code>bootstrap/app.php</code> de cada aplicación.</p>
+<p>El motivo: un paquete que decide por ti en qué rutas se aplica es un paquete que impone
+comportamiento silencioso. Si el día de mañana el <code>user-service</code> quiere el
+<code>request_id</code> también en las rutas web, se cambia en un sitio visible
+(<code>bootstrap/app.php</code>) y no dentro de un <code>vendor/</code> que no controlas.</p>
+</div>
+
+<h3>5.2 El provider del cliente HTTP: enlazar la implementación</h3>
+
+<p>El del cliente HTTP tiene un trabajo distinto: registrar el cliente como <strong>singleton</strong>
+en el contenedor, de forma que se comparta la instancia y su configuración, y enlazar la
+implementación con el contrato que consume la aplicación:</p>
+
+<pre><code>&lt;?php
+
+namespace Demo\Microservices\UserServiceClient;
+
+use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
+use Illuminate\Support\ServiceProvider;
+
+class UserServiceClientServiceProvider extends ServiceProvider
+{
+    public function register(): void
+    {
+        $this-&gt;mergeConfigFrom(
+            __DIR__.'/../config/user-service-client.php',
+            'user-service-client'
+        );
+
+        $this-&gt;app-&gt;singleton(UserServiceClient::class);
+
+        // El contrato es lo que consumen la aplicación; la implementación
+        // concreta es un detalle que puede cambiar sin tocar a nadie.
+        $this-&gt;app-&gt;bind(IdentityProvider::class, UserServiceClient::class);
+    }
+
+    public function boot(): void
+    {
+        if ($this-&gt;app-&gt;runningInConsole()) {
+            $this-&gt;publishes([
+                __DIR__.'/../config/user-service-client.php' =&gt; config_path('user-service-client.php'),
+            ], 'user-service-client-config');
+        }
+    }
+}
+</code></pre>
+
+<div>
+<p><strong>Resumen de los dos providers:</strong> el de observabilidad publica <em>aliases</em>
+(la API pública del paquete), el del cliente <em>enlaza implementaciones</em> y <em>publica
+configuración</em>. Son trabajos distintos y por eso los dos existen. Un provider vacío, en
+cambio, no hace ninguno de los dos.</p>
+</div>
+
+
+<h2 id="composer-app">6. El composer.json de la aplicación</h2>
+
+<p>En <code>user-service/composer.json</code> y <code>task-service/composer.json</code> se han
+añadido dos cosas.</p>
+
+<h3>6.1 El bloque repositories</h3>
+
+<pre><code>"repositories": [
+  {
+    "type": "path",
+    "url": "../packages/microservices-observability"
+  },
+  {
+    "type": "path",
+    "url": "../packages/microservices-user-service-client"
+  }
+]</code></pre>
+
+<p>La clave <code>"type": "path"</code> le dice a Composer: "este paquete no está en Packagist,
+está en <strong>este directorio de mi disco</strong>".</p>
+
+<p>La <code>url</code> es <strong>relativa al directorio donde vive el <code>composer.json</code></strong>.
+Por eso es <code>../packages/...</code> y no una ruta absoluta: el proyecto se puede clonar en
+cualquier sitio y sigue funcionando.</p>
+
+<h3>6.2 El bloque require</h3>
+
+<pre><code>"require": {
+  "php": "^8.3",
+  "laravel/framework": "^13.17",
+  "laravel/tinker": "^3.0",
+  "demo/microservices-observability": "@dev",
+  "demo/microservices-user-service-client": "@dev"
+}</code></pre>
+
+<p>La versión <code>"@dev"</code> es la que le dice a Composer: "de esta dependencia acepto
+cualquier cosa, incluido un paquete local sin versionar". Es la contrapartida obligatoria de
+usar un repositorio <code>path</code> con paquetes sin tags.</p>
+
+<h3>6.3 Las dos mitades juntas</h3>
+
+<div>
+<p><strong>Una de las dos piezas no basta:</strong></p>
+<ul>
+<li>El <code>repositories</code> le dice a Composer <em>dónde</em> está el paquete.</li>
+<li>El <code>require</code> le dice <em>que lo quieres</em>.</li>
+</ul>
+<p>Con las dos, Composer puede resolverlo. Con solo una, o no lo encuentra o no lo instala.</p>
+</div>
+
+<h2 id="symlink">7. Por qué un symlink y no una copia</h2>
+
+<p>Esta es la parte que conviene entender, porque cambia cómo se trabaja.</p>
+
+<p>Después de <code>composer update</code>, esto es lo que hay en cada servicio:</p>
+
+<pre><code>$ ls -la user-service/vendor/demo/
+lrwxr-xr-x  microservices-observability -&gt; ../../../packages/microservices-observability/
+lrwxr-xr-x  microservices-user-service-client -&gt; ../../../packages/microservices-user-service-client/</code></pre>
+
+<p><strong>Es un enlace simbólico, no una carpeta.</strong> Composer's repositorio <code>path</code>
+detecta que el destino es un directorio local y crea un symlink en lugar de copiar los
+archivos.</p>
+
+<h3>Lo que eso permite</h3>
+
+<pre><code>$ vim packages/microservices-observability/src/Http/Middleware/EnsureRequestId.php
+# guardar, y listo: los dos servicios ya usan el cambio</code></pre>
+
+<p>Sin ejecutar <code>composer update</code>. Sin reiniciar nada. Sin riesgo de tener una
+versión del paquete en <code>vendor/</code> y otra en <code>packages/</code>.</p>
+
+<h3>Lo que hay que vigilar</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Riesgo</th><th>Qué pasa</th><th>Cómo se evita</th></tr>
+<tr>
+<td>El symlink se pierde al reinstalar</td>
+<td>Un <code>composer install</code> en limpio lo recrea, pero hay que acordarse de la entrada <code>repositories</code></td>
+<td>Está en el <code>composer.json</code>, que sí se versiona</td>
+</tr>
+<tr>
+<td>Un <code>composer install</code> sin <code>--no-dev</code> en otro sitio</td>
+<td>Intenta descargar de Packagist y falla</td>
+<td>Los paquetes son <code>@dev</code> locales; nunca se descargan, se enlazan</td>
+</tr>
+<tr>
+<td>El paquete se "instala" pero el código no cambia</td>
+<td>Pasa si el <code>composer.json</code> del paquete cambió y no se regenera el autoloader</td>
+<td><code>composer dump-autoload</code></td>
+</tr>
+<tr>
+<td>Deployment en producción</td>
+<td>El symlink no existe en el servidor</td>
+<td>En el servidor el paquete se instala desde un repositorio real, o se despliega el monorepo completo</td>
+</tr>
+</table>
+
+<h2 id="migracion">8. Migración paso a paso</h2>
+
+<p>Los siete pasos que se ejecutaron, por si hay que repetirlo con otro módulo:</p>
+
+<ol>
+<li><strong>Crear el esqueleto</strong> del paquete: <code>packages/&lt;nombre&gt;/</code> con
+<code>composer.json</code>, <code>README.md</code> y <code>src/</code>.</li>
+<li><strong>Copiar el código</strong> desde <code>app/</code> a <code>src/</code> (copiar, no
+mover todavía).</li>
+<li><strong>Cambiar el namespace</strong> de <code>App\Http\Middleware</code> a
+<code>Demo\Microservices\Observability\Http\Middleware</code>.</li>
+<li><strong>Crear el ServiceProvider</strong> y declararlo en
+<code>extra.laravel.providers</code>.</li>
+<li><strong>Añadir <code>repositories</code> y <code>require</code></strong> al
+<code>composer.json</code> de cada aplicación.</li>
+<li><strong>Ejecutar <code>composer update demo/microservices-observability</code></strong> en
+cada servicio.</li>
+<li><strong>Actualizar los imports</strong> en <code>bootstrap/app.php</code>, <strong>borrar</strong>
+los archivos antiguos de <code>app/Http/Middleware/</code> y verificar con
+<code>pint</code> y <code>pest</code>.</li>
+</ol>
+
+<div>
+<p><strong>Copiar antes de borrar.</strong> Es un cambio de tres archivos, pero un
+<code>rm</code> equivocado deja el proyecto sin middlewares y sin error de compilación: el
+error sale en tiempo de ejecución, en una petición. La verificación final con los tests es
+lo que convierte esto en un cambio seguro.</p>
+</div>
+
+<h2 id="namespace">9. El cambio de namespace</h2>
+
+<p>Antes, en <code>user-service/app/Http/Middleware/EnsureRequestId.php</code>:</p>
+
+<pre><code>&lt;?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\Response;</code></pre>
+
+<p>Ahora, en <code>packages/microservices-observability/src/Http/Middleware/EnsureRequestId.php</code>:</p>
+
+<pre><code>&lt;?php
+
+namespace Demo\Microservices\Observability\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\Response;</code></pre>
+
+<p>Y en <code>user-service/bootstrap/app.php</code>:</p>
+
+<pre><code>use App\Http\Middleware\AuthenticateApiToken;
+use Demo\Microservices\Observability\Http\Middleware\AttachLogContext;
+use Demo\Microservices\Observability\Http\Middleware\EnsureRequestId;</code></pre>
+
+<p>El <strong>namespace del paquete tiene que incluir el del consumidor</strong>, porque
+Composer solo puede mapear un prefijo de namespace a un directorio. Por eso el paquete se
+llama <code>Demo\Microservices\Observability\</code> y no simplemente
+<code>Observability\</code>: deja claro de quién es el código.</p>
+
+<h2 id="lo-que-no-se-empaqueta">10. Lo que NO se empaquetó (y por qué)</h2>
+
+<p>Esta es la parte del trabajo que más conviene revisar, porque lo natural es empaquetar de
+más.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Código</th><th>¿Paquete?</th><th>Razón</th></tr>
+<tr>
+<td><code>EnsureRequestId</code></td>
+<td><strong>Sí</strong></td>
+<td>Idéntico en ambos servicios, sin dependencias del servicio</td>
+</tr>
+<tr>
+<td><code>AttachLogContext</code></td>
+<td><strong>Sí</strong></td>
+<td>Idéntico en ambos servicios</td>
+</tr>
+<tr>
+<td><code>UserServiceClient</code> + excepciones</td>
+<td><strong>Sí</strong></td>
+<td>Un tercer microservicio necesitará el mismo cliente. Hoy solo lo usa uno, pero la lógica ya está probada.</td>
+</tr>
+<tr>
+<td><code>AuthenticateApiToken</code></td>
+<td><strong>No</strong></td>
+<td>Solo tiene sentido en el <code>user-service</code>: valida tokens contra su propia base de datos.</td>
+</tr>
+<tr>
+<td><code>AuthenticateWithUserService</code></td>
+<td><strong>No</strong></td>
+<td>Solo tiene sentido en los servicios <em>consumidores</em>: reenvía el token por HTTP al user-service.</td>
+</tr>
+<tr>
+<td>Rate limiting y <code>config/tokens.php</code></td>
+<td><strong>No</strong></td>
+<td>Específico del servicio de identidad.</td>
+</tr>
+<tr>
+<td>DTO <code>AuthenticatedUser</code></td>
+<td><strong>Por decidir</strong></td>
+<td>Es genérico, pero solo lo usa un servicio. Se empaquetará cuando lo use un segundo.</td>
+</tr>
+</table>
+
+<div>
+<p><strong>La trampa:</strong> <code>AuthenticateApiToken</code> y
+<code>AuthenticateWithUserService</code> <em>se parecen mucho</em>. Los dos autentican una
+petición, los dos devuelven 401, los dos usan un token Bearer. La tentación es unificarlos en
+un middleware con un <code>if</code> dentro:</p>
+<pre><code>// NO: el día que este middleware crezca, será ilegible
+if ($service === 'user-service') { ... } else { ... }</code></pre>
+<p>Son <strong>responsabilidades distintas</strong> que happen en direcciones distintas: uno
+consulta su propia base de datos, el otro llama por HTTP a otro servicio. Unificarlos
+introduciría una dependencia entre ambos servicios en el mismo archivo, que es exactamente
+la acoplamiento que los microservicios intentan evitar.</p>
+</div>
+
+<h2 id="verificacion">11. Verificación</h2>
+
+<p>Tras la migración, en ambos servicios:</p>
+
+<pre><code>$ vendor/bin/pint
+{"tool":"pint","result":"passed"}
+
+$ vendor/bin/pest --compact
+{"tool":"pest","result":"passed","tests":28,"passed":28,"assertions":102}
+{"tool":"pest","result":"passed","tests":34,"passed":34,"assertions":88}</code></pre>
+
+<p>Los tests <strong>no se tocaron</strong>. Ni se cambiaron las aserciones, ni los nombres, ni
+los helpers de <code>tests/Pest.php</code>. Esa es la comprobación que importa: si la
+extracción del paquete hubiera cambiado un comportamiento, algún test habría caído.</p>
+
+<p>Y la cadena de observabilidad sigue intacta: el <code>request_id</code> se sigue generando,
+se sigue propagando al <code>user-service</code> y los logs siguen llevan el contexto.</p>
+
+<h2 id="siguiente">12. El segundo paquete: el cliente del user-service</h2>
+
+<p>El primer paquete era el caso fácil: dos middlewares idénticos. El segundo es
+distinto, porque el código <strong>no estaba duplicado</strong>: el
+<code>UserServiceClient</code> solo vivía en el <code>task-service</code>.</p>
+
+<p>La pregunta era: ¿aporta algo moverlo a un paquete?</p>
+
+<p>Sí, por una razón concreta: en cuanto exista un <strong>tercer</strong> microservicio
+que también necesite validar tokens, tendrá que escribir el mismo cliente, o copiarlo.
+Un paquete con contrato resuelve las dos cosas de golpe: el tercer servicio lo
+instala y ya.</p>
+
+<h3>12.1 El contrato: <code>IdentityProvider</code></h3>
+
+<p>La parte interesante no es mover la clase, sino <strong>qué consume la
+aplicación</strong>. Antes, el middleware y el controller dependían de la clase
+concreta:</p>
+
+<pre><code>use App\Services\UserServiceClient;
+
+public function __construct(private readonly UserServiceClient $users) {}</code></pre>
+
+<p>Ahora dependen del contrato:</p>
+
+<pre><code>use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
+
+public function __construct(private readonly IdentityProvider $users) {}</code></pre>
+
+<p>El <code>ServiceProvider</code> del paquete hace el enlace:</p>
+
+<pre><code>$this-&gt;app-&gt;singleton(UserServiceClient::class);
+
+// El contrato es lo que consumen la aplicación; la implementación
+// concreta es un detalle que puede cambiar sin tocar a nadie.
+$this-&gt;app-&gt;bind(IdentityProvider::class, UserServiceClient::class);</code></pre>
+
+<div>
+<p><strong>Por qué importa.</strong> Con la clase concreta, cambiar el transporte
+—de HTTP a AMQP, o a un <em>gateway</em>— obligaba a tocar los controllers. Con el
+contrato, se cambia el binding y nadie más se entera. Es la diferencia entre
+depender de una implementación y depender de una abstracción.</p>
+</div>
+
+<h3>12.2 La configuración: el paquete trae la suya</h3>
+
+<p>El cliente leía <code>config('services.user_service')</code>, una clave de la
+aplicación que el paquete no controla. Al moverlo, el paquete trae su propio
+archivo:</p>
+
+<pre><code>// packages/microservices-user-service-client/config/user-service-client.php
+return [
+    'url' =&gt; env('USER_SERVICE_URL', 'http://127.0.0.1:8000'),
+    'timeout' =&gt; (int) env('USER_SERVICE_TIMEOUT', 3),
+];</code></pre>
+
+<p>Y el <code>ServiceProvider</code> lo fusiona y lo hace publicable:</p>
+
+<pre><code>$this-&gt;mergeConfigFrom(
+    __DIR__.'/../config/user-service-client.php',
+    'user-service-client'
+);
+
+$this-&gt;publishes([
+    __DIR__.'/../config/user-service-client.php' =&gt; config_path('user-service-client.php'),
+], 'user-service-client-config');</code></pre>
+
+<p>Las variables de entorno <strong>no cambian</strong>: sigue siendo
+<code>USER_SERVICE_URL</code> y <code>USER_SERVICE_TIMEOUT</code>. Los ficheros
+<code>.env</code> de los servicios siguen siendo válidos sin tocar nada.</p>
+
+<h3>12.3 Lo que se borró del task-service</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo eliminado</th><th>Ahora vive en</th></tr>
+<tr>
+<td><code>app/Services/UserServiceClient.php</code></td>
+<td><code>packages/microservices-user-service-client/src/UserServiceClient.php</code></td>
+</tr>
+<tr>
+<td><code>app/Exceptions/UserServiceUnavailableException.php</code></td>
+<td><code>packages/…/src/Exceptions/UserServiceUnavailableException.php</code></td>
+</tr>
+<tr>
+<td><code>app/Exceptions/UserServiceErrorException.php</code></td>
+<td><code>packages/…/src/Exceptions/UserServiceErrorException.php</code></td>
+</tr>
+<tr>
+<td><code>app/Http/Middleware/EnsureRequestId.php</code></td>
+<td><code>packages/microservices-observability/src/Http/Middleware/</code></td>
+</tr>
+<tr>
+<td><code>app/Http/Middleware/AttachLogContext.php</code></td>
+<td><code>packages/microservices-observability/src/Http/Middleware/</code></td>
+</tr>
+</table>
+
+<p>El directorio <code>app/Exceptions/</code> del task-service quedó vacío y se eliminó
+por completo.</p>
+
+<h3>12.4 El user-service no necesita el cliente</h3>
+
+<p>Detalle que conviene señalar: el <code>user-service</code> <strong>es</strong> el
+proveedor de identidad. No tiene a nadie a quien preguntar. Así que de su
+<code>composer.json</code> se quitó el paquete del cliente, y del <code>repositories</code>
+también:</p>
+
+<pre><code>// user-service/composer.json
+"require": {
+  "php": "^8.3",
+  "laravel/framework": "^13.17",
+  "demo/microservices-observability": "@dev"
+},
+"repositories": [
+  {
+    "type": "path",
+    "url": "../packages/microservices-observability"
+  }
+]</code></pre>
+
+<p>Instalar una dependencia que no se usa es ruido: obliga a <code>composer install</code>
+a resolver algo que no aporta nada.</p>
+
+<h3>12.5 Los tests del paquete</h3>
+
+<p>Un paquete que se instala desde un path no trae tests propios con la instalación.
+Los del <code>task-service</code> cubren la <em>integración</em>, pero no el
+comportamiento del cliente aislado. Se añadieron 11 tests en
+<code>tests/Feature/UserServiceClientPackageTest.php</code>:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Test</th><th>Qué comprueba</th></tr>
+<tr><td>Resuelve el dueño de un token válido</td><td>El camino feliz</td></tr>
+<tr><td>Devuelve <code>null</code> con un token inválido</td><td>Que un 401 no sea una excepción</td></tr>
+<tr><td>Lanza error con un 500 del peer</td><td>La clasificación de errores</td></tr>
+<tr><td>Lanza unavailable si no hay conexión</td><td>La otra mitad de la clasificación</td></tr>
+<tr><td>Emite un token con credenciales válidas</td><td>El camino feliz del login</td></tr>
+<tr><td>Lanza error si las credenciales se rechazan</td><td>Que un 401 en el login sea manejable</td></tr>
+<tr><td>Envía las credenciales como JSON</td><td>El formato del body</td></tr>
+<tr><td>Revoca con la cabecera Bearer</td><td>Que revoke no envíe el token por otro sitio</td></tr>
+<tr><td>Propaga el correlation ID</td><td>La trazabilidad cruza la frontera</td></tr>
+<tr><td>El contrato resuelve a la implementación</td><td>El binding del contenedor</td></tr>
+<tr><td>Siempre la misma instancia</td><td>Que sea singleton</td></tr>
+</table>
+
+<h2 id="verificacion-final">13. Verificación final</h2>
+
+<p>Tras las dos extracciones:</p>
+
+<pre><code>$ cd user-service &amp;&amp; vendor/bin/pest --compact
+{"tool":"pest","result":"passed","tests":28,"passed":28,"assertions":102}
+
+$ cd task-service &amp;&amp; vendor/bin/pest --compact
+{"tool":"pest","result":"passed","tests":45,"passed":45,"assertions":100}
+
+$ vendor/bin/pint   (en los dos servicios)
+{"tool":"pint","result":"passed"}</code></pre>
+
+<p>Y la traza real cruzando los dos servicios, con el ID compartido:</p>
+
+<pre><code># task-service
+[2026-10-21 13:44:44] local.ERROR: No se pudo contactar al user-service.
+{"request_id":"E2E-traza-001","service":"Task Service","ip":"127.0.0.1",
+ "method":"POST","path":"login",
+ "exception":"…UserServiceClient.php:147"}
+
+# user-service
+[2026-10-21 13:44:44] local.INFO: API token issued
+{"request_id":"E2E-traza-001","service":"User Service","ip":"127.0.0.1",
+ "method":"POST","path":"api/tokens","user_id":1,"token_id":8}</code></pre>
+
+<p>El <code>request_id</code> es el mismo en los dos servicios, y el stack trace
+apunta al <strong>paquete</strong>, no a <code>app/Services/</code>. Eso es la prueba
+de que la extracción es real.</p>
+
+<h2 id="siguiente-paso">14. Siguiente paso</h2>
+
+<p>Con el código compartido empaquetado, el orden natural es:</p>
+
+<ol>
+<li><strong>Un tercer microservicio</strong> que consuma el paquete <code>IdentityProvider</code>
+sin escribir ni una línea de cliente HTTP. Es la prueba de que el empaquetado sirve
+para algo.</li>
+<li><strong>Extraer más módulos</strong> si aparece duplicación real: el DTO
+<code>AuthenticatedUser</code> es el siguiente candidato, cuando lo use un segundo
+servicio.</li>
+<li><strong>Circuit breaker y reintentos</strong> en el cliente, ahora que ya es un
+punto único y fácil de modificar.</li>
+</ol>
+
+<hr>
+
+<footer>
+<p><em>Nota:</em> el orden importa. <code>EnsureRequestId</code> debe ejecutarse
+<strong>antes</strong> que <code>AttachLogContext</code>, porque el segundo lee el
+<code>request_id</code> que el primero deja en los atributos del request. Si se invirtiera, el
+contexto del log llevaría un <code>request_id</code> nulo y la trazabilidad se perdería en
+silencio.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

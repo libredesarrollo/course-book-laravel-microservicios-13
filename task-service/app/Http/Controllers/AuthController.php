@@ -2,8 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Exceptions\UserServiceErrorException;
-use App\Services\UserServiceClient;
+use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
@@ -21,7 +21,7 @@ class AuthController extends Controller
      * El task-service nunca ve una contraseña: solo la reenvía al user-service
      * y guarda el token que le devuelven.
      */
-    public function store(Request $request, UserServiceClient $users): RedirectResponse
+    public function store(Request $request, IdentityProvider $users): RedirectResponse
     {
         $credentials = $request->validate([
             'email' => ['required', 'email'],
@@ -45,7 +45,7 @@ class AuthController extends Controller
     /**
      * Cierra sesión y revoca el token en el user-service.
      */
-    public function destroy(Request $request, UserServiceClient $users): RedirectResponse
+    public function destroy(Request $request, IdentityProvider $users): RedirectResponse
     {
         $token = $request->session()->get('api_token');
 

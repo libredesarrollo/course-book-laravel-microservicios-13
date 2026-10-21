@@ -39,7 +39,7 @@ it('logs in through the user-service and stores the returned token', function ()
         ->assertSessionHas('api_token', 'token-emitido');
 
     Http::assertSent(
-        fn ($request) => $request->url() === config('services.user_service.url').'/api/tokens'
+        fn ($request) => $request->url() === config('user-service-client.url').'/api/tokens'
             && $request['email'] === 'ana.torres@example.com'
     );
 });
@@ -72,7 +72,7 @@ it('logs out and revokes the token on the user-service', function () {
 
     Http::assertSent(
         fn ($request) => $request->method() === 'DELETE'
-            && $request->url() === config('services.user_service.url').'/api/tokens'
+            && $request->url() === config('user-service-client.url').'/api/tokens'
             && $request->hasHeader('Authorization', 'Bearer test-token')
     );
 });

@@ -1,0 +1,27 @@
+{
+  "name": "demo/microservices-observability",
+  "description": "Correlation ID + log context para microservicios Laravel",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["laravel", "microservices", "observability", "correlation-id", "x-request-id", "logging"],
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^13.0",
+    "illuminate/http": "^13.0",
+    "illuminate/routing": "^13.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Demo\\Microservices\\Observability\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Demo\\Microservices\\Observability\\MicroservicesObservabilityServiceProvider"
+      ]
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}

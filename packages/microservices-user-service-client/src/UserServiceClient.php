@@ -1,9 +1,10 @@
 <?php
 
-namespace App\Services;
+namespace Demo\Microservices\UserServiceClient;
 
-use App\Exceptions\UserServiceErrorException;
-use App\Exceptions\UserServiceUnavailableException;
+use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
+use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
@@ -12,14 +13,14 @@ use Illuminate\Support\Facades\Http;
  * Cliente HTTP del user-service.
  *
  * Todo el conocimiento sobre "cómo se habla con el user-service" vive aquí:
- * la URL base (config/services.php), el timeout, el manejo de errores de red
- * y la forma del JSON. Los controllers no saben nada del tema.
+ * la URL base (config/user-service-client.php), el timeout, el manejo de
+ * errores de red y la forma del JSON. Los controllers no saben nada del tema.
  *
  * Es exactamente el patrón de un API Gateway / service client: encapsular la
  * frontera de red para que el resto de la aplicación trate al otro
  * microservicio como si fuera una función local.
  */
-class UserServiceClient
+class UserServiceClient implements IdentityProvider
 {
     /**
      * Resuelve quién es el dueño de un token opaco.
@@ -109,6 +110,8 @@ class UserServiceClient
      */
     private function post(string $uri, array $payload = [], array $headers = []): Response
     {
+        $headers = array_merge($this->traceHeaders(), $headers);
+
         return $this->send(fn () => Http::acceptJson()
             ->asJson()
             ->withHeaders($headers)
@@ -150,12 +153,12 @@ class UserServiceClient
 
     private function baseUrl(): string
     {
-        return rtrim((string) config('services.user_service.url'), '/');
+        return rtrim((string) config('user-service-client.url'), '/');
     }
 
     private function timeout(): int
     {
-        return (int) config('services.user_service.timeout');
+        return (int) config('user-service-client.timeout');
     }
 
     /**

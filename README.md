@@ -70,6 +70,10 @@ Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
 > Las rutas de base de datos en `.env.example` son **relativas**, para que el repo funcione en
 > cualquier máquina. El archivo SQLite debe existir: `touch` o `migrate:fresh`.
 
+> `composer install` en cada servicio también enlaza los paquetes de `packages/`
+> (repositorio local de tipo `path`). Si da error de repositorio, revisa que las
+> rutas `../packages/...` del `composer.json` apunten bien.
+
 ---
 
 ## Los dos servicios
@@ -82,7 +86,8 @@ Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
 | Rol | Identidad: emite y valida tokens | Tareas del usuario autenticado |
 | ¿Conoce usuarios? | **Sí**, es el dueño | **No** — solo guarda el `user_id` |
 | Interfaz | Ninguna (headless) | API REST **+ UI web** |
-| Tests | 16 | 34 (88 asserts) |
+| Health check | `GET /health` · `GET /api/health` | `GET /api/health` · `GET /health-ui` |
+| Tests | 33 (114 asserts) | 50 (114 asserts) |
 
 ---
 
@@ -172,13 +177,18 @@ en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
 ## Tests
 
 ```bash
-cd user-service && vendor/bin/pest --compact   # 16 tests
-cd task-service && vendor/bin/pest --compact   # 34 tests
+cd user-service && vendor/bin/pest --compact   # 33 tests, 114 asserts
+cd task-service && vendor/bin/pest --compact   # 50 tests, 114 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
 conexión caída. Hay tests que intentan inyectar `user_id` por API y por formulario, y comprueban
 que se ignora.
+
+Los paquetes de `packages/` también tienen cobertura propia, en
+`task-service/tests/Feature/UserServiceClientPackageTest.php`: 11 tests sobre el cliente HTTP
+del user-service (resolución de token válido, token inválido, error del peer, servicio caído,
+emisión, revocación, propagación del `X-Request-Id` y el binding del contrato).
 
 ---
 
@@ -198,6 +208,11 @@ no hay espacio de búsqueda.
 **Toda la frontera de red vive en `UserServiceClient`.** URL, timeout, clasificación de errores.
 `401` significa "token inválido" y se traduce a `null`; cualquier otro status es un fallo del peer
 y lanza excepción.
+
+**El código compartido está empaquetado, no copiado.** Los middlewares de observabilidad y el
+cliente HTTP del user-service viven en `packages/` como paquetes Composer con repositorio `path`.
+El `task-service` consume el **contrato** `IdentityProvider`, no la clase concreta, así que
+cambiar la implementación no obliga a tocar los controllers.
 
 **`findOwnedTask()` en vez de route model binding.** `SubstituteBindings` corre antes del
 middleware de autenticación, así que con binding implícito un anónimo veía `404` para "no existe"
@@ -220,29 +235,72 @@ en el mismo request. Preguntarlo dos veces es pagar la latencia dos veces.
 demo-microservicios/
 ├── .gitignore
 ├── README.md
-├── FLUJO-MICROSERVICIOS.md           ← documentación completa (con roadmap)
-├── FLUJO-MICROSERVICIOS.html         ← la misma, con formato
-├── FLUJO-MICROSERVICIOS-PLAIN.html   ← la misma, HTML sin estilos
-├── laravel-services.html             ← services en Laravel: qué son y cuándo usarlos
-├── flujo-autenticacion.html          ← el flujo de auth, un 3er servicio y código compartido
+├── docs/                              ← toda la documentación
+│   ├── FLUJO-MICROSERVICIOS.md           ← la referencia completa (con roadmap)
+│   ├── FLUJO-MICROSERVICIOS.html         ← la misma, con diagrama y modo claro/oscuro
+│   ├── FLUJO-MICROSERVICIOS-PLAIN.html   ← la misma, HTML sin estilos
+│   ├── 01-estructura-base.html           ← el proyecto en 14 diapositivas
+│   ├── 02-flujo-autenticacion.html       ← el flujo de auth, un 3er servicio y código compartido
+│   ├── 03-rate-limit.html                ← el antes y el después del rate limiting
+│   ├── 04-observabilidad.html            ← correlation ID, health checks y trazabilidad
+│   ├── 05-modulos-composer.html          ← cómo empaquetar el código compartido con Composer
+│   └── laravel-services.html             ← services en Laravel: qué son y cuándo usarlos
+│
+├── packages/                         ← código compartido, empaquetado con Composer
+│   ├── microservices-observability/          ← correlation ID + contexto de logs
+│   │   └── src/Http/Middleware/{EnsureRequestId,AttachLogContext}.php
+│   └── microservices-user-service-client/    ← la frontera de red con el user-service
+│       ├── src/Contracts/IdentityProvider.php
+│       ├── src/UserServiceClient.php
+│       ├── src/Exceptions/
+│       └── config/user-service-client.php
 │
 ├── user-service/                     ← :8000 · db_users.sqlite
 │   ├── app/Models/ApiToken.php               ← emitir y buscar tokens
 │   ├── app/Http/Controllers/AuthController.php
+│   ├── app/Http/Controllers/HealthController.php
 │   ├── app/Http/Middleware/AuthenticateApiToken.php
 │   ├── database/migrations/…_create_api_tokens_table.php
 │   └── tests/Feature/AuthApiTest.php
 │
 └── task-service/                     ← :8001 · db_tasks.sqlite
-    ├── app/Services/UserServiceClient.php     ← la frontera de red
     ├── app/Http/Middleware/AuthenticateWithUserService.php
     ├── app/Support/AuthenticatedUser.php      ← identidad, solo durante el request
     ├── app/Http/Controllers/AuthController.php
+    ├── app/Http/Controllers/HealthController.php
     ├── app/Http/Controllers/TaskController.php        ← UI web
     ├── app/Http/Controllers/Api/TaskController.php   ← API REST
     ├── resources/views/{layouts,auth,tasks,errors}/
-    └── tests/Feature/{TaskApiTest,TaskUiTest}.php
+    └── tests/Feature/{TaskApiTest,TaskUiTest,UserServiceClientPackageTest}.php
 ```
+
+### Paquetes compartidos
+
+El código que usaban los dos servicios ya no está duplicado: vive en `packages/`
+como paquetes Composer reales, con su `composer.json`, su namespace y su
+ServiceProvider.
+
+```bash
+# en cada servicio
+composer install     # crea el symlink en vendor/demo/
+```
+
+Los paquetes se instalan desde un repositorio local de tipo `path`, así que un
+cambio en `packages/` se ve al instante en los dos servicios, sin `composer update`.
+
+El paquete de observabilidad publica sus middlewares como **aliases**
+(`request.id` y `log.context`), así que las apps los usan por nombre y no
+importan ninguna clase del paquete:
+
+```php
+// bootstrap/app.php
+$middleware->appendToGroup('api', 'request.id');
+$middleware->appendToGroup('api', 'log.context');
+```
+
+El paquete **no** decide en qué grupos se aplican: eso sigue en el
+`bootstrap/app.php` de cada servicio, a la vista.
+
 
 ## Configuración
 
@@ -265,27 +323,32 @@ Nada de URLs hardcodeadas: si el user-service cambia de host, solo tocas el `.en
 - **Un salto de red en cada request autenticado.** La latencia se suma a la de la base de datos.
 - **Sin circuit breaker.** Con el user-service caído, cada request espera los 3 s del timeout.
 - **La disponibilidad del task-service depende de la del user-service.**
-- **Los tokens no expiran por defecto.** La columna existe y el código la respeta, pero no hay TTL.
-- **Sin rate limiting en `POST /api/tokens`.** El login de la UI tiene `throttle:6,1`, pero el
-  endpoint que recibe contraseñas no. Es lo más urgente que queda.
 - **Sin refresh tokens, sin roles.** Solo "es tuya o no es tuya".
+- **El rate limit vive en caché de ficheros.** Con `CACHE_STORE=file` el límite es por instancia:
+  con varias réplicas, el atacante dispone de N presupuestos. En producción, Redis.
+- **Sin `trustProxies`.** `X-Forwarded-For` se ignora, así que el límite por IP ve la IP real del
+  balanceador. Es el primer paso antes de desplegar.
+- **Los contadores de rate limit no distinguen usuarios.** El límite es por cuenta, no por
+  persona: una cuenta compartida (familia, oficina) agota el presupuesto de todos.
 
 ## Y hacia dónde va
 
-| # | Paso |
-|---|---|
-| 1 | Rate limit en `POST /api/tokens` |
-| 2 | Métricas y `X-Request-Id` |
-| 3 | Circuit breaker + reintentos |
-| 4 | TTL y refresh tokens |
-| 5 | API versioning |
-| 6 | Contratos de consumidor en CI |
-| 7 | RabbitMQ |
-| 8 | Docker + health checks |
-| 9 | Octane |
-| 10 | JWT o gateway |
+| # | Paso | Estado |
+|---|---|---|
+| 1 | Rate limit en `POST /api/tokens` (por cuenta y por IP) | **Hecho** |
+| 2 | TTL de tokens (60 min, `expires_at` NOT NULL) | **Hecho** |
+| 3 | `X-Request-Id` + health checks + logs con contexto | **Hecho** |
+| 4 | Código compartido empaquetado con Composer | **Hecho** |
+| 5 | Circuit breaker + reintentos con backoff | Pendiente |
+| 6 | Refresh tokens | Pendiente |
+| 7 | API versioning | Pendiente |
+| 8 | Contratos de consumidor en CI | Pendiente |
+| 9 | RabbitMQ (`user.deleted` → purgar tareas) | Pendiente |
+| 10 | Docker + despliegue | Pendiente |
+| 11 | Octane | Pendiente |
+| 12 | JWT o gateway | Pendiente |
 
-Los tres primeros cuestan horas y evitan incidentes. El 9 puede esperar un año sin que nadie lo
+Los siguientes cuestan horas y evitan incidentes. El 11 puede esperar un año sin que nadie lo
 note.
 
 ---
@@ -294,11 +357,15 @@ note.
 
 | Archivo | Contenido |
 |---|---|
-| [`FLUJO-MICROSERVICIOS.md`](FLUJO-MICROSERVICIOS.md) | La referencia completa, en Markdown |
-| [`FLUJO-MICROSERVICIOS.html`](FLUJO-MICROSERVICIOS.html) | La misma, con diagrama y modo claro/oscuro |
-| [`FLUJO-MICROSERVICIOS-PLAIN.html`](FLUJO-MICROSERVICIOS-PLAIN.html) | La misma, HTML sin estilos |
-| [`laravel-services.html`](laravel-services.html) | Services en Laravel: qué son, por qué importan y cuándo usarlos |
-| [`flujo-autenticacion.html`](flujo-autenticacion.html) | El flujo de autenticación completo, qué pasa con un tercer microservicio y cómo compartir código |
+| [`docs/FLUJO-MICROSERVICIOS.md`](docs/FLUJO-MICROSERVICIOS.md) | La referencia completa, en Markdown |
+| [`docs/FLUJO-MICROSERVICIOS.html`](docs/FLUJO-MICROSERVICIOS.html) | La misma, con diagrama y modo claro/oscuro |
+| [`docs/FLUJO-MICROSERVICIOS-PLAIN.html`](docs/FLUJO-MICROSERVICIOS-PLAIN.html) | La misma, HTML sin estilos |
+| [`docs/laravel-services.html`](docs/laravel-services.html) | Services en Laravel: qué son, por qué importan y cuándo usarlos |
+| [`docs/02-flujo-autenticacion.html`](docs/02-flujo-autenticacion.html) | El flujo de autenticación completo, qué pasa con un tercer microservicio y cómo compartir código |
+| [`docs/03-rate-limit.html`](docs/03-rate-limit.html) | El rate limiting del login: el antes, el después y por qué dos límites |
+| [`docs/04-observabilidad.html`](docs/04-observabilidad.html) | Correlation ID, health checks y trazabilidad entre microservicios |
+| [`docs/05-modulos-composer.html`](docs/05-modulos-composer.html) | Cómo empaquetar el código compartido en paquetes Composer locales |
+| [`docs/01-estructura-base.html`](docs/01-estructura-base.html) | El proyecto entero en 14 diapositivas |
 
 ---
 

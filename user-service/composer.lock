@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "d4b14c3eb139c72cec2515e532b4aee3",
+    "content-hash": "b42c43721c90a042eac07c9ad64f31b1",
     "packages": [
         {
             "name": "brick/math",
@@ -139,6 +139,49 @@
                 }
             ],
             "time": "2026-09-06T14:11:38+00:00"
+        },
+        {
+            "name": "demo/microservices-observability",
+            "version": "dev-main",
+            "dist": {
+                "type": "path",
+                "url": "../packages/microservices-observability",
+                "reference": "f3dff73a7e2735a6ba4298034f73c71d222cc89c"
+            },
+            "require": {
+                "illuminate/http": "^13.0",
+                "illuminate/routing": "^13.0",
+                "illuminate/support": "^13.0",
+                "php": "^8.2"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "Demo\\Microservices\\Observability\\MicroservicesObservabilityServiceProvider"
+                    ]
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "Demo\\Microservices\\Observability\\": "src/"
+                }
+            },
+            "license": [
+                "MIT"
+            ],
+            "description": "Correlation ID + log context para microservicios Laravel",
+            "keywords": [
+                "correlation-id",
+                "laravel",
+                "logging",
+                "microservices",
+                "observability",
+                "x-request-id"
+            ],
+            "transport-options": {
+                "relative": true
+            }
         },
         {
             "name": "dflydev/dot-access-data",
@@ -10023,7 +10066,9 @@
     ],
     "aliases": [],
     "minimum-stability": "stable",
-    "stability-flags": {},
+    "stability-flags": {
+        "demo/microservices-observability": 20
+    },
     "prefer-stable": true,
     "prefer-lowest": false,
     "platform": {

@@ -2,9 +2,9 @@
 
 namespace App\Http\Middleware;
 
-use App\Services\UserServiceClient;
 use App\Support\AuthenticatedUser;
 use Closure;
+use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -21,7 +21,7 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class AuthenticateWithUserService
 {
-    public function __construct(private readonly UserServiceClient $users) {}
+    public function __construct(private readonly IdentityProvider $users) {}
 
     public function handle(Request $request, Closure $next): Response
     {

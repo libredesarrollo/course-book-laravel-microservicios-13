@@ -1,8 +1,6 @@
 <?php
 
-use App\Http\Middleware\AttachLogContext;
 use App\Http\Middleware\AuthenticateApiToken;
-use App\Http\Middleware\EnsureRequestId;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -16,13 +14,13 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        $middleware->appendToGroup('api', EnsureRequestId::class);
-        $middleware->appendToGroup('api', AttachLogContext::class);
+        // 'request.id' y 'log.context' los registra el paquete de observabilidad.
+        // Se referencian por nombre para no atar la app a sus clases internas.
+        $middleware->appendToGroup('api', 'request.id');
+        $middleware->appendToGroup('api', 'log.context');
 
         $middleware->alias([
             'auth.api-token' => AuthenticateApiToken::class,
-            'request.id' => EnsureRequestId::class,
-            'log.context' => AttachLogContext::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

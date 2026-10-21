@@ -40,7 +40,7 @@ it('asks the user-service who the caller is, on every request', function () {
     $this->withToken('test-token')->getJson('/api/tasks')->assertOk();
 
     Http::assertSent(
-        fn ($request) => $request->url() === config('services.user_service.url').'/api/user'
+        fn ($request) => $request->url() === config('user-service-client.url').'/api/user'
             && $request->hasHeader('Authorization', 'Bearer test-token')
     );
 });

@@ -1,0 +1,26 @@
+{
+  "name": "demo/microservices-user-service-client",
+  "description": "Cliente HTTP para comunicarse con user-service desde otros microservicios",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["laravel", "microservices", "http-client", "user-service"],
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^13.0",
+    "illuminate/http": "^13.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Demo\\Microservices\\UserServiceClient\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Demo\\Microservices\\UserServiceClient\\UserServiceClientServiceProvider"
+      ]
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}
