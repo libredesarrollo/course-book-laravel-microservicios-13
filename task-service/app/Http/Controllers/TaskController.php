@@ -7,6 +7,7 @@ use App\Http\Requests\UpdateTaskRequest;
 use App\Models\Task;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\View\View;
+use Illuminate\Support\Facades\Log;
 
 /**
  * CRUD de tareas para la interfaz web.
@@ -43,6 +44,8 @@ class TaskController extends Controller
             'status' => $validated['status'] ?? Task::STATUS_PENDING,
         ]);
 
+        Log::info('El usuario creó una tarea');
+
         return redirect()
             ->route('tasks.index')
             ->with('success', 'Tarea creada correctamente.');
@@ -60,6 +63,8 @@ class TaskController extends Controller
 
     public function update(UpdateTaskRequest $request, int $task): RedirectResponse
     {
+        Log::info('El usuario actualizó una tarea');
+
         $this->findOwnedTask($task)->update($request->validated());
 
         return redirect()

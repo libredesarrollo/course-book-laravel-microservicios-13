@@ -52,7 +52,7 @@ class AppServiceProvider extends ServiceProvider
 
                 // Y al revés: un atacante con muchas IP contra una sola cuenta.
                 // • .'|ip:'.$request->ip(): Obtiene la dirección IP pública de quien hace la petición y la une a la llave del correo usando una barra vertical (|).
-//Al unir el correo y la IP, el sistema es muy específico. Si un atacante intenta hackear una cuenta usando muchas IPs diferentes, el límite lo bloqueará por el correo. Si intenta hackear muchas cuentas distintas desde la misma computadora, el límite lo bloqueará por la IP.
+                // Al unir el correo y la IP, el sistema es muy específico. Si un atacante intenta hackear una cuenta usando muchas IPs diferentes, el límite lo bloqueará por el correo. Si intenta hackear muchas cuentas distintas desde la misma computadora, el límite lo bloqueará por la IP.
 
                 Limit::perMinute((int) config('tokens.throttle.per_account'))
                     ->by('email:'.hash('sha256', $email).'|ip:'.$request->ip()),

@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Observabilidad: correlation ID, health checks y trazabilidad</title>
+
+<meta name="description" content="Cómo añadir X-Request-Id, health checks, propagación entre servicios y trazabilidad con logs con contexto en dos microservicios Laravel.">
+<meta name="keywords" content="correlation id, x-request-id, microservicios laravel, trazabilidad, health check, logging context, laravel middleware">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:title" content="Observabilidad: correlation ID, health checks y trazabilidad">
+<meta property="og:description" content="Cómo añadir X-Request-Id, health checks, propagación entre servicios y trazabilidad con logs con contexto en dos microservicios Laravel.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Observabilidad: correlation ID, health checks y trazabilidad">
+<meta name="twitter:description" content="Cómo añadir X-Request-Id, health checks, propagación entre servicios y trazabilidad con logs con contexto en dos microservicios Laravel.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Observabilidad entre microservicios: correlation ID, health checks y trazabilidad",
+  "description": "Cómo añadir X-Request-Id, health checks, propagación entre servicios y trazabilidad con logs con contexto en dos microservicios Laravel.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-20",
+  "dateModified": "2026-10-20",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "Microservicios",
+  "keywords": "correlation id, x-request-id, health checks, laravel, trazabilidad",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>Observabilidad entre microservicios: correlation ID, health checks y trazabilidad</h1>
+
+<p><strong>Resumen:</strong> Al pasar de dos aplicaciones aisladas a dos microservicios que se llaman por HTTP, la pregunta deja de ser "¿ha funcionado?" para pasar a ser "<strong>¿qué petición ha provocado este error?</strong>". Para responderla hay que poder seguir un único identificador a lo largo de toda la cadena. Este artículo recoge lo que acabamos de implementar: <code>X-Request-Id</code>, health checks, propagación entre servicios y el plan para tener <strong>logs correlacionados</strong>.</p>
+
+<p>Contexto: proyecto <code>demo-microservicios</code> con <code>user-service</code> y <code>task-service</code>, comunicación HTTP síncrona y autenticación delegada.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: peticiones sin rastro</a></li>
+<li><a href="#objetivo">Objetivo del capítulo de observabilidad</a></li>
+<li><a href="#request-id">1. Correlation ID: X-Request-Id</a></li>
+<li><a href="#middleware">2. Middleware EnsureRequestId</a></li>
+<li><a href="#health">3. Health checks</a></li>
+<li><a href="#propagacion">4. Propagación al user-service desde task-service</a></li>
+<li><a href="#integracion">5. Integración en bootstrap/app.php</a></li>
+<li><a href="#pruebas">6. Comprobación en vivo</a></li>
+<li><a href="#logs">7. El siguiente paso: logs con contexto</a></li>
+<li><a href="#plan">8. Plan para cerrar este capítulo</a></li>
+<li><a href="#por-que">9. ¿Por qué antes de reintentos?</a></li>
+<li><a href="#archivos">10. Archivos añadidos o modificados</a></li>
+<li><a href="#estado">11. Estado actual</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="problema">1. El problema: peticiones sin rastro</h2>
+
+<p>En una app monolítica basta con abrir <code>storage/logs/laravel.log</code> y filtrar por ruta, usuario o excepción. En microservicios la realidad es otra:</p>
+
+<ul>
+<li><strong>Una acción en la UI</strong> del <code>task-service</code> provoca varias llamadas internas.</li>
+<li><strong>El <code>task-service</code> delega identidad</strong> llamando a <code>GET /api/user</code> del <code>user-service</code> por cada petición autenticada.</li>
+<li><strong>Si falla la red</strong>, el <code>UserServiceUnavailableException</code> aparece solo en los logs del <code>task-service</code>, pero <strong>¿qué cliente lo provocó?</strong> no se sabe.</li>
+<li><strong>Si hay varios usuarios en paralelo</strong>, las líneas se entremezclan y resulta imposible reconstruir el camino completo.</li>
+</ul>
+
+<p>Sin un identificador común, depurar entre dos servicios es adivinar.</p>
+
+<h2 id="objetivo">2. Objetivo del capítulo de observabilidad</h2>
+
+<p>El objetivo no es instrumentación completa con OpenTelemetry. Es algo mucho más práctico y necesario:</p>
+
+<ol>
+<li><strong>Poder trazar una petición</strong> desde que llega al <code>task-service</code> hasta las llamadas que hace al <code>user-service</code> con el mismo ID.</li>
+<li><strong>Saber si los servicios están vivos</strong> sin necesidad de autenticar.</li>
+<li><strong>Propagar la traza</strong> entre ambos servicios por HTTP.</li>
+<li><strong>Correlacionar los logs</strong> para poder filtrar por <code>request_id</code> y seguir el recorrido completo.</li>
+</ol>
+
+<h2 id="request-id">3. Correlation ID: X-Request-Id</h2>
+
+<p>La convención es sencilla: usar la cabecera HTTP <code>X-Request-Id</code>.</p>
+
+<ul>
+<li><strong>Si llega del cliente (o del servicio que nos llama)</strong>: se respeta. No se genera uno nuevo.</li>
+<li><strong>Si no llega</strong>: se genera un UUID v4 con <code>Illuminate\Support\Str::uuid()</code>.</li>
+<li><strong>Siempre se devuelve</strong> en la respuesta con la misma cabecera <code>X-Request-Id</code>.</li>
+</ul>
+
+<p>Así, cualquier herramienta, proxy o el propio desarrollador puede pasar ese ID y el sistema lo mantendrá durante toda la cadena.</p>
+
+<h2 id="middleware">4. Middleware EnsureRequestId</h2>
+
+<p>Se ha creado <code>App\Http\Middleware\EnsureRequestId</code> en ambos servicios con el mismo comportamiento.</p>
+
+<pre><code>&lt;?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\Response;
+
+class EnsureRequestId
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        $requestId = $request-&gt;header('X-Request-Id');
+
+        if (! is_string($requestId) || $requestId === '') {
+            $requestId = (string) Str::uuid();
+        }
+
+        $request-&gt;attributes-&gt;set('request_id', $requestId);
+
+        /** @var Response $response */
+        $response = $next($request);
+
+        $response-&gt;headers-&gt;set('X-Request-Id', $requestId);
+
+        return $response;
+    }
+}
+</code></pre>
+
+<p>Se guarda también en los <code>attributes</code> del request para poder accederlo desde servicios como <code>UserServiceClient</code> sin tener que leer la cabecera otra vez.</p>
+
+<h2 id="health">5. Health checks</h2>
+
+<p>Se han añadido endpoints para comprobar la disponibilidad sin pasar por autenticación.</p>
+
+<h3>user-service</h3>
+
+<pre><code>// routes/api.php
+Route::get('/health', [HealthController::class, 'index']);
+</code></pre>
+
+<pre><code>&lt;?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\JsonResponse;
+
+class HealthController extends Controller
+{
+    public function index(): JsonResponse
+    {
+        return response()-&gt;json([
+            'status' =&gt; 'ok',
+            'service' =&gt; config('app.name', 'user-service'),
+            'timestamp' =&gt; now()-&gt;toIso8601String(),
+        ]);
+    }
+}
+</code></pre>
+
+<h3>task-service</h3>
+
+<pre><code>// routes/api.php
+Route::get('/health', [HealthController::class, 'index']);
+
+// routes/web.php
+Route::get('/health-ui', function () {
+    return response('ok', 200)-&gt;header('Content-Type', 'text/plain');
+});
+</code></pre>
+
+<p>El <code>/up</code> que trae Laravel por defecto se mantiene como viene.</p>
+
+<h2 id="propagacion">6. Propagación al user-service desde task-service</h2>
+
+<p>El <code>task-service</code> llama constantemente al <code>user-service</code>: <code>authenticate()</code>, <code>issueToken()</code> y <code>revokeToken()</code> pasan por <code>App\Services\UserServiceClient</code>.</p>
+
+<p>Para mantener la traza, se ha añadido un método <code>traceHeaders()</code> que recoge <code>X-Request-Id</code> de la petición entrante al <code>task-service</code> y lo reenvía en todas las peticiones salientes.</p>
+
+<pre><code>private function traceHeaders(): array
+{
+    $headers = [];
+
+    if (function_exists('request')) {
+        $req = request();
+        if (! $req) {
+            return $headers;
+        }
+
+        $requestId = null;
+
+        if ($req-&gt;hasHeader('X-Request-Id')) {
+            $requestId = $req-&gt;header('X-Request-Id');
+        } elseif ($req-&gt;attributes &amp;&amp; $req-&gt;attributes-&gt;has('request_id')) {
+            $requestId = $req-&gt;attributes-&gt;get('request_id');
+        }
+
+        if (is_string($requestId) &amp;&amp; $requestId !== '') {
+            $headers['X-Request-Id'] = $requestId;
+        }
+    }
+
+    return $headers;
+}
+</code></pre>
+
+<p>Los tres métodos HTTP (<code>request()</code>, <code>post()</code>, <code>delete()</code>) hacen <code>array_merge($this-&gt;traceHeaders(), $headers)</code> para asegurarse de que la cabecera se añade sin romper las ya existentes.</p>
+
+<h2 id="integracion">7. Integración en bootstrap/app.php</h2>
+
+<h3>user-service</h3>
+
+<pre><code>$middleware-&gt;appendToGroup('api', EnsureRequestId::class);
+
+$middleware-&gt;alias([
+    'auth.api-token' =&gt; AuthenticateApiToken::class,
+    'request.id' =&gt; EnsureRequestId::class,
+]);
+</code></pre>
+
+<h3>task-service</h3>
+
+<pre><code>$middleware-&gt;appendToGroup('web', EnsureRequestId::class);
+$middleware-&gt;appendToGroup('api', EnsureRequestId::class);
+
+$middleware-&gt;alias([
+    'auth.user-service' =&gt; AuthenticateWithUserService::class,
+    'request.id' =&gt; EnsureRequestId::class,
+]);
+</code></pre>
+
+<p>Aplicarlo al grupo <code>api</code> es suficiente porque todas las rutas relevantes pasan por ahí. También se añade al grupo <code>web</code> en el <code>task-service</code> por si se accede directamente desde el navegador y se quiere ver la cabecera en respuestas HTML.</p>
+
+<h2 id="pruebas">8. Comprobación en vivo</h2>
+
+<p>Con ambos servidores arrancados en local:</p>
+
+<pre><code>$ curl -i http://127.0.0.1:8000/health
+HTTP/1.1 200 OK
+X-Request-Id: 9b9f3e8e-9b0a-4c56-b7a5-2f9e7b8c9d02
+...</code></pre>
+
+<p>Si se pasa un ID explícito, se mantiene:</p>
+
+<pre><code>$ curl -i -H "X-Request-Id: prueba-trazabilidad-123" http://127.0.0.1:8001/api/health
+HTTP/1.1 200 OK
+X-Request-Id: prueba-trazabilidad-123
+...</code></pre>
+
+<p>Al hacer login desde la web del <code>task-service</code>, ese mismo <code>X-Request-Id</code> viaja al <code>user-service</code> en la llamada HTTP que hace <code>UserServiceClient@issueToken</code>. Si miráramos los logs de los dos servicios ahora mismo, el ID aparecería en la cabecera, pero <strong>aún no está en el contexto del log</strong>.</p>
+
+<h2 id="logs">9. El siguiente paso: logs con contexto</h2>
+
+<p>Actualmente los logs son así:</p>
+
+<pre><code>Failed login attempt {"email":"ana.torres@example.com","ip":"127.0.0.1","account_exists":true}
+</code></pre>
+
+<p>Lo ideal es que se viera también el <code>request_id</code>:</p>
+
+<pre><code>[2026-10-20 13:35:12] local.warning: Failed login attempt {"request_id":"9b9f3e8e-...","service":"user-service","ip":"127.0.0.1","email":"ana.torres@example.com","account_exists":true}
+</code></pre>
+
+<p>Para conseguirlo vamos a utilizar <code>Log::withContext()</code> de Laravel. De esta manera <strong>cualquier</strong> <code>Log::info/warning/error</code> que se escriba a partir de ahí llevará ese contexto sin tener tocamilla contraseña, email o traza, más es obligatory, porque es muy fácil olvidar pasar el array.</p>
+
+<h3>Propuesta: middleware AttachLogContext</h3>
+
+<p>Se creará <code>AttachLogContext</code> que se ejecutará <strong>después</strong> de <code>EnsureRequestId</code>. Su trabajo será:</p>
+
+<pre><code>&lt;?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Symfony\Component\HttpFoundation\Response;
+
+class AttachLogContext
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        $requestId = $request-&gt;attributes-&gt;get('request_id') ?? $request-&gt;header('X-Request-Id');
+
+        Log::withContext([
+            'request_id' =&gt; $requestId,
+            'service' =&gt; config('app.name'),
+            'ip' =&gt; $request-&gt;ip(),
+        ]);
+
+        return $next($request);
+    }
+}
+</code></pre>
+
+<p>A diferencia de <code>EnsureRequestId</code>, este middleware no modifica la respuesta. Únicamente añade contexto al logger.</p>
+
+<h2 id="plan">8. Plan para cerrar este capítulo</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Paso</th><th>Acción</th><th>Razón</th></tr>
+<tr>
+<td><strong>1</strong></td>
+<td>Crear <code>app/Http/Middleware/AttachLogContext.php</code> en ambos servicios</td>
+<td>Añadir <code>request_id</code>, <code>service</tag> y <code>ip</code> al contexto del log</td>
+</tr>
+<tr>
+<td><strong>2</strong></td>
+<td>Registrarlo en <code>bootstrap/app.php</code> justo después de <code>EnsureRequestId</code></td>
+<td>Necesita que ya exista el <code>request_id</code></td>
+</tr>
+<tr>
+<td><strong>3</strong></td>
+<td>Aplicarlo a los grupos <code>api</code> (y <code>web</code> en task-service)</td>
+<td>Que se aplique a todas las rutas con lo cual hay trazabilidad</td>
+</tr>
+<tr>
+<td><strong>4</strong></td>
+<td>Enriquecer algunos logs existentes</td>
+<td>Probar en vivo que funciona: <code>AuthController</code> (user-service), <code>AuthenticateWithUserService</code>, <code>AuthenticateApiToken</code></td>
+</tr>
+<tr>
+<td><strong>5</strong></td>
+<td>Comprobar con <code>curl</code> y ver <code>storage/logs/laravel.log</code></td>
+<td>Validar que el mismo <code>request_id</code> aparece desde ambos lados</td>
+</tr>
+</table>
+
+<h2 id="por-que">9. ¿Por qué antes de reintentos?</h2>
+
+<p>En <code>UserServiceClient</code> está previsto añadir <code>Http::retry(3, 200)</code> con <code>retryWhen</code> para errores de red. Eso está bien, pero tiene un problema sin trazabilidad:</p>
+
+<ul>
+<li><strong>Sin contexto:</strong></li> <code>ConnectionException</code> → <strong>¿es el primer intento o el tercero?</strong> Difícil de distinguir.</li>
+<li><strong>Con <code>request_id</code> + logs con contexto:</strong> verás las 3 líneas con el <strong>mismo <code>request_id</code></strong> y sabrás que son reintentos de la misma petición.</li>
+<li><strong>Con propagación cruzada:</strong> también podrás buscar ese <code>request_id</code> en los logs del <code>user-service</code> y ver si llegó alguna vez o si nunca salió del <code>task-service</code>.</li>
+</ul>
+
+<p>Por eso se ha optado por <strong>logs con contexto</strong> antes que reintentos. Es el orden correcto para poder depurar lo que venga después.</p>
+
+<h2 id="archivos">10. Archivos añadidos o modificados</h2>
+
+<h3>user-service</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo</th><th>Acción</th><th>Descripción</th></tr>
+<tr>
+<td><code>app/Http/Middleware/EnsureRequestId.php</code></td>
+<td>Añadido</td>
+<td>Genera/respeta <code>X-Request-Id</code> y lo devuelve en la respuesta</td>
+</tr>
+<tr>
+<td><code>app/Http/Controllers/HealthController.php</code></td>
+<td>Añadido</td>
+<td><code>GET /health</code> JSON</td>
+</tr>
+<tr>
+<td><code>routes/api.php</code></td>
+<td>Modificado</td>
+<td>Ruta pública <code>/health</code></td>
+</tr>
+<tr>
+<td><code>bootstrap/app.php</code></td>
+<td>Modificado</td>
+<td>Se añade <code>EnsureRequestId</code> al grupo <code>api</code> y el alias <code>request.id</code></td>
+</tr>
+</table>
+
+<h3>task-service</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo</th><th>Acción</th><th>Descripción</th></tr>
+<tr>
+<td><code>app/Http/Middleware/EnsureRequestId.php</code></td>
+<td>Añadido</td>
+<td>Mismo comportamiento</td>
+</tr>
+<tr>
+<td><code>app/Http/Controllers/HealthController.php</code></td>
+<td>Añadido</td>
+<td><code>GET /health</code> JSON</td>
+</tr>
+<tr>
+<td><code>app/Services/UserServiceClient.php</code></td>
+<td>Modificado</td>
+<td>Propagación de <code>X-Request-Id</code> a todas las llamadas HTTP al user-service</td>
+</tr>
+<tr>
+<td><code>routes/api.php</code></td>
+<td>Modificado</td>
+<td>Ruta pública <code>/health</code></td>
+</tr>
+<tr>
+<td><code>routes/web.php</code></td>
+<td>Modificado</td>
+<td><code>GET /health-ui</code> para comprobación rápida</td>
+</tr>
+<tr>
+<td><code>bootstrap/app.php</code></td>
+<td>Modificado</td>
+<td>Se añade <code>EnsureRequestId</code> al grupo <code>api</code> y <code>web</code>, alias <code>request.id</code></td>
+</tr>
+</table>
+
+<h2 id="estado">11. Estado actual</h2>
+
+<p>Tras implementar lo anterior:</p>
+
+<ul>
+<li><strong>Tests:</strong> user-service <strong>28 tests / 102 asserts</strong> — OK. task-service <strong>34 tests / 88 asserts</strong> — OK.</li>
+<li><strong>Calidad:</strong> <code>pint</code> aplicado en ambos servicios sin fallos.</li>
+<li><strong>Operabilidad:</strong> Ya se puede obtener <code>X-Request-Id</code> en todas las respuestas y propagado entre servicios.</li>
+<li><strong>Pendiente:</strong> <strong>Logs con contexto</strong> (<code>Log::withContext</code>) + añadirlos a los logs existentes. Ahí es donde realmente se gana la trazabilidad al filtrar por <code>request_id</code>.</li>
+</ul>
+
+<hr>
+
+<footer>
+<p><strong>Próximo paso:</strong> Crear <code>AttachLogContext</code> en ambos servicios, registrarlo tras <code>EnsureRequestId</code> y enriquecer los logs de autenticación para poder seguir una misma petición de un extremo al otro con un solo filtro.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

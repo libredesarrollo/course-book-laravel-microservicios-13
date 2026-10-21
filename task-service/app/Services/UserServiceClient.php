@@ -93,6 +93,8 @@ class UserServiceClient
      */
     private function request(string $uri, array $headers = []): Response
     {
+        $headers = array_merge($this->traceHeaders(), $headers);
+
         return $this->send(fn () => Http::acceptJson()
             ->withHeaders($headers)
             ->timeout($this->timeout())
@@ -121,6 +123,8 @@ class UserServiceClient
      */
     private function delete(string $uri, array $headers = []): Response
     {
+        $headers = array_merge($this->traceHeaders(), $headers);
+
         return $this->send(fn () => Http::acceptJson()
             ->withHeaders($headers)
             ->timeout($this->timeout())
@@ -152,5 +156,34 @@ class UserServiceClient
     private function timeout(): int
     {
         return (int) config('services.user_service.timeout');
+    }
+
+    /**
+     * Propaga el correlation ID recibido del cliente al user-service.
+     */
+    private function traceHeaders(): array
+    {
+        $headers = [];
+
+        if (function_exists('request')) {
+            $req = request();
+            if (! $req) {
+                return $headers;
+            }
+
+            $requestId = null;
+
+            if ($req->hasHeader('X-Request-Id')) {
+                $requestId = $req->header('X-Request-Id');
+            } elseif ($req->attributes && $req->attributes->has('request_id')) {
+                $requestId = $req->attributes->get('request_id');
+            }
+
+            if (is_string($requestId) && $requestId !== '') {
+                $headers['X-Request-Id'] = $requestId;
+            }
+        }
+
+        return $headers;
     }
 }

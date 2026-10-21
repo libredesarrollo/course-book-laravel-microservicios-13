@@ -75,6 +75,8 @@ class AuthController extends Controller
         /** @var User $user */
         $user = $request->attributes->get('user');
 
+        Log::info('Consulta de usuario');
+
         return response()->json([
             'id' => $user->id,
             'name' => $user->name,

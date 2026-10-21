@@ -6,6 +6,10 @@ use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/tasks');
 
+Route::get('/health-ui', function () {
+    return response('ok', 200)->header('Content-Type', 'text/plain');
+});
+
 Route::get('/login', [AuthController::class, 'show'])->name('login');
 Route::post('/login', [AuthController::class, 'store'])->middleware('throttle:6,1');
 Route::post('/logout', [AuthController::class, 'destroy'])->name('logout');
