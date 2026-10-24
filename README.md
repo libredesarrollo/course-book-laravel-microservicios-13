@@ -179,6 +179,7 @@ en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
 ```bash
 cd user-service && vendor/bin/pest --compact   # 34 tests, 119 asserts
 cd task-service && vendor/bin/pest --compact   # 60 tests, 142 asserts
+cd billing-service && vendor/bin/pest --compact # 7 tests, 28 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
@@ -191,6 +192,9 @@ user-service (resolución de token válido, token inválido, error del peer, ser
 revocación, propagación del `X-Request-Id` y el binding del contrato) y sobre el middleware
 empaquetado (alias registrado, `401` en API, redirect en web, sesión descartada con token
 inválido) y el ciclo de vida de `TokenSession` (login, logout y logout con el peer caído).
+
+`billing-service` también tiene pruebas web: login, acceso a `/facturas` protegido con el
+mismo paquete, y revocación de sesión (`billing-service/tests/Feature/InvoiceWebTest.php`).
 
 ---
 

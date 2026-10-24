@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>¿Por qué empaquetar y cómo usar los módulos?</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #111827;
+            --text: #e5e7eb;
+            --muted: #9ca3af;
+            --accent: #38bdf8;
+            --accent2: #22c55e;
+            --border: #1f2937;
+            --code: #0b1020;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+            background: radial-gradient(1200px 800px at 20% -10%, #1e293b 0%, var(--bg) 40%);
+            color: var(--text);
+            line-height: 1.7;
+        }
+        header {
+            padding: 48px 24px 24px;
+            text-align: center;
+        }
+        header h1 {
+            margin: 0;
+            font-size: clamp(28px, 4vw, 56px);
+            letter-spacing: -0.02em;
+        }
+        header p {
+            margin: 12px auto 0;
+            max-width: 880px;
+            color: var(--muted);
+            font-size: clamp(16px, 1.6vw, 20px);
+        }
+        nav {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 12px;
+            padding: 12px 24px 0;
+        }
+        nav a {
+            text-decoration: none;
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 8px 14px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+        }
+        nav a:hover { border-color: rgba(56, 189, 248, 0.8); }
+        main {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 32px 24px 80px;
+            display: grid;
+            gap: 24px;
+        }
+        section {
+            border: 1px solid var(--border);
+            background: radial-gradient(600px 200px at 10% -20%, rgba(56, 189, 248, 0.08), transparent), var(--card);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 40px 80px -60px rgba(56, 189, 248, 0.6);
+        }
+        .section-header {
+            padding: 28px 32px 0;
+        }
+        .section-header h2 {
+            margin: 0;
+            font-size: clamp(22px, 2.6vw, 34px);
+            letter-spacing: -0.01em;
+        }
+        .section-header p {
+            margin: 10px 0 0;
+            color: var(--muted);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            padding: 22px 32px 32px;
+        }
+        .card {
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 18px 20px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.01), transparent);
+        }
+        .card h3 { margin: 0 0 8px; font-size: 18px; }
+        .card p { margin: 0; color: var(--muted); }
+        .split {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 18px;
+            padding: 22px 32px 32px;
+        }
+        pre {
+            margin: 0;
+            border: 1px solid var(--border);
+            background: var(--code);
+            border-radius: 12px;
+            padding: 18px 22px;
+            overflow-x: auto;
+            font-size: 14px;
+            line-height: 1.8;
+        }
+        code {
+            font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+        .list {
+            display: grid;
+            gap: 12px;
+            padding: 22px 32px 32px;
+        }
+        .list-item {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 16px;
+            align-items: start;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 20px;
+        }
+        .dot {
+            margin-top: 10px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: radial-gradient(circle, var(--accent), transparent 70%);
+            box-shadow: 0 0 0 6px rgba(56, 189, 248, 0.08);
+        }
+        .list-item h3 { margin: 0 0 6px; }
+        .list-item p { margin: 0; color: var(--muted); }
+        footer { text-align: center; padding: 0 24px 60px; color: var(--muted); }
+        .tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            font-size: 13px;
+            color: var(--muted);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <span class="tag">Módulos Composer · Frontera entre microservicios</span>
+        <h1>¿Por qué empaquetar y cómo lo usamos?</h1>
+        <p>
+            La idea: <strong>no duplicar código</strong>, sino <strong>empaquetar la frontera</strong>.
+            En lugar de copiar clientes HTTP, middlewares, identidades o health checks, los movimos a paquetes Composer locales
+            para que cualquier microservicio los consuma sin escribir código de integración.
+        </p>
+    </header>
+    <nav>
+        <a href="#porque">¿Por qué?</a>
+        <a href="#paquetes">Paquetes creados</a>
+        <a href="#como">¿Cómo lo usamos?</a>
+        <a href="#prueba">Prueba: billing-service</a>
+        <a href="#reglas">Reglas de diseño</a>
+        <a href="#verificacion">Verificación</a>
+    </nav>
+    <main>
+        <section id="porque">
+            <div class="section-header">
+                <h2>¿Por qué empaquetar?</h2>
+                <p>Evitar duplicación, mantener contrato único y desacoplar responsabilidades.</p>
+            </div>
+            <div class="grid">
+                <article class="card">
+                    <h3>Una sola fuente de verdad</h3>
+                    <p>El cliente HTTP, el middleware que autentica, la identidad y el ciclo de vida de sesión viven en un solo sitio. Si cambia el contrato con user-service, solo se toca el paquete.</p>
+                </article>
+                <article class="card">
+                    <h3>Frontera completa</h3>
+                    <p>No solo cómo llamar, sino cómo integrar. El paquete trae el middleware, el value object de identidad y el helper de sesión para que la app solo decida rutas, vistas y redirecciones.</p>
+                </article>
+                <article class="card">
+                    <h3>Sin acoplamiento a implementación</h3>
+                    <p>Los consumidores inyectan el contrato IdentityProvider, no la clase UserServiceClient. Se puede cambiar el transporte sin tocar controllers.</p>
+                </article>
+                <article class="card">
+                    <h3>Consistencia transversal</h3>
+                    <p>request.id, log.context y health se comportan igual en todos los microservicios. El paquete ofrece los bloques, la app decide dónde los monta.</p>
+                </article>
+            </div>
+        </section>
+
+        <section id="paquetes">
+            <div class="section-header">
+                <h2>Paquetes que usamos</h2>
+                <p>Dos paquetes locales, instalados con type: path.</p>
+            </div>
+            <div class="split">
+                <div>
+                    <h3 style="margin:0 0 12px;">demo/microservices-user-service-client</h3>
+                    <div class="list">
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>IdentityProvider + UserServiceClient</h3>
+                                <p>Contrato HTTP hacia user-service. authenticate() devuelve null si el token es inválido (401).</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>AuthenticateWithUserService</h3>
+                                <p>Middleware registrado como alias auth.user-service. Valida por HTTP, limpia sesión si es inválida y deja la identidad en atributos.</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>AuthenticatedUser + TokenSession</h3>
+                                <p>Identidad tipada (fromRequest()) y ciclo de vida de sesión web respaldada por token remoto (emisión + revocación con mejor esfuerzo).</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <h3 style="margin:0 0 12px;">demo/microservices-observability</h3>
+                    <div class="list">
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>EnsureRequestId</h3>
+                                <p>Genera/respeta X-Request-Id, lo guarda en atributos y lo devuelve en la respuesta.</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>AttachLogContext</h3>
+                                <p>Añade request_id, service, ip, method, path al contexto de logs.</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>HealthController</h3>
+                                <p>Respuesta JSON idéntica en todos los servicios. La ruta la decide la app.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="como">
+            <div class="section-header">
+                <h2>¿Cómo lo usamos?</h2>
+                <p>Cuatro pasos: instalar, configurar, enganchar y proteger.</p>
+            </div>
+            <div class="split">
+                <div>
+                    <h3 style="margin:0 0 12px;">1) composer.json</h3>
+                    <pre><code>{
+  "repositories": [
+    { "type": "path", "url": "../packages/microservices-observability" },
+    { "type": "path", "url": "../packages/microservices-user-service-client" }
+  ],
+  "require": {
+    "demo/microservices-observability": "@dev",
+    "demo/microservices-user-service-client": "@dev"
+  }
+}</code></pre>
+                </div>
+                <div>
+                    <h3 style="margin:0 0 12px;">2) .env</h3>
+                    <pre><code>APP_NAME="Billing Service"
+USER_SERVICE_URL=http://127.0.0.1:8000
+USER_SERVICE_TIMEOUT=3
+# Para API pura: dejar vacío para siempre responder 401 JSON
+USER_SERVICE_LOGIN_ROUTE=</code></pre>
+                </div>
+                <div>
+                    <h3 style="margin:0 0 12px;">3) bootstrap/app.php</h3>
+                    <pre><code>use Illuminate\Foundation\Configuration\Middleware;
+
+->withRouting(
+    web: __DIR__.'/../routes/web.php',
+    api: __DIR__.'/../routes/api.php',
+    health: '/up',
+)
+->withMiddleware(function (Middleware $middleware): void {
+    $middleware->appendToGroup('api', 'request.id');
+    $middleware->appendToGroup('api', 'log.context');
+})</code></pre>
+                </div>
+                <div>
+                    <h3 style="margin:0 0 12px;">4) rutas + controller</h3>
+                    <pre><code>use Demo\Microservices\Observability\Http\Controllers\HealthController;
+use Demo\Microservices\UserServiceClient\AuthenticatedUser;
+
+Route::get('/health', [HealthController::class, 'index']);
+
+Route::middleware('auth.user-service')->group(function () {
+    Route::get('/invoices', [InvoiceController::class, 'index']);
+});
+
+// En el controller
+$user = AuthenticatedUser::fromRequest($request);
+// ... usar $user->id, $user->name, $user->email</code></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="prueba">
+            <div class="section-header">
+                <h2>Prueba real: billing-service</h2>
+                <p>Nuevo microservicio creado desde cero, sin escribir cliente HTTP.</p>
+            </div>
+            <div class="split">
+                <div>
+                    <h3 style="margin:0 0 12px;">Flujo</h3>
+                    <div class="list">
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>Sin token</h3>
+                                <p>GET /api/invoices → 401 con mensaje claro</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>Token falso</h3>
+                                <p>El middleware pregunta al user-service, recibe null → 401</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>Token válido</h3>
+                                <p>Se emite en user-service, el billing-service lo valida por HTTP, deja la identidad y responde con datos del usuario + facturas.</p>
+                            </div>
+                        </div>
+                        <div class="list-item">
+                            <span class="dot"></span>
+                            <div>
+                                <h3>Trazabilidad</h3>
+                                <p>Se propaga X-Request-Id y aparece en los logs de ambos servicios.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <h3 style="margin:0 0 12px;">Respuesta real</h3>
+                    <pre><code>curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8002/api/invoices
+
+{
+  "user": {
+    "id": 1,
+    "name": "Ana Torres",
+    "email": "ana.torres@example.com"
+  },
+  "invoices": [
+    {"id": 1, "amount": 99.99, "status": "paid"},
+    {"id": 2, "amount": 49.5, "status": "pending"}
+  ]
+}</code></pre>
+                    <p style="color: var(--muted); margin: 14px 0 0;">
+                        <strong>Hecho:</strong> Nuevo microservicio, <strong>cero líneas</strong> de cliente HTTP escritas. Solo rutas, configuración y uso del paquete.
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <section id="reglas">
+            <div class="section-header">
+                <h2>Reglas de diseño que seguimos</h2>
+                <p>Lo que sí empaquetamos vs lo que no.</p>
+            </div>
+            <div class="grid">
+                <article class="card">
+                    <h3>Sí va al paquete</h3>
+                    <p>Lo idéntico entre servicios: observabilidad, cliente HTTP, middleware que valida, identidad, sesión con token remoto, health check.</p>
+                </article>
+                <article class="card">
+                    <h3>No va al paquete</h3>
+                    <p>Lo específico: vistas, redirecciones, validaciones, reglas de negocio, lógica de emitir tokens (solo existe en user-service).</p>
+                </article>
+                <article class="card">
+                    <h3>La app decide, el paquete ofrece</h3>
+                    <p>Aliases se registran solo si no existen. Rutas, grupos de middleware y login_route los decide la aplicación.</p>
+                </article>
+                <article class="card">
+                    <h3>Contratos primero</h3>
+                    <p>Inyectar IdentityProvider, no implementación. 401 → null, errores de red/infra → excepciones con semántica distinta.</p>
+                </article>
+            </div>
+        </section>
+
+        <section id="verificacion">
+            <div class="section-header">
+                <h2>Verificación</h2>
+                <p>Todo validado.</p>
+            </div>
+            <div class="grid">
+                <article class="card">
+                    <h3>Tests</h3>
+                    <p>user-service: 34 tests / 119 asserts · task-service: 60 tests / 142 asserts. Todo en verde.</p>
+                </article>
+                <article class="card">
+                    <h3>Calidad</h3>
+                    <p>Pint en servicios y en packages/ (ahora sí se formatea). HTML de docs válido, sin estilos inline, sin recursos externos, sin CJK.</p>
+                </article>
+                <article class="card">
+                    <h3>E2E</h3>
+                    <p>Health idéntico, login web, logout con revocación en peer, API sin token 401, y trazabilidad X-Request-Id cruzada.</p>
+                </article>
+                <article class="card">
+                    <h3>Propuesta 3</h3>
+                    <p>billing-service funciona: consume el paquete sin escribir cliente HTTP. Autentica, identifica y responde con datos del usuario validado.</p>
+                </article>
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>Demo microservicios · Paquetes Composer locales</p>
+    </footer>
+</body>
+</html>
