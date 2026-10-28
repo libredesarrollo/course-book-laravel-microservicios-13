@@ -47,6 +47,18 @@ class TokenSession
     }
 
     /**
+     * Guarda un token ya emitido por el IdP en la sesión.
+     *
+     * Úsalo en el hand-off SSO: el token llega del user-service tras
+     * intercambiar el código, no se pide con credenciales.
+     */
+    public function loginWithToken(Request $request, string $token): void
+    {
+        $request->session()->regenerate();
+        $request->session()->put(self::SESSION_KEY, $token);
+    }
+
+    /**
      * Revoca el token en el user-service y destruye la sesión local.
      *
      * Revocar en el peer es lo que lo hace inutilizable de verdad: si solo

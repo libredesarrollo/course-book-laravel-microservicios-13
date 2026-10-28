@@ -86,6 +86,63 @@ class UserServiceClient implements IdentityProvider
     }
 
     /**
+     * Intercambia un código SSO de un solo uso por un token para el cliente.
+     *
+     * @return array{token: string, token_type: string, expires_at: string, user: array{id: int, name: string, email: string, created_at: string|null, updated_at: string|null}}|null
+     *
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
+     */
+    public function exchangeCode(string $code): ?array
+    {
+        $response = $this->post('/api/sso/exchange', ['code' => $code]);
+
+        if ($response->status() === 400 || $response->status() === 404 || $response->status() === 422) {
+            return null;
+        }
+
+        if ($response->failed()) {
+            throw new UserServiceErrorException(
+                "El user-service rechazó el intercambio SSO ({$response->status()})."
+            );
+        }
+
+        $json = $response->json();
+
+        return is_array($json) ? $json : null;
+    }
+
+    /**
+     * Pide un ticket SSO al IdP usando el token del usuario.
+     *
+     * @return array{code: string, expires_in: int}|null
+     *
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
+     */
+    public function authorizeSso(string $token, string $client, string $redirect): ?array
+    {
+        $response = $this->post('/api/sso/authorize', [
+            'client' => $client,
+            'redirect' => $redirect,
+        ], ['Authorization' => "Bearer {$token}"]);
+
+        if ($response->status() === 401 || $response->status() === 422) {
+            return null;
+        }
+
+        if ($response->failed()) {
+            throw new UserServiceErrorException(
+                "El user-service rechazó la autorización SSO ({$response->status()})."
+            );
+        }
+
+        $json = $response->json();
+
+        return is_array($json) ? $json : null;
+    }
+
+    /**
      * Ejecuta la petición HTTP con la política de timeout compartida.
      *
      * @param  array<string, string>  $headers

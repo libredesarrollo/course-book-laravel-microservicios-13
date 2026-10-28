@@ -43,4 +43,24 @@ interface IdentityProvider
      * @throws UserServiceErrorException
      */
     public function revokeToken(string $token): void;
+
+    /**
+     * Intercambia un código SSO de un solo uso por un token para el cliente.
+     *
+     * @return array{token: string, token_type: string, expires_at: string, user: array{id: int, name: string, email: string, created_at: string|null, updated_at: string|null}}|null
+     *
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
+     */
+    public function exchangeCode(string $code): ?array;
+
+    /**
+     * Pide un ticket SSO al IdP usando el token del usuario.
+     *
+     * @return array{code: string, expires_in: int}|null
+     *
+     * @throws UserServiceUnavailableException
+     * @throws UserServiceErrorException
+     */
+    public function authorizeSso(string $token, string $client, string $redirect): ?array;
 }

@@ -86,7 +86,7 @@
     <h1>Task Service</h1>
     <nav style="display:flex; align-items:center; gap:14px; margin-left:18px;">
         <a href="{{ route('tasks.index') }}">Mis tareas</a>
-        <a href="{{ env('BILLING_SERVICE_URL', 'http://127.0.0.1:8002') }}/facturas">Facturas</a>
+        <a href="{{ route('sso.bridge') }}">Facturas</a>
     </nav>
     <div class="right" style="margin-left:auto;">
         @if ($currentUser)

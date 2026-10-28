@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\SsoController;
 use Demo\Microservices\Observability\Http\Controllers\HealthController;
 use Illuminate\Support\Facades\Route;
 

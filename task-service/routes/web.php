@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\SsoBridgeController;
 use App\Http\Controllers\TaskController;
 use Illuminate\Support\Facades\Route;
 
@@ -15,5 +16,6 @@ Route::post('/login', [AuthController::class, 'store'])->middleware('throttle:6,
 Route::post('/logout', [AuthController::class, 'destroy'])->name('logout');
 
 Route::middleware('auth.user-service')->group(function () {
+    Route::get('/sso/bridge', [SsoBridgeController::class, 'bridge'])->name('sso.bridge');
     Route::resource('tasks', TaskController::class);
 });
