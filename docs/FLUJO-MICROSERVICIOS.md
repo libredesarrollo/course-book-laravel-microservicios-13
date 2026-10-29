@@ -1,5 +1,11 @@
 # Sistema de Tareas Inteligente — Cómo funciona
 
+> **Nota de estado:** este documento describe la arquitectura de **dos servicios**
+> previa al SSO. El estado actual añade `billing-service` y convierte a
+> `user-service` en IdP con login central y single logout. La referencia vigente
+> está en [`SSO-HANDOFF-IDP.md`](SSO-HANDOFF-IDP.md) y
+> [`docs/08-que-se-hizo-sso.html`](docs/08-que-se-hizo-sso.html).
+
 Demostración de **microservicios reales** con comunicación **síncrona por HTTP** entre dos
 proyectos Laravel 13 independientes, cada uno con su propia base de datos, y **autenticados**
 por tokens opacos que el task-service valida consultando al user-service en cada request.

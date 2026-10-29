@@ -279,8 +279,9 @@
                     <pre><code>APP_NAME="Billing Service"
 USER_SERVICE_URL=http://127.0.0.1:8000
 USER_SERVICE_TIMEOUT=3
+USER_SERVICE_CLIENT=billing
 # Para API pura: dejar vacío para siempre responder 401 JSON
-USER_SERVICE_LOGIN_ROUTE=</code></pre>
+USER_SERVICE_SSO_START_ROUTE=</code></pre>
                 </div>
                 <div>
                     <h3 style="margin:0 0 12px;">3) bootstrap/app.php</h3>
@@ -391,7 +392,7 @@ $user = AuthenticatedUser::fromRequest($request);
                 </article>
                 <article class="card">
                     <h3>La app decide, el paquete ofrece</h3>
-                    <p>Aliases se registran solo si no existen. Rutas, grupos de middleware y login_route los decide la aplicación.</p>
+                    <p>Aliases se registran solo si no existen. Rutas, grupos de middleware y sso_start_route los decide la aplicación.</p>
                 </article>
                 <article class="card">
                     <h3>Contratos primero</h3>

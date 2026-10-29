@@ -1,7 +1,13 @@
 <?php
 
-test('the application returns a successful response', function () {
-    $response = $this->get('/');
+use App\Models\User;
 
-    $response->assertStatus(200);
+it('sends anonymous visitors to the login page', function () {
+    $this->get('/')->assertRedirect(route('login'));
+});
+
+it('shows the home page to a signed-in user', function () {
+    $this->actingAs(User::factory()->create())
+        ->get('/')
+        ->assertOk();
 });

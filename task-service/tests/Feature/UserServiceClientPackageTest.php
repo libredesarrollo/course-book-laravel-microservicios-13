@@ -156,10 +156,10 @@ it('leaves the identity of the caller in the request attributes', function () {
         ->and($user->email)->toBe('luis@example.com');
 });
 
-it('sends a web visitor to the login page instead of answering a json', function () {
+it('sends a web visitor to the sso start route instead of answering a json', function () {
     Http::fake();
 
-    $this->get('/tasks')->assertRedirect(route('login'));
+    $this->get('/tasks')->assertRedirect(route('sso.start'));
 
     Http::assertNothingSent();
 });
@@ -169,34 +169,58 @@ it('drops the web session when the token is no longer valid upstream', function 
 
     $this->withSession([TokenSession::SESSION_KEY => 'token-caducado'])
         ->get('/tasks')
-        ->assertRedirect(route('login'))
+        ->assertRedirect(route('sso.start'))
         ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
+
+/*
+|--------------------------------------------------------------------------
+| Canje del código SSO
+|--------------------------------------------------------------------------
+*/
+
+it('exchanges an sso code for a token', function () {
+    Http::fake(['*/api/sso/exchange' => Http::response(ssoExchangePayload('token-emitido'), 201)]);
+
+    $result = app(UserServiceClient::class)->exchangeCode('codigo-ss0', 'task');
+
+    expect($result['token'])->toBe('token-emitido');
+
+    Http::assertSent(fn (Request $request) => $request->url() === config('user-service-client.url').'/api/sso/exchange'
+        && $request['code'] === 'codigo-ss0'
+        && $request['client'] === 'task'
+    );
+});
+
+it('returns null when the sso code is rejected', function (int $status) {
+    Http::fake(['*/api/sso/exchange' => Http::response(['error' => 'Código inválido'], $status)]);
+
+    expect(app(UserServiceClient::class)->exchangeCode('codigo-malo', 'task'))->toBeNull();
+})->with([400, 401, 404, 422]);
+
+it('throws an error exception when the sso exchange fails upstream', function () {
+    Http::fake(['*/api/sso/exchange' => Http::response(['error' => 'boom'], 500)]);
+
+    app(UserServiceClient::class)->exchangeCode('codigo-ss0', 'task');
+})->throws(UserServiceErrorException::class);
 
 /*
 |--------------------------------------------------------------------------
 | La sesión con token remoto
 |--------------------------------------------------------------------------
 |
-| TokenSession encapsula el ciclo de vida de la sesión web: emitir el token,
-| regenerar el identificador de sesión y revocarlo al cerrar sesión.
+| TokenSession encapsula el ciclo de vida de la sesión web: guardar el token
+| que emitió el IdP, regenerar el identificador de sesión y revocarlo al
+| cerrar sesión.
 |
 */
 
-it('stores the issued token in the session when logging in', function () {
-    Http::fake(['*/api/tokens' => Http::response(['token' => 'token-emitido'], 201)]);
-
+it('stores the issued token in the session', function () {
     $request = requestWithSession();
 
-    app(TokenSession::class)->login(
-        $request,
-        ['email' => 'ana@example.com', 'password' => 'secreto'],
-        'task-service-web'
-    );
+    app(TokenSession::class)->loginWithToken($request, 'token-emitido');
 
     expect($request->session()->get(TokenSession::SESSION_KEY))->toBe('token-emitido');
-
-    Http::assertSent(fn (Request $request) => $request['device_name'] === 'task-service-web');
 });
 
 it('revokes the token on the user-service when logging out', function () {

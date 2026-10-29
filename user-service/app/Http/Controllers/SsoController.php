@@ -4,76 +4,62 @@ namespace App\Http\Controllers;
 
 use App\Models\ApiToken;
 use App\Models\SsoTicket;
-use App\Models\User;
+use App\Services\SsoTicketIssuer;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
+use Illuminate\View\View;
 
 class SsoController extends Controller
 {
-    public function authorize(Request $request): JsonResponse
+    public function authorize(Request $request, SsoTicketIssuer $issuer): RedirectResponse|View
     {
-        $validated = $request->validate([
-            'client' => ['required', 'string', 'max:50'],
-            'redirect' => ['nullable', 'string', 'max:500'],
-        ]);
-
-        /** @var User $user */
-        $user = $request->attributes->get('user');
-        /** @var ApiToken $token */
-        $token = $request->attributes->get('api_token');
-
-        if (! $token || $token->isExpired()) {
-            return response()->json(['error' => 'Unauthenticated.'], 401);
+        if (! Auth::check()) {
+            return redirect()->route('login', $request->only(['client', 'redirect_uri']));
         }
 
-        $plainCode = Str::random(64);
-        $codeHash = hash('sha256', $plainCode);
+        $validated = $request->validate([
+            'client' => ['required', 'string'],
+            'redirect_uri' => ['required', 'string'],
+        ]);
 
-        SsoTicket::create([
-            'code_hash' => $codeHash,
+        $user = $request->user();
+        $code = $issuer->issue($user, $validated['client'], $validated['redirect_uri']);
+
+        $separator = str_contains($validated['redirect_uri'], '?') ? '&' : '?';
+
+        Log::info('idp.sso.authorized', [
             'user_id' => $user->id,
-            'token_id' => $token->id,
             'client' => $validated['client'],
-            'expires_at' => now()->addSeconds(60),
+            'request_id' => $request->attributes->get('request_id'),
         ]);
 
-        Log::info('SSO ticket issued', [
-            'user_id' => $user->id,
-            'client' => $validated['client'],
-        ]);
-
-        return response()->json([
-            'code' => $plainCode,
-            'expires_in' => 60,
-        ]);
+        return redirect()->away($validated['redirect_uri'].$separator.'code='.urlencode($code));
     }
 
     public function exchange(Request $request): JsonResponse
     {
         $validated = $request->validate([
             'code' => ['required', 'string'],
+            'client' => ['required', 'string'],
         ]);
 
-        $codeHash = hash('sha256', $validated['code']);
-        $ticket = SsoTicket::query()->where('code_hash', $codeHash)->first();
+        $ticket = SsoTicket::query()
+            ->with('user')
+            ->where('code_hash', hash('sha256', $validated['code']))
+            ->first();
 
         if (! $ticket || ! $ticket->isValid()) {
-            return response()->json(['error' => 'Invalid or expired code.'], 400);
+            return response()->json(['error' => 'Invalid or expired SSO code.'], 400);
         }
 
-        $tokenModel = $ticket->token;
-
-        if (! $tokenModel || $tokenModel->isExpired()) {
-            $ticket->forceFill(['used_at' => now()])->save();
-
-            return response()->json(['error' => 'Invalid or expired code.'], 400);
+        if ($ticket->client !== $validated['client']) {
+            return response()->json(['error' => 'Invalid SSO code client.'], 400);
         }
 
-        $ticket->forceFill(['used_at' => now()])->save();
-
-        $deviceName = $ticket->client === 'billing' ? 'billing-sso' : $ticket->client.'-sso';
+        $deviceName = $ticket->client.'-sso';
 
         $issued = ApiToken::issueFor(
             $ticket->user,
@@ -81,10 +67,13 @@ class SsoController extends Controller
             now()->addMinutes((int) config('tokens.ttl_minutes')),
         );
 
-        Log::info('SSO token exchanged', [
+        $ticket->update(['used_at' => now()]);
+
+        Log::info('idp.sso.exchanged', [
             'user_id' => $ticket->user_id,
             'client' => $ticket->client,
             'token_id' => $issued['model']->id,
+            'request_id' => $request->attributes->get('request_id'),
         ]);
 
         return response()->json([

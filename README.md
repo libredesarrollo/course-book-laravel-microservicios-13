@@ -1,37 +1,48 @@
 # Sistema de Tareas Inteligente
 
-**Dos microservicios Laravel independientes hablando por HTTP síncrono, con autenticación
-delegada.** El ejemplo más pequeño que demuestra dos principios reales: cuando los servicios son
+**Tres microservicios Laravel independientes con `user-service` como Identity Provider (IdP)
+central.** El ejemplo más pequeño que demuestra tres principios reales: cuando los servicios son
 independientes, la única forma de validar un dato que "pertenece" al otro es preguntárselo por la
-red; y cuando no tienes usuarios, la única forma de saber quién llama es preguntárselo también.
+red; cuando no tienes usuarios, la única forma de saber quién llama es preguntárselo también; y
+cuando varios servicios comparten identidad, el login vive en **uno solo** y los demás son
+relying parties.
 
 ```
-┌─────────────┐     ┌────────────────────────────────┐     ┌──────────────────────────┐
-│             │     │                                │     │                          │
-│  Cliente    │────▶│  task-service   :8001          │────▶│  user-service  :8000    │
-│  curl /     │     │  db_tasks.sqlite               │ GET │  db_users.sqlite         │
-│  Postman/UI │◀────│  API REST + UI web             │◀────│  /api/tokens  /api/user  │
-│             │201  │  NO tiene tabla users          │200  │  (identidad)  headless   │
-└─────────────┘     └────────────────────────────────┘     └──────────────────────────┘
+┌─────────────┐     ┌────────────────────────────┐     ┌──────────────────────────┐
+│             │     │  task-service   :8001      │     │  user-service  :8000     │
+│  Navegador  │────▶│  db_tasks.sqlite           │────▶│  db_users.sqlite         │
+│  curl /     │◀────│  API REST + UI web         │◀────│  IdP: /login /authorize  │
+│  Postman    │     │  NO tiene tabla users      │     │  /api/tokens /api/user   │
+│             │     └────────────────────────────┘     │  /api/sso/exchange       │
+│             │     ┌────────────────────────────┐     └──────────────────────────┘
+│             │────▶│  billing-service :8002     │────▶        ▲
+│             │◀────│  db_billing.sqlite         │◀────        │
+└─────────────┘     │  API REST + UI web         │  SSO redirect + backchannel
+                    │  NO tiene tabla users      │
+                    └────────────────────────────┘
 ```
 
-Para saber quién llama, el task-service **no tiene usuarios**: le reenvía el token al
-user-service por HTTP y pregunta. Si ese servicio responde `200`, sigue; si dice `401`, el token
-no vale; si está caído, devuelve `503` y **nadie puede autenticarse**.
+Para saber quién llama, `task-service` y `billing-service` **no tienen usuarios**: le reenvían el
+token al `user-service` por HTTP y preguntan. Si responde `200`, siguen; si dice `401`, el token no
+vale; si está caído, devuelven `503`. Para iniciar sesión, el navegador va **siempre** al IdP: si
+ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por su propio token.
 
 ---
 
 ## Qué demuestra
 
-- ✅ Aislamiento real de datos: **dos bases de datos, cero FKs cruzadas**
+- ✅ Aislamiento real de datos: **tres bases de datos, cero FKs cruzadas**
 - ✅ Comunicación **síncrona por HTTP** en cada request (`UserServiceClient`)
 - ✅ **Tokens opacos** con SHA-256: revocables de inmediato, sin JWT
-- ✅ Un **middleware** que autentica contra el otro servicio (`AuthenticateWithUserService`)
+- ✅ Un **middleware** que autentica contra el IdP (`AuthenticateWithUserService`)
+- ✅ **Login único**: solo `user-service` tiene formulario, credenciales y tabla `users`
+- ✅ **SSO por código de un solo uso** entre RPs, con whitelist de `redirect_uri`
+- ✅ **Single logout**: cada RP delega el cierre en la sesión central del IdP
 - ✅ **Autorización por propiedad**: solo ves y tocas tus propias tareas
 - ✅ **Errores tipados** (`UserServiceUnavailableException` / `UserServiceErrorException`) renderizados en un solo lugar
 - ✅ **CRUD completo**: API REST + interfaz web Blade, ambos con el mismo cliente
 - ✅ **Degradación controlada**: si el user-service cae, la UI lo explica en vez de romperse
-- ✅ 50 tests / 126 asserts, sin levantar el otro servicio (`Http::fake()`)
+- ✅ 129 tests / 341 asserts, sin levantar los otros servicios (`Http::fake()`)
 
 ## Requisitos
 
@@ -58,9 +69,18 @@ composer install && cp .env.example .env && php artisan key:generate
 touch database/db_tasks.sqlite
 php artisan migrate:fresh --seed
 php artisan serve --port=8001
+
+# --- billing-service (en otra terminal) ---
+cd billing-service
+composer install && cp .env.example .env && php artisan key:generate
+touch database/db_billing.sqlite
+php artisan migrate:fresh --seed
+php artisan serve --port=8002
 ```
 
-Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
+Abre **<http://127.0.0.1:8001/tasks>** (o `/facturas` en el 8002) → te llevará al login del IdP
+en **<http://127.0.0.1:8000/login>**. Tras autenticarte, la sesión SSO se reutiliza en el otro
+servicio: el segundo no vuelve a pedir contraseña.
 
 | Email | Contraseña |
 |---|---|
@@ -76,32 +96,39 @@ Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
 
 ---
 
-## Los dos servicios
+## Los tres servicios
 
-| | user-service | task-service |
-|---|---|---|
-| Puerto | `http://127.0.0.1:8000` | `http://127.0.0.1:8001` |
-| Base de datos | `database/db_users.sqlite` | `database/db_tasks.sqlite` |
-| Tablas | `users`, `api_tokens` | `tasks`, `cache`, `jobs` |
-| Rol | Identidad: emite y valida tokens | Tareas del usuario autenticado |
-| ¿Conoce usuarios? | **Sí**, es el dueño | **No** — solo guarda el `user_id` |
-| Interfaz | Ninguna (headless) | API REST **+ UI web** |
-| Health check | `GET /health` · `GET /api/health` | `GET /api/health` · `GET /health-ui` |
-| Tests | 33 (114 asserts) | 50 (114 asserts) |
+| | user-service | task-service | billing-service |
+|---|---|---|---|
+| Puerto | `:8000` | `:8001` | `:8002` |
+| Base de datos | `db_users.sqlite` | `db_tasks.sqlite` | `db_billing.sqlite` |
+| Tablas | `users`, `api_tokens`, `sso_tickets` | `tasks`, `cache`, `jobs` | `invoices`, `cache`, `jobs` |
+| Rol | **IdP**: login, SSO, emite y valida tokens | Tareas del usuario autenticado | Facturas del usuario autenticado |
+| ¿Conoce usuarios? | **Sí**, es el dueño | **No** — solo guarda el `user_id` | **No** — solo usa la identidad |
+| Interfaz | Login + `/authorize` + API | API REST **+ UI web** | API REST **+ UI web** |
+| Health check | `GET /health` | `GET /api/health` · `GET /health-ui` | `GET /api/health` · `GET /health-ui` |
 
 ---
 
 ## API
 
-### user-service — identidad
+### user-service — identidad (IdP)
 
 | Método | Ruta | Body / Header | Respuesta |
 |---|---|---|---|
+| `GET` | `/login` | — | Formulario (único del sistema) |
+| `POST` | `/login` | `{email, password, client?, redirect_uri?}` | `302` al RP con `?code=...` |
+| `GET` | `/authorize` | `?client=&redirect_uri=` | `302` al RP con `?code=...` (o al login) |
+| `GET`/`POST` | `/logout` | `?redirect_uri=` | Cierra la sesión SSO y vuelve al RP |
+| `POST` | `/api/sso/exchange` | `{code, client}` | `201` + `{token, token_type, expires_at, user}` · `400` |
 | `POST` | `/api/tokens` | `{email, password, device_name?}` | `201` + `{token, token_type, expires_at, user}` |
 | `GET` | `/api/user` | `Authorization: Bearer <token>` | `200` `{id, name, email}` · `401` |
 | `DELETE` | `/api/tokens` | `Authorization: Bearer <token>` | `204` revoca el token |
 | `GET` | `/api/users` | — | Lista paginada (abierto) |
 | `GET` | `/api/users/{id}` | — | `200` · `404` (abierto) |
+
+`POST /api/tokens` se mantiene para clientes que **no son navegador** (CLI, Postman, apps
+móviles). El flujo web usa el código SSO.
 
 ### task-service — tareas (todas requieren token)
 
@@ -112,7 +139,14 @@ Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
 | `GET` | `/api/tasks/{id}` | `/tasks/{id}` |
 | `PUT` | `/api/tasks/{id}` | `/tasks/{id}/edit` |
 | `DELETE` | `/api/tasks/{id}` | `/tasks/{id}` |
-| — | — | `/login` · `POST /login` · `POST /logout` |
+| — | — | `/sso/start` · `/sso/callback` · `POST /logout` |
+
+### billing-service — facturas
+
+| Método | API | UI web |
+|---|---|---|
+| `GET` | `/api/invoices` | `/facturas` |
+| — | — | `/sso/start` · `/sso/callback` · `POST /logout` |
 
 ### Matriz de respuestas
 
@@ -120,7 +154,7 @@ Abre **<http://127.0.0.1:8001/tasks>** → te llevará a `/login`.
 |---|---|---|
 | Sin token (API) | `401` | No |
 | Token inválido o revocado | `401` | No |
-| Sin sesión (web) | `302 → /login` | No |
+| Sin sesión (web) | `302 → /sso/start → /login` (IdP) | No |
 | user-service apagado | `503` | No |
 | user-service devuelve 500 | `502` | No |
 | Payload inválido | `422` | No |
@@ -177,9 +211,9 @@ en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
 ## Tests
 
 ```bash
-cd user-service && vendor/bin/pest --compact   # 34 tests, 119 asserts
-cd task-service && vendor/bin/pest --compact   # 60 tests, 142 asserts
-cd billing-service && vendor/bin/pest --compact # 7 tests, 28 asserts
+cd user-service && vendor/bin/pest --compact    # 53 tests, 166 asserts
+cd task-service && vendor/bin/pest --compact    # 67 tests, 147 asserts
+cd billing-service && vendor/bin/pest --compact # 9 tests, 28 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
@@ -193,8 +227,12 @@ revocación, propagación del `X-Request-Id` y el binding del contrato) y sobre 
 empaquetado (alias registrado, `401` en API, redirect en web, sesión descartada con token
 inválido) y el ciclo de vida de `TokenSession` (login, logout y logout con el peer caído).
 
-`billing-service` también tiene pruebas web: login, acceso a `/facturas` protegido con el
-mismo paquete, y revocación de sesión (`billing-service/tests/Feature/InvoiceWebTest.php`).
+`billing-service` también tiene pruebas web: arranque del flujo SSO, canje del código, acceso a
+`/facturas` y logout delegado al IdP (`billing-service/tests/Feature/InvoiceWebTest.php`).
+
+`user-service` cubre el flujo completo del IdP en `tests/Feature/SsoFlowTest.php`: login,
+`/authorize`, whitelist de clientes y `redirect_uri`, canje válido, código reutilizado, expirado,
+de otro cliente o inexistente, y logout.
 
 ---
 
@@ -271,19 +309,25 @@ demo-microservicios/
 │       ├── src/Exceptions/
 │       └── config/user-service-client.php
 │
-├── user-service/                     ← :8000 · db_users.sqlite
-│   ├── app/Models/ApiToken.php               ← emitir y buscar tokens
-│   ├── app/Http/Controllers/AuthController.php
-│   ├── app/Http/Middleware/AuthenticateApiToken.php
-│   ├── database/migrations/…_create_api_tokens_table.php
-│   └── tests/Feature/AuthApiTest.php
+├── user-service/                     ← :8000 · db_users.sqlite · IdP
+│   ├── app/Models/{ApiToken,SsoTicket}.php
+│   ├── app/Services/SsoTicketIssuer.php      ← valida client/redirect y emite códigos
+│   ├── app/Http/Controllers/WebLoginController.php
+│   ├── app/Http/Controllers/SsoController.php  ← authorize + exchange
+│   ├── resources/views/auth/login.blade.php    ← el único login del sistema
+│   ├── config/sso.php                          ← whitelist de clientes y TTL
+│   └── tests/Feature/{AuthApiTest,SsoFlowTest,LoginThrottleTest}.php
 │
-└── task-service/                     ← :8001 · db_tasks.sqlite
-    ├── app/Http/Controllers/AuthController.php
-    ├── app/Http/Controllers/TaskController.php        ← UI web
-    ├── app/Http/Controllers/Api/TaskController.php   ← API REST
-    ├── resources/views/{layouts,auth,tasks,errors}/
-    └── tests/Feature/{TaskApiTest,TaskUiTest,UserServiceClientPackageTest,ObservabilityPackageTest}.php
+├── task-service/                     ← :8001 · db_tasks.sqlite
+│   ├── app/Http/Controllers/TaskController.php        ← UI web
+│   ├── app/Http/Controllers/Api/TaskController.php   ← API REST
+│   ├── resources/views/{layouts,tasks,errors}/
+│   └── tests/Feature/{TaskApiTest,TaskUiTest,UserServiceClientPackageTest}.php
+│
+└── billing-service/                  ← :8002 · db_billing.sqlite
+    ├── app/Http/Controllers/InvoiceController.php
+    ├── resources/views/{layouts,invoices,errors}/
+    └── tests/Feature/InvoiceWebTest.php
 ```
 
 ### Paquetes compartidos
@@ -314,9 +358,10 @@ El paquete **no** decide en qué grupos se aplican: eso sigue en el
 `bootstrap/app.php` de cada servicio, a la vista.
 
 El paquete del cliente hace lo mismo con su middleware, bajo el alias
-`auth.user-service`. Y expone tres piezas que antes vivían en el `task-service`:
-el propio middleware, la identidad (`AuthenticatedUser`) y el ciclo de vida de la
-sesión con token remoto (`TokenSession`).
+`auth.user-service`. Y expone las piezas que antes vivían en el `task-service`:
+el propio middleware, la identidad (`AuthenticatedUser`), el ciclo de vida de la
+sesión con token remoto (`TokenSession`) y los **tres controllers del flujo SSO**
+(`SsoStartController`, `SsoCallbackController`, `SsoLogoutController`).
 
 ```php
 // bootstrap/app.php
@@ -328,27 +373,30 @@ aplicación no ha declarado otro con el mismo nombre. La línea de arriba solo e
 si quieres un nombre distinto.
 
 El `HealthController` también viene en el paquete de observabilidad, así que los
-dos servicios responden el health check exactamente igual. Lo que decide cada
+tres servicios responden el health check exactamente igual. Lo que decide cada
 aplicación es la ruta en la que lo monta.
 
 
 ## Configuración
 
-`task-service/.env`:
+`task-service/.env` y `billing-service/.env`:
 
 ```dotenv
 USER_SERVICE_URL=http://127.0.0.1:8000
 USER_SERVICE_TIMEOUT=3
-USER_SERVICE_LOGIN_ROUTE=login
+USER_SERVICE_CLIENT=task        # billing en el otro servicio
+USER_SERVICE_SSO_START_ROUTE=sso.start
+# USER_SERVICE_CALLBACK_URL=   # opcional; por defecto url('/sso/callback')
 ```
 
 Nada de URLs hardcodeadas: si el user-service cambia de host, solo tocas el `.env`.
 
-`USER_SERVICE_LOGIN_ROUTE` es la ruta a la que el middleware manda cuando el
-request viene de la web y no de la API. La pone la aplicación porque el paquete
-no puede saber cómo se llama su pantalla de login. A `null` significa "no
-redirijas nunca": el middleware responde `401` en JSON, que es lo que necesita una
-aplicación que solo expone API.
+`USER_SERVICE_CLIENT` es el identificador con el que el RP se presenta ante el IdP. El IdP lo
+valida contra la whitelist de `user-service/config/sso.php`, que también fija qué `redirect_uri`
+se acepta por cliente: sin eso, `/authorize` sería un open redirect.
+
+`USER_SERVICE_SSO_START_ROUTE` es la ruta local que arranca el flujo SSO. Si se deja vacía, el
+middleware responde `401` en JSON, que es lo que necesita una API pura.
 
 > Ojo: `php artisan serve` **no propaga variables de entorno arbitrarias** al proceso hijo. Si
 > lanzas el servicio con `USER_SERVICE_URL=... php artisan serve`, seguirá leyendo el `.env`.
@@ -367,6 +415,13 @@ aplicación que solo expone API.
   balanceador. Es el primer paso antes de desplegar.
 - **Los contadores de rate limit no distinguen usuarios.** El límite es por cuenta, no por
   persona: una cuenta compartida (familia, oficina) agota el presupuesto de todos.
+- **El single logout es central, no federado.** Al cerrar sesión, el RP redirige al `/logout`
+  del IdP; las sesiones locales de los RPs ya visitados se invalidan en su siguiente request,
+  no con un back-channel. Un OIDC real usa front/back-channel logout.
+- **La whitelist de clientes vive en configuración.** Añadir un RP exige tocar
+  `user-service/config/sso.php`; en un IdP real sería un registro de clientes en base de datos.
+- **Sin PKCE ni refresh tokens.** El código SSO es de un solo uso, caduca en 60 s y va hasheado,
+  pero el flujo está simplificado: no hay `state`, `nonce` ni verificación de code challenge.
 
 ## Y hacia dónde va
 
@@ -376,6 +431,7 @@ aplicación que solo expone API.
 | 2 | TTL de tokens (60 min, `expires_at` NOT NULL) | **Hecho** |
 | 3 | `X-Request-Id` + health checks + logs con contexto | **Hecho** |
 | 4 | Código compartido empaquetado con Composer | **Hecho** |
+| 4b | SSO con IdP central + single logout | **Hecho** |
 | 5 | Circuit breaker + reintentos con backoff | Pendiente |
 | 6 | Refresh tokens | Pendiente |
 | 7 | API versioning | Pendiente |
@@ -415,4 +471,4 @@ reales, APIs, colas, testing y despliegue, paso a paso y sin atajos:
 
 ---
 
-*user-service `:8000` · db_users.sqlite — task-service `:8001` · db_tasks.sqlite*
+*user-service `:8000` (IdP) · task-service `:8001` · billing-service `:8002`*

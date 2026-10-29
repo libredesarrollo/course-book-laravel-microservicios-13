@@ -4,11 +4,47 @@ use Demo\Microservices\UserServiceClient\TokenSession;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
-it('redirects anonymous users to login on facturas', function () {
+it('redirects anonymous users to the sso start route on facturas', function () {
     $response = $this->get('/facturas');
 
     $response->assertStatus(302);
-    $response->assertRedirect('/login');
+    $response->assertRedirect(route('sso.start'));
+});
+
+it('starts the sso flow against the user-service', function () {
+    $this->get(route('sso.start'))
+        ->assertRedirect(config('user-service-client.url').'/authorize?'.http_build_query([
+            'client' => config('user-service-client.client'),
+            'redirect_uri' => url('/sso/callback'),
+        ]));
+});
+
+it('exchanges the sso code and stores the returned token', function () {
+    Http::fake([
+        '*/api/sso/exchange' => Http::response([
+            'token' => 'tok-'.Str::random(40),
+            'token_type' => 'Bearer',
+            'expires_at' => now()->addHour()->toIso8601String(),
+            'user' => ['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'],
+        ], 201),
+    ]);
+
+    $this->get(route('sso.callback', ['code' => 'codigo-ss0']))
+        ->assertRedirect('/')
+        ->assertSessionHas(TokenSession::SESSION_KEY);
+
+    Http::assertSent(fn ($request) => $request->url() === config('user-service-client.url').'/api/sso/exchange'
+        && $request['code'] === 'codigo-ss0'
+        && $request['client'] === config('user-service-client.client')
+    );
+});
+
+it('rejects an sso code the user-service does not accept', function () {
+    Http::fake(['*/api/sso/exchange' => Http::response(['error' => 'Código inválido'], 422)]);
+
+    $this->get(route('sso.callback', ['code' => 'codigo-caducado']))
+        ->assertUnauthorized()
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
 
 it('shows invoices and user name when authenticated', function () {
@@ -28,60 +64,37 @@ it('shows invoices and user name when authenticated', function () {
         ->assertSee('Pendiente');
 });
 
-it('can log in via token session flow and reach facturas', function () {
+it('reaches facturas with an sso session', function () {
     $token = 'tok-'.Str::random(40);
 
     Http::fake([
-        '*/api/tokens' => Http::response([
+        '*/api/sso/exchange' => Http::response([
             'token' => $token,
             'token_type' => 'Bearer',
             'expires_at' => now()->addHour()->toIso8601String(),
             'user' => ['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'],
-        ], 200),
+        ], 201),
         '*/api/user' => Http::response(['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'], 200),
     ]);
 
-    $this->from('/login')
-        ->post('/login', [
-            'email' => 'ana.torres@example.com',
-            'password' => 'password',
-        ])
-        ->assertStatus(302)
-        ->assertRedirect('/facturas');
+    $this->get(route('sso.callback', ['code' => 'codigo-ss0']))->assertRedirect('/');
 
     $this->get('/facturas')
         ->assertStatus(200)
         ->assertSee('Ana Torres');
 });
 
-it('shows errors on invalid credentials', function () {
-    Http::fake([
-        '*/api/tokens' => Http::response(['message' => 'Invalid credentials'], 401),
-    ]);
-
-    $this->from('/login')
-        ->post('/login', [
-            'email' => 'ana.torres@example.com',
-            'password' => 'bad',
-        ])
-        ->assertStatus(302)
-        ->assertRedirect('/login')
-        ->assertSessionHasErrors('email');
-});
-
-it('closes session on logout', function () {
+it('closes the local session and hands the logout to the user-service', function () {
     $token = 'tok-'.Str::random(40);
     Http::fake([
-        '*/api/user' => Http::response(['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'], 200),
         '*/api/tokens' => Http::response([], 204),
     ]);
 
     $this->withSession([TokenSession::SESSION_KEY => $token])
         ->post('/logout')
         ->assertStatus(302)
-        ->assertRedirect('/login');
-
-    $this->get('/facturas')
-        ->assertStatus(302)
-        ->assertRedirect('/login');
+        ->assertRedirect(config('user-service-client.url').'/logout?'.http_build_query([
+            'redirect_uri' => url('/'),
+        ]))
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
 });

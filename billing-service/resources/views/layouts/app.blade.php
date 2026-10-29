@@ -156,7 +156,7 @@
             <div class="nav-left">
                 <div class="brand">Billing</div>
                 <div class="links">
-                    <a href="{{ env('TASK_SERVICE_URL', 'http://127.0.0.1:8001') }}/tasks">Tareas</a>
+                    <a href="{{ rtrim(config('services.task.url', env('TASK_SERVICE_URL', 'http://127.0.0.1:8001')), '/') }}/tasks">Tareas</a>
                     <a class="@if(request()->routeIs('facturas.*')) active @endif" href="{{ route('facturas.index') }}">Facturas</a>
                 </div>
             </div>
@@ -171,7 +171,7 @@
                         <button class="btn-link">Cerrar sesión</button>
                     </form>
                 @else
-                    <a href="{{ route('login') }}">Iniciar sesión</a>
+                    <a href="{{ route('sso.start') }}">Iniciar sesión</a>
                 @endif
             </div>
         </nav>

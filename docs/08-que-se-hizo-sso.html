@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>SSO con un IdP central en microservicios Laravel: qué se hizo y por qué</title>
+
+<meta name="description" content="Cómo convertir un user-service Laravel en Identity Provider central: login único, códigos de un solo uso, canje backchannel, relying parties sin tabla de usuarios y single logout.">
+<meta name="keywords" content="SSO Laravel, identity provider Laravel, microservicios autenticación centralizada, authorization code, single logout, sso tickets, relying party, oauth simplificado">
+<meta name="author" content="desarrollolibre.net">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1">
+<meta name="theme-color" content="#0969da">
+
+<meta property="og:type" content="article">
+<meta property="og:locale" content="es_ES">
+<meta property="og:site_name" content="desarrollolibre.net">
+<meta property="og:title" content="SSO con un IdP central en microservicios Laravel: qué se hizo y por qué">
+<meta property="og:description" content="Login único en el user-service, relying parties sin usuarios, códigos de un solo uso y single logout. El paso a paso de la implementación.">
+
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="SSO con un IdP central en microservicios Laravel">
+<meta name="twitter:description" content="Cómo pasar de tres logins duplicados a un Identity Provider central con relying parties puros.">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "SSO con un IdP central en microservicios Laravel: qué se hizo y por qué",
+  "description": "Cómo convertir un user-service Laravel en Identity Provider central: login único, códigos de un solo uso, canje backchannel, relying parties sin tabla de usuarios y single logout.",
+  "inLanguage": "es",
+  "datePublished": "2026-10-28",
+  "dateModified": "2026-10-28",
+  "proficiencyLevel": "Intermediate",
+  "articleSection": "Laravel",
+  "keywords": "SSO, Identity Provider, Laravel, microservicios, authorization code, single logout",
+  "isAccessibleForFree": true,
+  "publisher": { "@type": "Organization", "name": "desarrollolibre.net" }
+}
+</script>
+
+</head>
+<body>
+
+<article>
+
+<header>
+<h1>SSO con un IdP central: qué se hizo y por qué (Single Sign-On (en español, Inicio de Sesión Único).)</h1>
+
+RP significa Relying Party (Parte Confiante) e IdP significa Identity Provider (Proveedor de Identidad).
+
+<p><strong>Resumen:</strong> el proyecto tenía tres microservicios, pero también tres
+formularios de login. Cada servicio validaba el mismo token contra el mismo
+<code>user-service</code> y, aun así, al pasar de uno a otro había que volver a escribir la
+contraseña. Este capítulo cuenta cómo se resolvió: el <code>user-service</code> pasó a ser un
+<strong>Identity Provider</strong> con login único, y los demás servicios quedaron como
+<strong>relying parties</strong> que no conocen usuarios, no guardan contraseñas y no tienen
+pantalla de login.</p>
+
+<p>El resultado es un SSO en miniatura: un código de un solo uso viaja por la URL, se canjea
+por un token propio de cada servicio, y cerrar sesión en cualquiera de ellos cierra la sesión
+central. No hay JWT, no hay OAuth completo, y esa es parte de la gracia: entender el mecanismo
+antes de delegarlo en un proveedor.</p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: tres servicios, tres logins</a></li>
+<li><a href="#regla">La regla que ordena todo</a></li>
+<li><a href="#flujo">El flujo completo, paso a paso</a></li>
+<li><a href="#idp">El IdP: piezas y endpoints</a></li>
+<li><a href="#paquete">El paquete: la frontera compartida</a></li>
+<li><a href="#rps">Los relying parties: lo que se borró</a></li>
+<li><a href="#seguridad">Seguridad del código</a></li>
+<li><a href="#logout">Single logout</a></li>
+<li><a href="#decisiones">Decisiones de diseño</a></li>
+<li><a href="#verificacion">Verificación</a></li>
+<li><a href="#limitaciones">Limitaciones honestas</a></li>
+<li><a href="#cookie">Cómo viaja la cookie y qué sesión manda</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="problema">1. El problema: tres servicios, tres logins</h2>
+
+<p>La arquitectura anterior tenía una virtud y un defecto. La virtud: la identidad era
+propiedad de un solo servicio, el <code>user-service</code>, y los demás validaban el token
+preguntándoselo por HTTP. El defecto: <strong>el acto de iniciar sesión estaba duplicado en
+cada consumidor</strong>.</p>
+
+<p><code>task-service</code> tenía su <code>AuthController</code>, su vista
+<code>auth/login</code>, su ruta <code>/login</code> y su modelo <code>User</code>.
+<code>billing-service</code> tenía exactamente lo mismo, copiado. Ambos pedían credenciales y
+las reenviaban a <code>user-service</code>. El servicio dueño de la identidad, en cambio, no
+tenía formulario de login.</p>
+
+<p>Eso producía tres efectos que se notaban en el uso normal de la aplicación:</p>
+
+<ol>
+<li><strong>Re-login constante.</strong> Entrar a facturas desde tareas obligaba a teclear la
+contraseña otra vez, aunque las credenciales fueran las mismas y el validador fuera el
+mismo.</li>
+<li><strong>Sesiones que no se hablaban.</strong> Cerrar sesión en un servicio no cerraba nada
+en el otro. Cada uno tenía su cookie y su almacén, y nadie coordinaba el cierre.</li>
+<li><strong>Credenciales en tres sitios.</strong> Aunque solo el IdP las verificara, cada
+relying party seguía teniendo un formulario donde se escribían, una ruta que las recibía y un
+controller que las manejaba.</li>
+</ol>
+
+<p>El diagnóstico es incómodo: no era un problema de protocolo, era un problema de
+<strong>dónde vive la responsabilidad</strong>. Mientras el login viva en cada servicio, el SSO
+no puede existir, porque no hay una sesión central a la que apelar.</p>
+
+<h2 id="regla">2. La regla que ordena todo</h2>
+
+<p>Antes de tocar código se fijó una regla, y todo lo demás salió de ella:</p>
+
+<blockquote>
+<p><strong>El login y los datos de usuario viven solo en <code>user-service</code>.</strong>
+Ningún otro servicio tiene formulario de login, rutas <code>/login</code>, modelo
+<code>User</code>, tabla <code>users</code> ni acceso directo a la base de datos de
+identidad.</p>
+</blockquote>
+
+<p>Un relying party puede hacer exactamente cuatro cosas: redirigir al IdP, recibir un
+código, canjearlo por un token propio y guardar ese token en su sesión local. Nada más. Todo lo
+que necesita saber de una persona se lo pregunta al IdP por HTTP.</p>
+
+<p>Esta restricción tiene una consecuencia práctica valiosa: si mañana se añade un cuarto
+servicio, no hay que copiar un formulario ni una tabla. Se declaran tres rutas y el paquete
+hace el resto. El coste de la identidad deja de multiplicarse por el número de servicios.</p>
+
+<h2 id="flujo">3. El flujo completo, paso a paso</h2>
+
+<p>El mecanismo es una versión simplificada del flujo <em>Authorization Code</em> de OAuth 2.0.
+La diferencia principal es que aquí el cliente es interno y el IdP está hecho a medida, así que
+se omiten <code>state</code>, <code>nonce</code> y PKCE.</p>
+
+<pre><code>Navegador                task-service (RP)              user-service (IdP)
+    |                          |                                |
+    | GET /tasks (sin sesión)  |                                |
+    |------------------------->| middleware auth.user-service   |
+    | 302 /sso/start           |                                |
+    |&lt;-------------------------|                                |
+    | GET /sso/start           |                                |
+    |------------------------->| SsoStartController             |
+    | 302 /authorize?client=task&amp;redirect_uri=...                |
+    |&lt;-------------------------|                                |
+    | GET /authorize...        |                                |
+    |---------------------------------------------------------->|
+    |                          |            ¿sesión SSO?        |
+    |                          |            NO -> 302 /login     |
+    | 302 /login?client=task&amp;redirect_uri=...                    |
+    |&lt;----------------------------------------------------------|
+    | GET /login (formulario)  |                                |
+    |---------------------------------------------------------->|
+    | POST /login (email+pass) |                                |
+    |---------------------------------------------------------->| Auth::attempt
+    |                          |                                | emite code (60 s)
+    | 302 redirect_uri?code=XYZ|                                |
+    |&lt;----------------------------------------------------------|
+    | GET /sso/callback?code=XYZ                                |
+    |------------------------->| SsoCallbackController          |
+    |                          | POST /api/sso/exchange         |
+    |                          |------------------------------->| valida code + client
+    |                          |                                | crea token del RP
+    |                          |&lt;-------------------------------| 201 {token, user}
+    |                          | loginWithToken() -> sesión     |
+    | 302 /tasks               |                                |
+    |&lt;-------------------------|                                |</code></pre>
+
+<p>Leído en orden, el flujo dice esto:</p>
+
+<ol>
+<li>El middleware del RP no encuentra token en la sesión. En vez de mostrar un formulario,
+<strong>manda al navegador a <code>/sso/start</code></strong>.</li>
+<li><code>SsoStartController</code> construye la URL del IdP con dos datos: el nombre del
+cliente (<code>task</code>) y la URL exacta a la que debe volver.</li>
+<li>El IdP mira su propia sesión. Si no existe, manda al login. Si existe, <strong>salta el
+formulario</strong> y emite el código ahí mismo.</li>
+<li>El login valida las credenciales con <code>Auth::attempt()</code>, regenera la sesión y,
+si venía un cliente, emite un código y redirige al RP.</li>
+<li>El RP recibe <code>?code=...</code> y lo canjea en
+<code>POST /api/sso/exchange</code>. Ese canje es <strong>backchannel</strong>: servidor a
+servidor, sin navegador de por medio.</li>
+<li>El IdP valida el código, comprueba que pertenece a ese cliente y emite un
+<strong>token nuevo, exclusivo de ese RP</strong>.</li>
+<li>El RP guarda el token en su sesión con <code>loginWithToken()</code>, que regenera el
+identificador de sesión, y redirige a donde el usuario quería ir.</li>
+</ol>
+
+<p>El detalle que elimina el re-login es el paso 3. La segunda vez que el navegador visita el
+IdP, <strong>ya hay sesión SSO</strong>, así que el formulario no aparece. El usuario ve una
+redirección y aterriza autenticado en el otro servicio. No hay contraseña, no hay token
+compartido: solo un código de un solo uso que se consume en el canje.</p>
+
+<h2 id="idp">4. El IdP: piezas y endpoints</h2>
+
+<p>El <code>user-service</code> dejó de ser un servicio sin interfaz. Ahora tiene la única
+pantalla de login del sistema y tres responsabilidades nuevas: validar a quién redirige,
+emitir códigos y canjearlos.</p>
+
+<h3>4.1 La whitelist de clientes</h3>
+
+<p>La primera pieza es una configuración explícita. Sin ella, <code>/authorize</code> sería un
+<em>open redirect</em>: cualquiera podría enviar a un usuario autenticado a un dominio
+arbitrario con un código válido en la URL.</p>
+
+<pre><code>// user-service/config/sso.php
+return [
+    'clients' =&gt; [
+        'task' =&gt; [
+            'http://127.0.0.1:8001/sso/callback',
+            'http://localhost:8001/sso/callback',
+        ],
+        'billing' =&gt; [
+            'http://127.0.0.1:8002/sso/callback',
+            'http://localhost:8002/sso/callback',
+        ],
+    ],
+    'ticket_ttl' =&gt; (int) env('SSO_TICKET_TTL', 60),
+];</code></pre>
+
+<p>La comparación es exacta, no por prefijo ni por dominio. Se aceptan las variantes
+<code>127.0.0.1</code> y <code>localhost</code> porque en desarrollo conviven las dos, pero no
+hay comodines. Añadir un relying party es añadir una entrada aquí, y esa fricción es
+deliberada: el registro de clientes es una decisión de seguridad, no un detalle de
+configuración.</p>
+
+<h3>4.2 El emisor de códigos</h3>
+
+<p><code>SsoTicketIssuer</code> concentra la parte delicada: validar, rotar y hashear. No
+devuelve un modelo, devuelve el código en claro <strong>una sola vez</strong>, porque después
+solo existirá su hash.</p>
+
+<pre><code>public function issue(User $user, string $client, string $redirectUri): string
+{
+    // 1. El cliente debe existir y el destino debe estar en su whitelist.
+    // 2. Un código nuevo invalida los pendientes del mismo usuario y cliente.
+    // 3. Se genera el código y se guarda solo su SHA-256.
+
+    $code = Str::random(64);
+
+    SsoTicket::query()-&gt;create([
+        'code_hash' =&gt; hash('sha256', $code),
+        'user_id'   =&gt; $user-&gt;id,
+        'client'    =&gt; $client,
+        'expires_at' =&gt; now()-&gt;addSeconds((int) config('sso.ticket_ttl', 60)),
+        'used_at'   =&gt; null,
+    ]);
+
+    return $code;
+}</code></pre>
+
+<p>La rotación merece una frase: si el usuario pulsa dos veces o recarga el authorize, no se
+acumulan códigos vivos. El anterior se borra. Un código pendiente por usuario y cliente es
+suficiente y reduce la superficie de ataque.</p>
+
+<h3>4.3 El ticket</h3>
+
+<p>La tabla <code>sso_tickets</code> guarda <code>code_hash</code> (único),
+<code>user_id</code>, <code>client</code>, <code>expires_at</code> y <code>used_at</code>. En
+una iteración anterior tenía además <code>token_id</code>, el token que había usado el primer
+servicio para pedir el ticket. Se eliminó: el flujo actual no depende de que el usuario llegue
+con un token previo, porque el navegador va directo al IdP y allí ya hay una sesión. Atar el
+ticket a un token de origen rompía justamente el caso de "entrar primero por billing".</p>
+
+<h3>4.4 Los endpoints</h3>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Método</th><th>Ruta</th><th>Auth</th><th>Qué hace</th></tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/login</code></td>
+<td>guest</td>
+<td>El único formulario de login del sistema.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/login</code></td>
+<td><code>throttle:6,1</code></td>
+<td>Autentica y, si trae <code>client</code> y <code>redirect_uri</code>, redirige con código.</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/authorize</code></td>
+<td>sesión web</td>
+<td>Sin sesión redirige al login; con sesión emite el código.</td>
+</tr>
+<tr>
+<td><code>GET</code>/<code>POST</code></td>
+<td><code>/logout</code></td>
+<td>—</td>
+<td>Cierra la sesión central y vuelve al <code>redirect_uri</code>.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/sso/exchange</code></td>
+<td>pública</td>
+<td>Canjea <code>{code, client}</code> por un token del relying party.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/tokens</code></td>
+<td>pública</td>
+<td>Login para clientes que no son navegador (CLI, Postman, apps).</td>
+</tr>
+</table>
+
+<p>Se conservó <code>POST /api/tokens</code> a propósito. El flujo SSO resuelve el navegador,
+pero una herramienta de línea de comandos no puede seguir redirecciones ni mantener una cookie
+de sesión del IdP. Ese endpoint ya tenía rate limit por cuenta y por IP, TTL de token y tests;
+eliminarlo habría roto un caso de uso legítimo para ganar nada.</p>
+
+<h2 id="paquete">5. El paquete: la frontera compartida</h2>
+
+<p>Los relying parties no implementan el flujo. Lo consume del paquete
+<code>demo/microservices-user-service-client</code>, que ya encapsulaba el cliente HTTP, el
+middleware y la sesión con token remoto. Se le añadieron tres controllers y se ajustó el
+contrato.</p>
+
+<pre><code>// El contrato: el RP no conoce la implementación HTTP.
+public function exchangeCode(string $code, string $client): ?array;
+
+// La sesión: el token ya viene emitido, no se piden credenciales.
+public function loginWithToken(Request $request, string $token): void;
+
+// El cierre: revoca el token del RP y destruye su sesión local.
+public function logout(Request $request): void;</code></pre>
+
+<p>La decisión de devolver <code>null</code> en los estados <code>400</code>, <code>401</code>,
+<code>404</code> y <code>422</code> es la misma que ya se usaba en
+<code>authenticate()</code>: un código inválido no es una caída de infraestructura, es una
+respuesta de negocio. El controller lo traduce a un <code>401</code> y sigue. Los errores
+<code>5xx</code>, en cambio, lanzan excepción y terminan en un <code>503</code>, porque ahí sí
+hay un problema del sistema.</p>
+
+<p>El paquete también trae los tres controllers del flujo. La aplicación solo declara las
+rutas y elige el nombre del cliente:</p>
+
+<pre><code>Route::get('/sso/start', SsoStartController::class)-&gt;name('sso.start');
+Route::get('/sso/callback', SsoCallbackController::class)-&gt;name('sso.callback');
+Route::post('/logout', SsoLogoutController::class)-&gt;name('logout');</code></pre>
+
+<p>Se eliminó <code>login_route</code> de la configuración. Ya no existe una pantalla de login
+local a la que redirigir; en su lugar hay <code>sso_start_route</code>, que apunta al inicio
+del flujo. Es un cambio pequeño en el archivo, pero grande en el significado: el paquete dejó
+de asumir que cada aplicación tenía su propio login.</p>
+
+<h2 id="rps">6. Los relying parties: lo que se borró</h2>
+
+<p>La parte más elocuente del cambio no es lo que se añadió, sino lo que se pudo borrar. En
+<code>task-service</code> y <code>billing-service</code> desaparecieron:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Archivo eliminado</th><th>Por qué</th></tr>
+<tr>
+<td><code>app/Http/Controllers/AuthController.php</code></td>
+<td>El login lo hace el IdP; el RP no recibe contraseñas.</td>
+</tr>
+<tr>
+<td><code>app/Models/User.php</code> y <code>UserFactory.php</code></td>
+<td>El RP no es dueño de usuarios, solo recibe una identidad ya validada.</td>
+</tr>
+<tr>
+<td><code>database/migrations/*_create_users_table.php</code></td>
+<td>No debe existir una segunda tabla de identidad.</td>
+</tr>
+<tr>
+<td><code>config/auth.php</code></td>
+<td>Sin guard local de usuarios no hay nada que configurar.</td>
+</tr>
+<tr>
+<td><code>resources/views/auth/</code></td>
+<td>La única vista de autenticación vive en el IdP.</td>
+</tr>
+<tr>
+<td><code>SsoBridgeController.php</code> (task) y <code>SsoCallbackController.php</code> (billing)</td>
+<td>El flujo ya es genérico y vive en el paquete.</td>
+</tr>
+</table>
+
+<p>En su lugar quedan tres rutas finas y una navegación que cruza de servicio con
+<code>config('services.billing.url')</code> y <code>config('services.task.url')</code>. El
+botón "Facturas" del task-service ya no pide un ticket por detrás: es un enlace normal al otro
+servicio, y el SSO hace el resto.</p>
+
+<p>Hay una consecuencia de modelo de datos que conviene decir en voz alta: los relying parties
+siguen guardando <code>user_id</code> en sus tablas, pero ya no tienen una tabla de usuarios
+donde buscarlo. Ese número es una referencia opaca que solo el IdP puede resolver. La
+verificación de que existe ocurre en el middleware, en el mismo request, no en el formulario
+de creación.</p>
+
+<h2 id="seguridad">7. Seguridad del código</h2>
+
+<p>El código SSO es una credencial temporal. Se trató como tal, con las mismas reglas que los
+tokens opacos del proyecto.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Riesgo</th><th>Medida</th></tr>
+<tr>
+<td>Reutilización</td>
+<td><code>used_at</code> se marca en el canje; el segundo intento responde <code>400</code>.</td>
+</tr>
+<tr>
+<td>Ventana de ataque</td>
+<td>TTL de 60 segundos. Suficiente para el redirect y el canje, corto para todo lo demás.</td>
+</tr>
+<tr>
+<td>Fuga desde la base de datos</td>
+<td>Solo se guarda <code>sha256(code)</code>. En claro existe únicamente en la respuesta.</td>
+</tr>
+<tr>
+<td>Open redirect</td>
+<td>Cada cliente tiene su <code>redirect_uri</code> exacta en la whitelist.</td>
+</tr>
+<tr>
+<td>Código cruzado entre clientes</td>
+<td>El canje exige que <code>client</code> coincida con el del ticket.</td>
+</tr>
+<tr>
+<td>Acumulación de códigos</td>
+<td>Emitir uno nuevo borra los pendientes del mismo usuario y cliente.</td>
+</tr>
+<tr>
+<td>Session fixation</td>
+<td><code>loginWithToken()</code> regenera el id de sesión antes de guardar el token.</td>
+</tr>
+<tr>
+<td>Credenciales en tránsito</td>
+<td>El token nunca viaja por la URL; solo el código.</td>
+</tr>
+</table>
+
+<p>Hay una limitación que no se esconde: el código viaja en la query string y, por tanto,
+puede quedar en el historial del navegador o en un log de acceso. Es exactamente lo que OAuth
+mitiga con un TTL muy corto y un solo uso. Aquí se aplican las dos cosas, pero un despliegue
+real añadiría HTTPS obligatorio y quizá <code>state</code> para proteger el callback.</p>
+
+<h2 id="logout">8. Single logout</h2>
+
+<p>Cerrar sesión dejó de ser un acto local. El relying party no intenta cerrar sesiones
+ajenas; delega en el dueño de la sesión central:</p>
+
+<pre><code>POST rp/logout
+  -&gt; TokenSession::logout() revoca el token del RP y destruye su sesión local
+  -&gt; 302 al /logout del IdP con redirect_uri
+  -&gt; el IdP destruye la sesión SSO
+  -&gt; vuelve al RP, que ya no tiene sesión</code></pre>
+
+<p>La clave es el orden. Primero se limpia lo local y se revoca el token propio; después se
+pide al IdP que cierre la sesión compartida. Si el IdP estuviera caído, el usuario quedaría
+fuera del servicio que pulsó el botón, y el token huérfano caducaría por su cuenta. Es una
+degradación aceptable: cerrar sesión nunca debe fallar por una dependencia externa.</p>
+
+<p>Lo que este diseño no hace es avisar a los demás servicios. No hay back-channel: si el
+usuario tenía sesión en tres relying parties, los otros dos conservan su token local hasta que
+el IdP lo rechace en su siguiente request. Un OIDC completo usaría front-channel o
+back-channel logout para propagar el cierre. Aquí se eligió la versión honesta y simple, y se
+documenta la diferencia en vez de fingir que no existe.</p>
+
+<h2 id="decisiones">9. Decisiones de diseño</h2>
+
+<p><strong>El navegador va al IdP, no el servidor.</strong> La iteración anterior hacía que
+task-service pidiera el ticket server-to-server con su token. Funcionaba, pero solo si el
+usuario ya estaba dentro de task. El flujo actual permite entrar primero por cualquier
+servicio, porque el IdP es el punto de entrada y el dueño de la sesión.</p>
+
+<p><strong>Un token por relying party.</strong> Billing recibe su propio token
+(<code>device_name = billing-sso</code>), no el de task. Revocar uno no afecta al otro. Es el
+mismo principio que OAuth: access tokens por cliente, no una credencial compartida.</p>
+
+<p><strong>El ticket no está atado al token de origen.</strong> Atarlo parecía más seguro, pero
+impedía el caso normal: el usuario llega al IdP sin token previo de ningún RP. La seguridad
+real está en la sesión del IdP, en la whitelist y en el TTL, no en el token que originó el
+viaje.</p>
+
+<p><strong>La whitelist vive en configuración.</strong> Para una demo es explícita y fácil de
+leer. En producción sería un registro de clientes en base de datos, con scopes y secretos. El
+código ya está separado para que ese cambio no toque los controllers.</p>
+
+<p><strong>Se conserva el login por API.</strong> El SSO es para navegadores. Un cliente
+programático no puede seguir redirecciones ni mantener cookies del IdP, así que
+<code>POST /api/tokens</code> sigue siendo la puerta para ese caso.</p>
+
+<h2 id="verificacion">10. Verificación</h2>
+
+<p>La suite se amplió en los tres servicios. El IdP ganó un archivo dedicado al flujo, y los
+relying parties reemplazaron los tests de formulario por tests de SSO y canje.</p>
+
+<pre><code>cd user-service    &amp;&amp; php artisan test --compact   # 53 tests
+cd task-service    &amp;&amp; php artisan test --compact   # 67 tests
+cd billing-service &amp;&amp; php artisan test --compact   # 9 tests</code></pre>
+
+<p>En el IdP, <code>tests/Feature/SsoFlowTest.php</code> cubre el login, el formulario, la
+emisión de códigos, la whitelist de clientes y de <code>redirect_uri</code>, el canje válido y
+todos los rechazos: código reutilizado, expirado, de otro cliente e inexistente. También
+comprueba que el código en claro no queda en la base de datos.</p>
+
+<p>La prueba de extremo a extremo, con los tres servicios levantados, es esta:</p>
+
+<ol>
+<li><code>GET :8001/tasks</code> sin sesión responde <code>302</code> a
+<code>/sso/start</code>, que a su vez redirige a
+<code>:8000/authorize?client=task&amp;redirect_uri=...</code>.</li>
+<li>Sin sesión en el IdP, el authorize responde <code>302</code> a
+<code>/login?client=task&amp;redirect_uri=...</code>.</li>
+<li>Un login correcto responde <code>302</code> a
+<code>:8001/sso/callback?code=...</code>; el callback canjea y responde <code>302</code> a
+<code>/tasks</code>, que devuelve <code>200</code>.</li>
+<li>En el mismo navegador, <code>GET :8002/facturas</code> devuelve <code>200</code>
+<strong>sin formulario</strong>: el IdP ya tenía sesión.</li>
+<li><code>POST :8002/logout</code> redirige al <code>/logout</code> del IdP, que destruye la
+sesión y devuelve al servicio; un request posterior vuelve a pasar por el login.</li>
+</ol>
+
+<h2 id="limitaciones">11. Limitaciones honestas</h2>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Limitación</th><th>Qué implicaría resolverla</th></tr>
+<tr>
+<td>Single logout no federado</td>
+<td>Front-channel o back-channel logout de OIDC: avisar a cada RP en vez de esperar a su
+siguiente request.</td>
+</tr>
+<tr>
+<td>Sin <code>state</code>, <code>nonce</code> ni PKCE</td>
+<td>Protección contra CSRF en el callback y contra intercepción del código en clientes
+públicos.</td>
+</tr>
+<tr>
+<td>Whitelist en configuración</td>
+<td>Registro de clientes en base de datos, con scopes, secretos y rotación.</td>
+</tr>
+<tr>
+<td>Sin refresh tokens</td>
+<td>Renovación de la sesión del RP sin volver a pasar por el IdP.</td>
+</tr>
+<tr>
+<td>Sin revocación global</td>
+<td>Tabla de sesiones SSO y un endpoint que invalide todas las sesiones de un usuario.</td>
+</tr>
+</table>
+
+<p>Ninguna de estas limitaciones invalida el objetivo del capítulo. El objetivo era demostrar
+dónde debe vivir la identidad y cómo se coordina entre servicios sin compartir base de datos ni
+credenciales. Eso está implementado, probado y verificado de punta a punta. Lo que falta es el
+grosor de un estándar completo, y ese grosor tiene nombre: OIDC.</p>
+
+<h2 id="cookie">12. Cómo viaja la cookie y qué sesión manda</h2>
+
+<p>Hay un matiz que suele confundirse al seguir el flujo con las herramientas del navegador.
+Cuando <code>SsoController@authorize</code> ejecuta <code>Auth::check()</code>, no está
+consultando la sesión de task ni la de billing: está consultando <strong>la sesión del
+IdP</strong>. Ese detalle explica por qué el segundo servicio no necesita recibir nada del
+primero.</p>
+
+<p>La sesión del IdP se crea cuando el usuario envía el formulario de login en
+<code>:8000</code>: <code>Auth::attempt()</code> escribe la clave
+<code>login_web_&lt;hash&gt;</code> en la sesión y <code>regenerate()</code> renueva el
+identificador. El guard <code>web</code> (driver <code>session</code>, definido en
+<code>user-service/config/auth.php</code>) es el que lee esa clave. La sesión de task
+—<code>task-service-session</code>, con su <code>api_token</code>— no participa en esa
+comprobación.</p>
+
+<p>Por eso, cuando el navegador llega a <code>:8000/authorize?client=billing&amp;...</code>
+después de haber iniciado sesión desde task, <code>Auth::check()</code> ya es
+<code>true</code>: el IdP reconoce al usuario y emite un código <em>nuevo</em>, esta vez para
+<code>billing</code>. No reutiliza el código de task; el ticket anterior ya se consumió.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Componente</th><th>Qué guarda</th><th>Dónde</th></tr>
+<tr>
+<td>IdP</td>
+<td>Hash del código SSO</td>
+<td><code>sso_tickets.code_hash</code></td>
+</tr>
+<tr>
+<td>IdP</td>
+<td>Sesión del usuario (login)</td>
+<td>cookie <code>user-service-session</code></td>
+</tr>
+<tr>
+<td>task</td>
+<td>Su propio token (<code>task-sso</code>)</td>
+<td>cookie <code>task-service-session</code> → <code>api_token</code></td>
+</tr>
+<tr>
+<td>billing</td>
+<td>Su propio token (<code>billing-sso</code>)</td>
+<td>cookie <code>billing-service-session</code> → <code>api_token</code></td>
+</tr>
+</table>
+
+<p>La cookie no la transporta código PHP de un servicio a otro: la transporta el navegador.
+El recorrido es siempre el mismo:</p>
+
+<ol>
+<li>El POST <code>/login</code> responde con <code>Set-Cookie:
+user-service-session=...</code>. El valor es el identificador de sesión cifrado, no los datos
+del usuario; los datos quedan en <code>storage/framework/sessions/</code> porque
+<code>SESSION_DRIVER=file</code>.</li>
+<li>El navegador almacena la cookie por <strong>host + path + nombre</strong>, sin distinguir
+puertos. Por eso la envía también a <code>:8001</code> y <code>:8002</code>, aunque solo el
+IdP la usa.</li>
+<li>Los <code>302</code> del flujo hacen que el navegador vuelva a visitar el IdP y adjunte
+automáticamente la cookie. No hay ningún traspaso manual.</li>
+<li>En cada request, el grupo <code>web</code> ejecuta <code>EncryptCookies</code> (descifra
+con el <code>APP_KEY</code> local) y <code>StartSession</code> (carga la sesión desde el
+identificador). Como cada servicio tiene un <code>APP_KEY</code> distinto, ninguno puede leer
+la cookie de otro aunque la reciba.</li>
+</ol>
+
+<p>El nombre y los atributos se definen en <code>user-service/config/session.php</code>:
+<code>cookie</code> en la línea 130 (<code>Str::slug(APP_NAME).'-session'</code>),
+<code>path</code> en la 146, <code>domain</code> en la 159 (<code>null</code>, cookie de host),
+<code>http_only</code> en la 185 y <code>same_site</code> en la 202 (<code>lax</code>). En
+local, <code>secure</code> queda desactivado porque se sirve por HTTP.</p>
+
+<p>El mecanismo falla en tres casos previsibles: si el usuario se autenticó con
+<code>POST /api/tokens</code> (los clientes no-navegador no crean sesión web en el IdP), si se
+alterna entre <code>localhost</code> y <code>127.0.0.1</code> (son hosts distintos para el
+navegador), o si la sesión expiró o se cerró. En los tres, <code>authorize</code> vuelve a
+pedir login.</p>
+
+<p>La conclusión es la misma que sostiene todo el capítulo: task y billing no se pasan un
+token; cada uno redirige al IdP, que ya tiene la sesión del usuario, y regresa con su propio
+token.</p>
+
+<hr>
+
+<footer>
+<p><em>Para profundizar:</em> el diseño completo, con el diagrama, los endpoints y las
+decisiones de seguridad, está en <code>SSO-HANDOFF-IDP.md</code>. La implementación concreta
+vive en <code>user-service/app/Http/Controllers/SsoController.php</code>,
+<code>user-service/app/Services/SsoTicketIssuer.php</code> y en los tres controllers del
+paquete <code>demo/microservices-user-service-client</code>.</p>
+</footer>
+
+</article>
+
+</body>
+</html>

@@ -9,10 +9,10 @@ use Illuminate\Support\Facades\Http;
 | prueba aquí es el renderizado y el flujo de sesión, no la lógica microservicios.
 */
 
-it('redirects anonymous visitors to the login page', function (string $uri) {
+it('redirects anonymous visitors to the sso start route', function (string $uri) {
     Http::fake();
 
-    $this->get($uri)->assertRedirect(route('login'));
+    $this->get($uri)->assertRedirect(route('sso.start'));
 
     Http::assertNothingSent();
 })->with([
@@ -21,54 +21,61 @@ it('redirects anonymous visitors to the login page', function (string $uri) {
     'edit' => '/tasks/1/edit',
 ]);
 
-it('shows the login form', function () {
-    $this->get(route('login'))
-        ->assertOk()
-        ->assertSee('Iniciar sesión', escape: false);
+it('starts the sso flow against the user-service', function () {
+    $this->get(route('sso.start'))
+        ->assertRedirect(config('user-service-client.url').'/authorize?'.http_build_query([
+            'client' => config('user-service-client.client'),
+            'redirect_uri' => url('/sso/callback'),
+        ]));
 });
 
-it('logs in through the user-service and stores the returned token', function () {
+it('exchanges the sso code and stores the returned token', function () {
     Http::fake([
-        '*/api/tokens' => Http::response(['token' => 'token-emitido'], 201),
+        '*/api/sso/exchange' => Http::response(ssoExchangePayload('token-emitido'), 201),
     ]);
 
-    $this->post(route('login'), [
-        'email' => 'ana.torres@example.com',
-        'password' => 'password',
-    ])
-        ->assertRedirect(route('tasks.index'))
+    $this->get(route('sso.callback', ['code' => 'codigo-ss0']))
+        ->assertRedirect('/')
         ->assertSessionHas(TokenSession::SESSION_KEY, 'token-emitido');
 
     Http::assertSent(
-        fn ($request) => $request->url() === config('user-service-client.url').'/api/tokens'
-            && $request['email'] === 'ana.torres@example.com'
+        fn ($request) => $request->url() === config('user-service-client.url').'/api/sso/exchange'
+            && $request['code'] === 'codigo-ss0'
+            && $request['client'] === config('user-service-client.client')
     );
 });
 
-it('rejects invalid credentials without creating a session', function () {
-    Http::fake([
-        '*/api/tokens' => Http::response(['error' => 'Credenciales inválidas'], 401),
-    ]);
+it('rejects an sso callback without a code', function () {
+    Http::fake();
 
-    $this->from(route('login'))
-        ->post(route('login'), ['email' => 'ana@example.com', 'password' => 'mala'])
-        ->assertRedirect(route('login'))
-        ->assertSessionHasErrors('email')
+    $this->get(route('sso.callback'))
+        ->assertUnauthorized()
         ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
 
-it('returns 503 on the login page when the user-service is down', function () {
+it('rejects an sso code the user-service does not accept', function () {
+    Http::fake([
+        '*/api/sso/exchange' => Http::response(['error' => 'Código inválido'], 422),
+    ]);
+
+    $this->get(route('sso.callback', ['code' => 'codigo-caducado']))
+        ->assertUnauthorized()
+        ->assertSessionMissing(TokenSession::SESSION_KEY);
+});
+
+it('returns 503 during the sso callback when the user-service is down', function () {
     fakeUserServiceDown();
 
-    $this->post(route('login'), ['email' => 'ana@example.com', 'password' => 'password'])
-        ->assertStatus(503);
+    $this->get(route('sso.callback', ['code' => 'codigo-ss0']))->assertStatus(503);
 });
 
 it('logs out and revokes the token on the user-service', function () {
     loginAs();
 
     $this->post(route('logout'))
-        ->assertRedirect(route('login'))
+        ->assertRedirect(config('user-service-client.url').'/logout?'.http_build_query([
+            'redirect_uri' => url('/'),
+        ]))
         ->assertSessionMissing(TokenSession::SESSION_KEY);
 
     Http::assertSent(
@@ -140,7 +147,7 @@ it('drops the web session when the token is no longer valid upstream', function 
     Http::fake(['*/api/user' => Http::response(['error' => 'Unauthenticated.'], 401)]);
 
     $this->get(route('tasks.index'))
-        ->assertRedirect(route('login'))
+        ->assertRedirect(route('sso.start'))
         ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
 

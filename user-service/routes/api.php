@@ -18,7 +18,6 @@ Route::post('/sso/exchange', [SsoController::class, 'exchange']);
 Route::middleware('auth.api-token')->group(function () {
     Route::get('/user', [AuthController::class, 'me']);
     Route::delete('/tokens', [AuthController::class, 'destroy']);
-    Route::post('/sso/authorize', [SsoController::class, 'authorize']);
 });
 
 // Catálogo de usuarios. Se deja abierto a propósito: el listado no es un dato

@@ -39,7 +39,11 @@ El ServiceProvider se descubre solo y registra:
 ```bash
 USER_SERVICE_URL=http://127.0.0.1:8000
 USER_SERVICE_TIMEOUT=3
-USER_SERVICE_LOGIN_ROUTE=login
+USER_SERVICE_CLIENT=mi-app
+# Opcional: si no se define, se usa url('/sso/callback') de la app.
+USER_SERVICE_CALLBACK_URL=
+# Opcional: nombre de la ruta que arranca el flujo SSO (por defecto sso.start).
+USER_SERVICE_SSO_START_ROUTE=sso.start
 ```
 
 Para publicar el archivo de configuración en la aplicación:
@@ -48,11 +52,13 @@ Para publicar el archivo de configuración en la aplicación:
 php artisan vendor:publish --tag=user-service-client-config
 ```
 
-`login_route` es el nombre de la ruta a la que el middleware manda cuando el
-request viene de la web y no de la API. Un paquete no puede saber cómo se llama
-la pantalla de login de cada aplicación, así que lo declara la aplicación. Si se
-pone a `null`, el middleware responde siempre `401` en JSON, sin redirigir: es lo
-que necesita una aplicación que solo expone API.
+`client` es el identificador con el que la aplicación se presenta ante el IdP
+(`task`, `billing`...). El IdP lo valida contra su whitelist y lo usa para saber
+a qué callback puede redirigir.
+
+`sso_start_route` es la ruta local que arranca el flujo SSO. El middleware manda
+ahí a los visitantes web sin sesión; si se deja vacía, responde siempre `401` en
+JSON, sin redirigir, que es lo que necesita una aplicación que solo expone API.
 
 ## Uso
 
@@ -78,28 +84,40 @@ use Demo\Microservices\UserServiceClient\AuthenticatedUser;
 $user = AuthenticatedUser::fromRequest(request());
 ```
 
+### SSO con el IdP central
+
+El paquete trae los tres controllers del flujo. La aplicación solo declara las
+rutas:
+
+```php
+use Demo\Microservices\UserServiceClient\Http\Controllers\SsoCallbackController;
+use Demo\Microservices\UserServiceClient\Http\Controllers\SsoLogoutController;
+use Demo\Microservices\UserServiceClient\Http\Controllers\SsoStartController;
+
+Route::get('/sso/start', SsoStartController::class)->name('sso.start');
+Route::get('/sso/callback', SsoCallbackController::class)->name('sso.callback');
+Route::post('/logout', SsoLogoutController::class)->name('logout');
+```
+
+- `SsoStartController` redirige al `/authorize` del IdP con `client` y
+  `redirect_uri`.
+- `SsoCallbackController` canjea el `code` por un token y lo guarda en sesión.
+- `SsoLogoutController` destruye la sesión local y delega el cierre en el IdP
+  (`/logout`), que es el dueño de la sesión SSO.
+
+Ningún RP tiene pantalla de login ni tabla de usuarios: el único que conoce
+credenciales es el IdP.
+
 ### Sesión web con token remoto
 
-`TokenSession` se encarga de la parte sutil: emitir el token, regenerar el
-identificador de sesión al iniciar sesión, y revocar el token en el peer al
-cerrarla.
+`TokenSession` se encarga de la parte sutil: regenerar el identificador de
+sesión al guardar el token y revocarlo en el peer al cerrar sesión.
 
 ```php
 use Demo\Microservices\UserServiceClient\TokenSession;
 
-public function store(Request $request, TokenSession $session)
-{
-    $session->login($request, $credentials, 'mi-app-web');
-
-    return redirect()->intended(route('dashboard'));
-}
-
-public function destroy(Request $request, TokenSession $session)
-{
-    $session->logout($request);
-
-    return redirect()->route('login');
-}
+$session->loginWithToken($request, $token); // tras el canje SSO
+$session->logout($request);                 // revoca el token y vacía la sesión
 ```
 
 La aplicación conserva el control de las vistas y de las redirecciones: el
@@ -119,8 +137,13 @@ public function __construct(private readonly IdentityProvider $users) {}
 ```php
 $user = $this->users->authenticate($token);   // array{id,name,email}|null
 $token = $this->users->issueToken($credentials); // string
+$result = $this->users->exchangeCode($code, 'mi-app'); // array|null
 $this->users->revokeToken($token);              // void
 ```
+
+`exchangeCode()` devuelve `null` cuando el código es inválido, expiró, ya se usó
+o pertenece a otro cliente. Igual que `authenticate()`, eso no es un fallo de
+infraestructura: es un código que no sirve.
 
 `authenticate()` devuelve `null` cuando el token no vale (401). Eso **no** es un
 error: es la respuesta normal a un token caducado o revocado.

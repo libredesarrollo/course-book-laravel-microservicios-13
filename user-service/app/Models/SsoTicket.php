@@ -2,18 +2,14 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class SsoTicket extends Model
 {
-    use HasFactory;
-
     protected $fillable = [
         'code_hash',
         'user_id',
-        'token_id',
         'client',
         'expires_at',
         'used_at',
@@ -32,11 +28,6 @@ class SsoTicket extends Model
         return $this->belongsTo(User::class);
     }
 
-    public function token(): BelongsTo
-    {
-        return $this->belongsTo(ApiToken::class, 'token_id');
-    }
-
     public function isExpired(): bool
     {
         return $this->expires_at->isPast();
@@ -44,7 +35,7 @@ class SsoTicket extends Model
 
     public function isUsed(): bool
     {
-        return ! is_null($this->used_at);
+        return $this->used_at !== null;
     }
 
     public function isValid(): bool

@@ -29,28 +29,10 @@ class TokenSession
     public function __construct(private readonly IdentityProvider $users) {}
 
     /**
-     * Pide un token al user-service y lo guarda en la sesión.
-     *
-     * @param  array{email: string, password: string}  $credentials
-     *
-     * @throws UserServiceUnavailableException si el user-service no está alcanzable
-     * @throws UserServiceErrorException si las credenciales son incorrectas
-     */
-    public function login(Request $request, array $credentials, string $deviceName): string
-    {
-        $token = $this->users->issueToken($credentials + ['device_name' => $deviceName]);
-
-        $request->session()->regenerate();
-        $request->session()->put(self::SESSION_KEY, $token);
-
-        return $token;
-    }
-
-    /**
      * Guarda un token ya emitido por el IdP en la sesión.
      *
-     * Úsalo en el hand-off SSO: el token llega del user-service tras
-     * intercambiar el código, no se pide con credenciales.
+     * Úsalo en el flujo SSO centralizado: el código se canjea en /sso/callback
+     * y el token resultante se guarda aquí.
      */
     public function loginWithToken(Request $request, string $token): void
     {

@@ -32,19 +32,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Ruta de login
+    | Cliente SSO
     |--------------------------------------------------------------------------
-    |
-    | Nombre de la ruta a la que el middleware de autenticación manda cuando
-    | el request viene de la web y no de la API. Un paquete no puede saber
-    | cómo se llama la pantalla de login de cada aplicación, así que lo
-    | declara la aplicación.
-    |
-    | Ponlo a null si la aplicación solo expone API: entonces el middleware
-    | responde siempre 401 en JSON, sin intentar ninguna redirección.
-    |
     */
 
-    'login_route' => env('USER_SERVICE_LOGIN_ROUTE', 'login'),
+    'client' => env('USER_SERVICE_CLIENT', 'app'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | URL de callback del RP
+    |--------------------------------------------------------------------------
+    | Si es null, se usa url('/sso/callback').
+    */
+
+    'callback_url' => env('USER_SERVICE_CALLBACK_URL'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Ruta para iniciar el flujo SSO
+    |--------------------------------------------------------------------------
+    */
+
+    'sso_start_route' => env('USER_SERVICE_SSO_START_ROUTE', 'sso.start'),
 
 ];

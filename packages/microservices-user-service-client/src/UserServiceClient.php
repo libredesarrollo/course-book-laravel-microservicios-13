@@ -93,47 +93,20 @@ class UserServiceClient implements IdentityProvider
      * @throws UserServiceUnavailableException
      * @throws UserServiceErrorException
      */
-    public function exchangeCode(string $code): ?array
+    public function exchangeCode(string $code, string $client): ?array
     {
-        $response = $this->post('/api/sso/exchange', ['code' => $code]);
+        $response = $this->post('/api/sso/exchange', [
+            'code' => $code,
+            'client' => $client,
+        ]);
 
-        if ($response->status() === 400 || $response->status() === 404 || $response->status() === 422) {
+        if ($response->status() === 400 || $response->status() === 404 || $response->status() === 422 || $response->status() === 401) {
             return null;
         }
 
         if ($response->failed()) {
             throw new UserServiceErrorException(
                 "El user-service rechazó el intercambio SSO ({$response->status()})."
-            );
-        }
-
-        $json = $response->json();
-
-        return is_array($json) ? $json : null;
-    }
-
-    /**
-     * Pide un ticket SSO al IdP usando el token del usuario.
-     *
-     * @return array{code: string, expires_in: int}|null
-     *
-     * @throws UserServiceUnavailableException
-     * @throws UserServiceErrorException
-     */
-    public function authorizeSso(string $token, string $client, string $redirect): ?array
-    {
-        $response = $this->post('/api/sso/authorize', [
-            'client' => $client,
-            'redirect' => $redirect,
-        ], ['Authorization' => "Bearer {$token}"]);
-
-        if ($response->status() === 401 || $response->status() === 422) {
-            return null;
-        }
-
-        if ($response->failed()) {
-            throw new UserServiceErrorException(
-                "El user-service rechazó la autorización SSO ({$response->status()})."
             );
         }
 
@@ -233,7 +206,7 @@ class UserServiceClient implements IdentityProvider
 
             $requestId = null;
 
-            if ($req->hasHeader('X-Request-Id')) {
+            if (method_exists($req, 'hasHeader') && $req->hasHeader('X-Request-Id')) {
                 $requestId = $req->header('X-Request-Id');
             } elseif ($req->attributes && $req->attributes->has('request_id')) {
                 $requestId = $req->attributes->get('request_id');

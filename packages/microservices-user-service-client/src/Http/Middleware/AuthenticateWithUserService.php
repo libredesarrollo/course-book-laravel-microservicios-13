@@ -37,6 +37,7 @@ class AuthenticateWithUserService
 
     public function handle(Request $request, Closure $next): Response
     {
+        // dd(true);
         $token = $request->bearerToken()
             ?? ($request->hasSession() ? $request->session()->get(TokenSession::SESSION_KEY) : null);
 
@@ -66,11 +67,11 @@ class AuthenticateWithUserService
     }
 
     /**
-     * Responde 401 en la API y manda a la pantalla de login en la web.
+     * Responde 401 en la API y manda al inicio del flujo SSO en la web.
      *
-     * La ruta de login no se puede hardcodear en un paquete: la aplicación
-     * la declara en su configuración. Si no declara ninguna, el middleware
-     * se comporta como uno de API pura y siempre responde 401.
+     * Con el IdP centralizado, ningún RP debe tener su propia pantalla de login.
+     * Si no hay ruta de inicio SSO configurada, el middleware se comporta como
+     * uno de API pura.
      */
     private function reject(Request $request): Response
     {
@@ -78,13 +79,13 @@ class AuthenticateWithUserService
             return $this->unauthenticated();
         }
 
-        $loginRoute = config('user-service-client.login_route');
+        $startRoute = config('user-service-client.sso_start_route');
 
-        if (! is_string($loginRoute) || $loginRoute === '') {
+        if (! is_string($startRoute) || $startRoute === '') {
             return $this->unauthenticated();
         }
 
-        return $this->redirector->guest($this->url->route($loginRoute));
+        return $this->redirector->guest($this->url->route($startRoute));
     }
 
     private function unauthenticated(): JsonResponse

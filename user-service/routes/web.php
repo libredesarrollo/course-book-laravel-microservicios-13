@@ -1,13 +1,23 @@
 <?php
 
 use App\Http\Controllers\SsoController;
+use App\Http\Controllers\WebLoginController;
 use Demo\Microservices\Observability\Http\Controllers\HealthController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', function () {
-    return view('welcome');
-});
+    if (auth()->check()) {
+        return view('welcome');
+    }
 
-// Health check en la raíz, para que el balanceador no tenga que saber que
-// las rutas de API van con prefijo. Responde lo mismo que /api/health.
+    return redirect()->route('login');
+})->name('home');
+
+Route::get('/login', [WebLoginController::class, 'show'])->name('login')->middleware('guest');
+Route::post('/login', [WebLoginController::class, 'login'])->middleware('throttle:6,1');
+Route::get('/logout', [WebLoginController::class, 'logout'])->name('logout');
+Route::post('/logout', [WebLoginController::class, 'logout']);
+
+Route::get('/authorize', [SsoController::class, 'authorize'])->name('sso.authorize');
+
 Route::get('/health', [HealthController::class, 'index']);

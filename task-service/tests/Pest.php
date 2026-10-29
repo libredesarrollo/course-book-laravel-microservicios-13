@@ -44,10 +44,28 @@ function fakeUserService(?array $user = null): array
 
     Http::fake([
         '*/api/user' => Http::response($user),
-        '*/api/tokens' => Http::response(['token' => 'issued-token'], 201),
+        '*/api/sso/exchange' => Http::response(ssoExchangePayload('issued-token', $user), 201),
     ]);
 
     return $user;
+}
+
+/**
+ * Respuesta del user-service al canjear un código SSO.
+ *
+ * @param  array{id: int, name: string, email: string}|null  $user
+ * @return array{token: string, token_type: string, expires_at: string, user: array{id: int, name: string, email: string}}
+ */
+function ssoExchangePayload(string $token = 'token-emitido', ?array $user = null): array
+{
+    $user ??= ['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'];
+
+    return [
+        'token' => $token,
+        'token_type' => 'Bearer',
+        'expires_at' => now()->addHour()->toIso8601String(),
+        'user' => $user,
+    ];
 }
 
 /**

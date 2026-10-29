@@ -741,7 +741,9 @@ archivo:</p>
 return [
     'url' =&gt; env('USER_SERVICE_URL', 'http://127.0.0.1:8000'),
     'timeout' =&gt; (int) env('USER_SERVICE_TIMEOUT', 3),
-    'login_route' =&gt; env('USER_SERVICE_LOGIN_ROUTE', 'login'),
+    'client' =&gt; env('USER_SERVICE_CLIENT', 'app'),
+    'callback_url' =&gt; env('USER_SERVICE_CALLBACK_URL'),
+    'sso_start_route' =&gt; env('USER_SERVICE_SSO_START_ROUTE', 'sso.start'),
 ];</code></pre>
 
 <p>Y el <code>ServiceProvider</code> lo fusiona y lo hace publicable:</p>
@@ -759,9 +761,10 @@ $this-&gt;publishes([
 <code>USER_SERVICE_URL</code> y <code>USER_SERVICE_TIMEOUT</code>. Los ficheros
 <code>.env</code> de los servicios siguen siendo válidos sin tocar nada.</p>
 
-<p>La clave <code>login_route</code> sí es nueva, y es necesaria: el middleware
-vive en el paquete y el paquete no puede saber cómo se llama la pantalla de login
-de cada aplicación. Si se pone a <code>null</code>, el middleware responde siempre
+<p>Las claves <code>client</code>, <code>callback_url</code> y
+<code>sso_start_route</code> son las que necesita el flujo SSO: con qué nombre se
+presenta el RP ante el IdP, a qué URL vuelve el código y qué ruta local arranca el
+flujo. Si <code>sso_start_route</code> se deja vacía, el middleware responde siempre
 <code>401</code> en JSON, sin redirigir: es lo que necesita una aplicación que solo
 expone API.</p>
 
