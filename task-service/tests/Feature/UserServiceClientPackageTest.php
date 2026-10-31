@@ -7,6 +7,7 @@ use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableExcept
 use Demo\Microservices\UserServiceClient\TokenSession;
 use Demo\Microservices\UserServiceClient\UserServiceClient;
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 
 /*
@@ -246,4 +247,179 @@ it('closes the local session even when the revocation fails', function () {
     Http::assertSent(fn (Request $sent) => $sent->method() === 'DELETE');
 
     expect($request->session()->has(TokenSession::SESSION_KEY))->toBeFalse();
+});
+
+/*
+|--------------------------------------------------------------------------
+| Resiliencia
+|--------------------------------------------------------------------------
+|
+| Todo el HTTP con el IdP pasa por UserServiceClient::send, así que aquí
+| viven los reintentos, el circuit breaker y la caché de verificación del
+| middleware. Son las piezas que convierten una caída del IdP de "toda la
+| aplicación caída" en "degradación breve y legible".
+|
+*/
+
+it('retries an idempotent request when the user-service answers with 5xx', function () {
+    config([
+        'user-service-client.retries' => 2,
+        'user-service-client.retry_delay_ms' => 0,
+    ]);
+
+    Http::fake([
+        '*/api/user' => Http::sequence()
+            ->push(['error' => 'boom'], 500)
+            ->push(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com']),
+    ]);
+
+    expect(app(UserServiceClient::class)->authenticate('token-valido'))
+        ->toBe(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com']);
+
+    Http::assertSentCount(2);
+});
+
+it('does not retry when the answer is a legitimate 4xx', function () {
+    config(['user-service-client.retries' => 2, 'user-service-client.retry_delay_ms' => 0]);
+
+    Http::fake([
+        '*/api/user' => Http::sequence()
+            ->push(['error' => 'Unauthenticated.'], 401)
+            ->push(['id' => 1, 'name' => 'Otro', 'email' => 'otro@example.com']),
+    ]);
+
+    expect(app(UserServiceClient::class)->authenticate('token-falso'))->toBeNull();
+
+    Http::assertSentCount(1);
+});
+
+it('never retries the sso exchange because its code is single-use', function () {
+    config(['user-service-client.retries' => 2, 'user-service-client.retry_delay_ms' => 0]);
+
+    Http::fake([
+        '*/api/sso/exchange' => Http::sequence()
+            ->push(['error' => 'boom'], 500)
+            ->push(ssoExchangePayload('token-emitido'), 201),
+    ]);
+
+    app(UserServiceClient::class)->exchangeCode('codigo-ss0', 'task');
+})->throws(UserServiceErrorException::class);
+
+it('opens the circuit after the configured number of consecutive failures', function () {
+    config([
+        'user-service-client.retries' => 0,
+        'user-service-client.retry_delay_ms' => 0,
+        'user-service-client.circuit_threshold' => 2,
+    ]);
+
+    fakeUserServiceDown();
+
+    $client = app(UserServiceClient::class);
+
+    foreach (range(1, 2) as $_) {
+        try {
+            $client->authenticate('token');
+        } catch (UserServiceUnavailableException) {
+            // esperado: el IdP no responde
+        }
+    }
+
+    try {
+        $client->authenticate('token');
+        $this->fail('El circuito abierto debía fallar en frío.');
+    } catch (UserServiceUnavailableException) {
+        // esperado, pero esta vez sin salir a la red
+    }
+
+    Http::assertSentCount(2);
+});
+
+it('lets traffic through again once the circuit cooldown expires', function () {
+    config([
+        'user-service-client.retries' => 0,
+        'user-service-client.retry_delay_ms' => 0,
+        'user-service-client.circuit_threshold' => 1,
+    ]);
+
+    Http::fake([
+        '*/api/user' => Http::sequence()
+            ->push(['error' => 'boom'], 500)
+            ->push(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com']),
+    ]);
+
+    // El 500 también es histórico de infra: alimenta el breaker.
+    try {
+        app(UserServiceClient::class)->authenticate('token');
+    } catch (UserServiceErrorException) {
+        // primer 500: abre el circuito
+    }
+
+    // Cooldown vencido: la llave ya no bloquea aunque siga guardada.
+    Cache::put(
+        'user-service-client.circuit.open_until',
+        now()->getTimestamp() - 1,
+        now()->addSeconds(5),
+    );
+
+    expect(app(UserServiceClient::class)->authenticate('token'))
+        ->toBe(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com']);
+});
+
+it('caches the verification result of a valid token for the next request', function () {
+    config(['user-service-client.cache_ttl' => 60]);
+
+    Http::fake(['*/api/user' => Http::response(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com'])]);
+
+    $this->withToken('token-valido')->getJson('/api/tasks')->assertOk();
+    $this->withToken('token-valido')->getJson('/api/tasks')->assertOk();
+
+    Http::assertSentCount(1);
+});
+
+it('caches the rejection of an invalid token too', function () {
+    config(['user-service-client.cache_ttl' => 60]);
+
+    Http::fake(['*/api/user' => Http::response(['error' => 'Unauthenticated.'], 401)]);
+
+    $this->withToken('token-falso')->getJson('/api/tasks')->assertUnauthorized();
+    $this->withToken('token-falso')->getJson('/api/tasks')->assertUnauthorized();
+
+    Http::assertSentCount(1);
+});
+
+it('verifies over http on every request when the cache is disabled', function () {
+    config(['user-service-client.cache_ttl' => 0]);
+
+    Http::fake(['*/api/user' => Http::response(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com'])]);
+
+    $this->withToken('token-valido')->getJson('/api/tasks')->assertOk();
+    $this->withToken('token-valido')->getJson('/api/tasks')->assertOk();
+
+    Http::assertSentCount(2);
+});
+
+it('answers with a fast 503 when the circuit is open', function () {
+    config([
+        'user-service-client.retries' => 0,
+        'user-service-client.retry_delay_ms' => 0,
+        'user-service-client.circuit_threshold' => 1,
+    ]);
+
+    Http::fake([
+        '*/api/user' => Http::sequence()
+            ->push(['error' => 'boom'], 500)
+            ->push(['id' => 7, 'name' => 'Luis', 'email' => 'luis@example.com']),
+    ]);
+
+    try {
+        app(UserServiceClient::class)->authenticate('token');
+    } catch (UserServiceErrorException) {
+        // primer 500: abre el circuito
+    }
+
+    $this->withSession([TokenSession::SESSION_KEY => 'token'])
+        ->get('/tasks')
+        ->assertStatus(503);
+
+    Http::assertSentCount(1);
 });

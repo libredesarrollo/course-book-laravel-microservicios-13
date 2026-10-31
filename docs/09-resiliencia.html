@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Resiliencia en el demo de microservicios: reintentos idempotentes, circuit breaker respaldado por caché y caché de verificación del token, todo dentro del paquete cliente del IdP.">
+<meta name="keywords" content="microservicios, laravel, resiliencia, circuit breaker, retries, sso, idp">
+<title>Resiliencia ante la caída del IdP — demo-microservicios</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Resiliencia ante la caída del IdP",
+  "about": ["resiliencia", "circuit breaker", "reintentos", "caché de verificación", "microservicios", "laravel"],
+  "inLanguage": "es"
+}
+</script>
+</head>
+<body>
+<article>
+
+<header>
+<h1>Resiliencia ante la caída del IdP</h1>
+<p><em>Capítulo de la serie de microservicios. Tras el SSO (<code>docs/08-que-se-hizo-sso.html</code>),
+el IdP quedó como la única dependencia capaz de tumbar a toda la aplicación. Este capítulo es
+lo que hacemos con eso: reintentos, circuit breaker y caché de verificación, todo dentro del
+paquete <code>demo/microservices-user-service-client</code>, sin que ningún RP cambie su código.</em></p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema que dejó el SSO</a></li>
+<li><a href="#piezas">Las tres piezas</a></li>
+<li><a href="#codigo">El código, pieza por pieza</a></li>
+<li><a href="#matriz">Comportamiento antes y después</a></li>
+<li><a href="#verificacion">Verificación real con los tres servicios</a></li>
+<li><a href="#config">Configuración</a></li>
+<li><a href="#elecciones">Elecciones y precios</a></li>
+</ol>
+</nav>
+
+<h2 id="problema">1. El problema que dejó el SSO</h2>
+
+<p>Con el login centralizado, cada request web de task-service y billing-service pasa por el
+middleware, que le pregunta al user-service quién es el dueño del token. Ese diseño evita
+duplicar el estado de identidad, con una consecuencia directa: <strong>si el IdP cae, no se
+puede autenticar a nadie</strong>, ni en la API ni en la web. Y hasta este capítulo, la única
+protección era un timeout de 3 segundos: cada request esperaba 3 s a un servicio muerto y
+devolvía un 503 lento. Una caída de un minuto del IdP convertía a toda la demo en un candado
+con tiempo de espera.</p>
+
+<p>La meta no era evitar la dependencia (es inherente al diseño), sino que la caída sea
+<strong>degradación breve y legible</strong>: fallar rápido, reintentar lo seguro y absorber
+picos con caché. Todo vive en el paquete, así que los servicios RP no cambian ninguna línea
+de su código de aplicación.</p>
+
+<h2 id="piezas">2. Las tres piezas</h2>
+
+<p>Toda la política de resiliencia se resuelve en la llamada que el paquete hace al IdP. Las piezas se desactivan de forma independiente poniendo su
+valor a <code>0</code> en el <code>.env</code>.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Pieza</th><th>Qué hace</th><th>En qué archivo vive</th></tr>
+<tr>
+<td><strong>Reintentos</strong></td>
+<td>Repite timeouts/5xx en peticiones idempotentes (GET y DELETE). Los POST no se repiten:
+el código SSO es de un solo uso, y repetirlo da un 400 engañoso.</td>
+<td><code>src/UserServiceClient.php</code> → <code>send()</code></td>
+</tr>
+<tr>
+<td><strong>Circuit breaker</strong></td>
+<td>Con <code>threshold</code> fallos consecutivos de infra queda abierto durante
+<code>cooldown</code> segundos y rechaza al instante: 503 en milisegundos, no en timeouts.
+Vencido el cooldown, pasa tráfico de nuevo; un fallo lo reabre. Su estado vive en la caché
+de la aplicación (file en local), no en memoria del proceso.</td>
+<td><code>src/Resiliency/CircuitBreaker.php</code></td>
+</tr>
+<tr>
+<td><strong>Caché de verificación</strong></td>
+<td>El middleware guarda <code>sha256(token) → usuario</code> durante <code>cache_ttl</code>
+segundos, y también el resultado negativo (token podrido). Los usuarios visibles dejan de
+golpear al IdP con el 401 de cada página; el precio declarado es una ventana de hasta
+<code>cache_ttl</code> segundos para notar una revocación.</td>
+<td><code>src/Http/Middleware/AuthenticateWithUserService.php</code> → <code>resolveUser()</code></td>
+</tr>
+</table>
+
+<h2 id="codigo">3. El código, pieza por pieza</h2>
+
+<p>Todo el HTTP del paquete pasa por <code>UserServiceClient::send()</code>, y ahí es donde
+enganche el breaker y los reintentos. Primero el breaker: consulta antes de ejecutar, y
+cada intento de conexión fallido y cada 5xx que agota sus reintentos son evidencia.
+Y toda respuesta recibida, incluso un 4xx, demuestra que el IdP está vivo y lo cierra:
+el circuito solo se preocupa por la infraestructura.</p>
+
+<pre><code>// packages/microservices-user-service-client/src/UserServiceClient.php
+private function send(callable $callback, bool $retryable = false): Response
+{
+    if ($this-&gt;breaker-&gt;isBlocked()) {
+        throw new UserServiceUnavailableException(
+            'El user-service no está disponible (circuito abierto).'
+        );
+    }
+
+    $attempts = $retryable
+        ? 1 + max(0, (int) config('user-service-client.retries', 2))
+        : 1;
+    $delayMs = max(0, (int) config('user-service-client.retry_delay_ms', 150));
+
+    for ($attempt = 1; ; $attempt++) {
+        $last = $attempt === $attempts;
+
+        try {
+            $response = $callback();
+        } catch (ConnectionException $exception) {
+            // Cada intento de conexión fallido es evidencia adicional.
+            $this-&gt;breaker-&gt;recordFailure();
+
+            if ($last) {
+                throw new UserServiceUnavailableException(
+                    'No se pudo contactar al user-service.',
+                    previous: $exception,
+                );
+            }
+
+            usleep($delayMs * 1000);
+
+            continue;
+        }
+
+        // El circuito solo se preocupa por la infraestructura: hasta un
+        // 4xx demuestra que el IdP está vivo y responde.
+        if ($response-&gt;successful() || $response-&gt;clientError()) {
+            $this-&gt;breaker-&gt;recordSuccess();
+
+            return $response;
+        }
+
+        if ($last || ! $retryable) {
+            if ($response-&gt;serverError()) {
+                $this-&gt;breaker-&gt;recordFailure();
+            }
+
+            return $response;
+        }
+
+        usleep($delayMs * 1000);
+    }
+}</code></pre>
+
+<p>Qué es <code>retryable</code>: <code>request()</code> (GET de <code>/api/user</code>) y
+<code>delete()</code> (revocación de token) lo son, <code>post()</code>
+(<code>/api/sso/exchange</code> y <code>/api/tokens</code>) no. Su estado vive en la caché
+de la aplicación, así que lo comparten todos los requests y workers del proceso:</p>
+
+<pre><code>// packages/microservices-user-service-client/src/Resiliency/CircuitBreaker.php
+class CircuitBreaker
+{
+    private const OPEN_UNTIL = 'user-service-client.circuit.open_until';
+    private const FAILURES = 'user-service-client.circuit.failures';
+
+    public function isBlocked(): bool
+    {
+        return now()-&gt;getTimestamp() &lt; (int) Cache::get(self::OPEN_UNTIL, 0);
+    }
+
+    public function recordSuccess(): void
+    {
+        Cache::forget(self::OPEN_UNTIL);
+        Cache::forget(self::FAILURES);
+    }
+
+    public function recordFailure(): void
+    {
+        $failures = (int) Cache::get(self::FAILURES, 0) + 1;
+
+        Cache::put(self::FAILURES, $failures, now()-&gt;addHours(1));
+
+        if ($failures &gt;= $this-&gt;threshold()) {
+            Cache::forget(self::FAILURES);
+
+            $cooldown = max(1, (int) config('user-service-client.circuit_cooldown', 30));
+
+            Cache::put(
+                self::OPEN_UNTIL,
+                now()-&gt;getTimestamp() + $cooldown,
+                now()-&gt;addSeconds($cooldown + 5),
+            );
+        }
+    }
+}</code></pre>
+
+<p>Y la pieza del middleware: la caché de la verificación, con su precio declarado en la
+documentación del método. También se recuerda el resultado negativo, para que un token
+inútil no repita su <code>401</code> contra el IdP.</p>
+
+<pre><code>// packages/microservices-user-service-client/src/Http/Middleware/AuthenticateWithUserService.php
+private function resolveUser(string $token): ?array
+{
+    $ttl = max(0, (int) config('user-service-client.cache_ttl', 60));
+
+    if ($ttl === 0) {
+        return $this-&gt;users-&gt;authenticate($token);
+    }
+
+    $key = self::USER_CACHE_PREFIX.hash('sha256', $token);
+
+    $cached = Cache::get($key);
+
+    if ($cached !== null) {
+        return $cached['user'] ?? null;
+    }
+
+    $user = $this-&gt;users-&gt;authenticate($token);
+
+    Cache::put($key, ['user' =&gt; $user], now()-&gt;addSeconds($ttl));
+
+    return $user;
+}</code></pre>
+
+<h2 id="matriz">4. Comportamiento antes y después</h2>
+
+<p>El IdP caído, en los cuatro escenarios posibles:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Estado</th><th>Antes</th><th>Ahora</th></tr>
+<tr>
+<td>Con la caché de verificación viva (menos de 60 s)</td>
+<td>503 lento (timeout de 3 s)</td>
+<td><strong>200</strong>: el usuario navega sin enterarse de que el IdP ya no está</td>
+</tr>
+<tr>
+<td>Sin caché, primer request</td>
+<td>503 en 3000 ms</td>
+<td>503 en ~340 ms: connection refused es instantáneo y los 2 reintentos
+(+ backoff de 150 ms) no esperan el timeout</td>
+</tr>
+<tr>
+<td>Sin caché, requests siguientes</td>
+<td>503 en 3000 ms cada uno</td>
+<td>503 en ~5 ms: el circuito ya está abierto y ni se intenta la red</td>
+</tr>
+<tr>
+<td>API</td>
+<td>503 lento con cuerpo JSON por el handler del RP</td>
+<td>Lo mismo, solo que rápido: el breaker lanza la misma
+<code>UserServiceUnavailableException</code> que ya se renderizaba</td>
+</tr>
+</table>
+
+<p>Nótese la última fila: el circuito no inventa un tipo de error nuevo. Lanza la excepción
+existente, y cada RP ya sabía renderizarla (503 con una página que explica cómo levantar el
+IdP). Lo único nuevo es <em>cuándo</em> se lanza.</p>
+
+<h2 id="verificacion">5. Verificación real con los tres servicios</h2>
+
+<p>Ejercicio medido con los tres servidores levantados, login real por el flujo SSO y
+<code>kill -9</code> al user-service del IdP:</p>
+
+<ol>
+<li><strong>Fase A (caché viva):</strong> matar el IdP y pedir de nuevo la página de tareas
+con la misma sesión → <code>200 en 11 ms</code>. El usuario no se entera.</li>
+<li><strong>Fase B (sin caché):</strong> limpiar la caché de la aplicación y repetir →
+<code>503 en 341 ms</code> (3 intentos de conexión, connection refused instantáneo, más
+backoff). El segundo request → <code>503 en 5 ms</code>: el circuito ya está abierto.</li>
+<li><strong>Fase C (recuperación):</strong> levantar de nuevo el IdP → los requests
+siguen saliendo <code>503 en 11 ms</code> por circuito abierto; pasados los 30 s del
+cooldown → <code>200 en 166 ms</code>, autenticándose en frío contra el IdP.</li>
+</ol>
+
+<p>Todo esto también está respaldado en tests: la suite del paquete
+(<code>task-service/tests/Feature/UserServiceClientPackageTest.php</code>) cubre el reintento
+con <code>Http::sequence()</code>, que GET/DELETE reintentan y POST no, el umbral del
+circuito, la recuperación tras el cooldown, el 503 en frío con el circuito abierto y la caché
+positiva/negativa del middleware, con un <code>Http::assertSentCount()</code> que prueba
+que al IdP le llega la cantidad exacta de llamadas.</p>
+
+<h2 id="config">6. Configuración</h2>
+
+<p>En <code>task-service/.env</code> y <code>billing-service/.env</code> (publica la config con
+<code>php artisan vendor:publish --tag=user-service-client-config</code> si necesitas tocar
+el archivo):</p>
+
+<pre><code>USER_SERVICE_URL=http://127.0.0.1:8000
+USER_SERVICE_TIMEOUT=3
+USER_SERVICE_RETRIES=2            # reintentos de peticiones idempotentes
+USER_SERVICE_RETRY_DELAY_MS=150   # pausa fija entre reintentos
+USER_SERVICE_CACHE_TTL=60         # segundos de caché de verificación (0 = sin caché)
+USER_SERVICE_CIRCUIT_THRESHOLD=3  # fallos consecutivos que abren el circuito
+USER_SERVICE_CIRCUIT_COOLDOWN=30  # segundos abierto antes de volver a sondear
+</code></pre>
+
+<h2 id="elecciones">7. Elecciones y precios</h2>
+
+<p><strong>El estado del breaker vive en la caché, no en memoria.</strong> Con
+<code>CACHE_STORE=file</code>, un <code>artisan serve</code> por puerto funciona, y con
+varios workers de PHP-FPM el breaker queda compartido: todos ven el circuito de la
+aplicación, no el del proceso.</p>
+
+<p><strong>Fallar en frío es lo correcto para la web</strong>: mejor un 503 inmediato con la
+página de error ya existente que tres segundos colgado por request. Y como el circuito abre
+al tercer fallo consecutivo, la ventana "lenta" dura un request.</p>
+
+<p><strong>Sin grace period</strong>: si el circuito está abierto y la caché también expiró,
+la respuesta es 503. No se acepta un token sin poder validarlo. La caché de 60 s es el único
+margen declarado, y es estrictamente a cambio de estar más rápido y no pisar al IdP.</p>
+
+<p><strong>El precio real está documentado donde se decide.</strong> La ventana de revocación
+(ya expuesta en el README) y el coste de la caché están en el PHPDoc de
+<code>resolveUser()</code> y en la config: que nadie fuerce <code>cache_ttl</code> a 3600 sin
+leer la advertencia del método.</p>
+
+<hr>
+
+<footer>
+<p><em>Estado del roadmap después de este capítulo:</em> rate limiting y observabilidad
+(capítulos 3 y 4), SSO (capítulo 8) y resiliencia (este) están hechos. Quedan los más
+pedagógicos y los más maduros del roadmap: Docker Compose, versionado de API, contratos de
+consumidor y colas. La referencia completa sigue en <code>docs/FLUJO-MICROSERVICIOS.md</code> y
+el detalle del paquete en <code>packages/microservices-user-service-client/README.md</code>.</p>
+</footer>
+
+</article>
+</body>
+</html>

@@ -42,7 +42,8 @@ ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por
 - ✅ **Errores tipados** (`UserServiceUnavailableException` / `UserServiceErrorException`) renderizados en un solo lugar
 - ✅ **CRUD completo**: API REST + interfaz web Blade, ambos con el mismo cliente
 - ✅ **Degradación controlada**: si el user-service cae, la UI lo explica en vez de romperse
-- ✅ 129 tests / 341 asserts, sin levantar los otros servicios (`Http::fake()`)
+- ✅ **Resiliencia ante la caída del IdP**: reintento idempotente, circuit breaker (503 en ms) y caché de verificación del token
+- ✅ 139 tests / 361 asserts, sin levantar los otros servicios (`Http::fake()`)
 
 ## Requisitos
 
@@ -199,7 +200,9 @@ curl -X POST http://127.0.0.1:8001/api/tasks \
 # 6. Otro usuario intenta tocar una tarea ajena -> 403
 curl -i http://127.0.0.1:8001/api/tasks/1 -H "Authorization: Bearer $TOKEN_DE_LUIS"
 
-# 7. user-service apagado (Ctrl+C) -> 503 en TODO
+# 7. user-service apagado (Ctrl+C) -> 503: el primero en ~340 ms, los demás en ~5 ms
+#    (circuito abierto). Y mientras la caché de verificación siga viva (60 s),
+#    la UI web responde 200 sin enterarse de que el IdP ya no está.
 curl -i http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -212,8 +215,8 @@ en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
 
 ```bash
 cd user-service && vendor/bin/pest --compact    # 53 tests, 166 asserts
-cd task-service && vendor/bin/pest --compact    # 67 tests, 147 asserts
-cd billing-service && vendor/bin/pest --compact # 9 tests, 28 asserts
+cd task-service && vendor/bin/pest --compact    # 76 tests, 165 asserts
+cd billing-service && vendor/bin/pest --compact # 10 tests, 30 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
@@ -223,9 +226,11 @@ que se ignora.
 Los paquetes de `packages/` también tienen cobertura propia, en
 `task-service/tests/Feature/UserServiceClientPackageTest.php`: tests sobre el cliente HTTP del
 user-service (resolución de token válido, token inválido, error del peer, servicio caído, emisión,
-revocación, propagación del `X-Request-Id` y el binding del contrato) y sobre el middleware
+revocación, propagación del `X-Request-Id` y el binding del contrato), sobre el middleware
 empaquetado (alias registrado, `401` en API, redirect en web, sesión descartada con token
-inválido) y el ciclo de vida de `TokenSession` (login, logout y logout con el peer caído).
+inválido), el ciclo de vida de `TokenSession` (login, logout y logout con el peer caído) y la
+**resiliencia** (reintento ante 5xx idempotente, `4xx`/POST que no se reintentan, circuito que
+abre tras el umbral y se recupera tras el cooldown, y caché de verificación positiva y negativa).
 
 `billing-service` también tiene pruebas web: arranque del flujo SSO, canje del código, acceso a
 `/facturas` y logout delegado al IdP (`billing-service/tests/Feature/InvoiceWebTest.php`).
@@ -293,6 +298,8 @@ demo-microservicios/
 │   ├── 03-rate-limit.html                ← el antes y el después del rate limiting
 │   ├── 04-observabilidad.html            ← correlation ID, health checks y trazabilidad
 │   ├── 05-modulos-composer.html          ← cómo empaquetar el código compartido con Composer
+│   ├── 08-que-se-hizo-sso.html           ← el capítulo SSO: flujo, canje de código y cookie
+│   ├── 09-resiliencia.html               ← retries, circuit breaker y caché ante la caída del IdP
 │   └── laravel-services.html             ← services en Laravel: qué son y cuándo usarlos
 │
 ├── packages/                         ← código compartido, empaquetado con Composer
@@ -302,10 +309,11 @@ demo-microservicios/
 │   │       └── Http/Controllers/HealthController.php
 │   └── microservices-user-service-client/    ← la frontera de red con el user-service
 │       ├── src/Contracts/IdentityProvider.php
-│       ├── src/UserServiceClient.php
+│       ├── src/UserServiceClient.php         ← con reintentos y breaker en send()
+│       ├── src/Resiliency/CircuitBreaker.php  ← breaker respaldado por caché
 │       ├── src/AuthenticatedUser.php        ← la identidad que confirmó el peer
 │       ├── src/TokenSession.php             ← sesión web respaldada por token remoto
-│       ├── src/Http/Middleware/AuthenticateWithUserService.php
+│       ├── src/Http/Middleware/AuthenticateWithUserService.php  ← con caché de verificación
 │       ├── src/Exceptions/
 │       └── config/user-service-client.php
 │
@@ -387,6 +395,14 @@ USER_SERVICE_TIMEOUT=3
 USER_SERVICE_CLIENT=task        # billing en el otro servicio
 USER_SERVICE_SSO_START_ROUTE=sso.start
 # USER_SERVICE_CALLBACK_URL=   # opcional; por defecto url('/sso/callback')
+
+# Resiliencia: reintentos idempotentes, caché del resultado de verificar
+# el token y circuit breaker. Defaults razonables; 0 desactiva cada pieza.
+USER_SERVICE_RETRIES=2
+USER_SERVICE_RETRY_DELAY_MS=150
+USER_SERVICE_CACHE_TTL=60
+USER_SERVICE_CIRCUIT_THRESHOLD=3
+USER_SERVICE_CIRCUIT_COOLDOWN=30
 ```
 
 Nada de URLs hardcodeadas: si el user-service cambia de host, solo tocas el `.env`.
@@ -405,9 +421,9 @@ middleware responde `401` en JSON, que es lo que necesita una API pura.
 
 ## Limitaciones honestas
 
-- **Un salto de red en cada request autenticado.** La latencia se suma a la de la base de datos.
-- **Sin circuit breaker.** Con el user-service caído, cada request espera los 3 s del timeout.
-- **La disponibilidad del task-service depende de la del user-service.**
+- **Un salto de red en cada request autenticado.** La caché de verificación lo suaviza (y absorbe picos), pero en frío el salto existe.
+- **La disponibilidad del task-service depende de la del user-service.** El circuit breaker y la caché la convierten en degradación breve (503 rápido, ventana de 60 s con caché viva), no en "todo roto"; dependencia inherente a validar la identidad por HTTP.
+- **La caché de verificación tiene hasta 60 s de ventana.** Un token revocado puede seguir autorizando hasta `USER_SERVICE_CACHE_TTL` segundos. Es el precio de la pieza y se ajusta en el `.env` (o a `0` para desactivarla).
 - **Sin refresh tokens, sin roles.** Solo "es tuya o no es tuya".
 - **El rate limit vive en caché de ficheros.** Con `CACHE_STORE=file` el límite es por instancia:
   con varias réplicas, el atacante dispone de N presupuestos. En producción, Redis.

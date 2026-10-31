@@ -22,7 +22,7 @@ class SsoStartController extends Controller
             'client' => $client,
             'redirect_uri' => $callback,
         ]);
-        
+
         return redirect()->away($authorize);
     }
 }

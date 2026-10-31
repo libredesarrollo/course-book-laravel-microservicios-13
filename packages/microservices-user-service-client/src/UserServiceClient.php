@@ -5,6 +5,7 @@ namespace Demo\Microservices\UserServiceClient;
 use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
+use Demo\Microservices\UserServiceClient\Resiliency\CircuitBreaker;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
@@ -14,7 +15,8 @@ use Illuminate\Support\Facades\Http;
  *
  * Todo el conocimiento sobre "cómo se habla con el user-service" vive aquí:
  * la URL base (config/user-service-client.php), el timeout, el manejo de
- * errores de red y la forma del JSON. Los controllers no saben nada del tema.
+ * errores de red, la política de reintentos, el circuit breaker y la forma
+ * del JSON. Los controllers no saben nada del tema.
  *
  * Es exactamente el patrón de un API Gateway / service client: encapsular la
  * frontera de red para que el resto de la aplicación trate al otro
@@ -22,6 +24,8 @@ use Illuminate\Support\Facades\Http;
  */
 class UserServiceClient implements IdentityProvider
 {
+    public function __construct(private readonly CircuitBreaker $breaker) {}
+
     /**
      * Resuelve quién es el dueño de un token opaco.
      *
@@ -116,7 +120,8 @@ class UserServiceClient implements IdentityProvider
     }
 
     /**
-     * Ejecuta la petición HTTP con la política de timeout compartida.
+     * Ejecuta la petición HTTP con la política de timeout compartida. Es
+     * idempotente: GET se puede repetir sin cambiar nada en el IdP.
      *
      * @param  array<string, string>  $headers
      *
@@ -129,10 +134,14 @@ class UserServiceClient implements IdentityProvider
         return $this->send(fn () => Http::acceptJson()
             ->withHeaders($headers)
             ->timeout($this->timeout())
-            ->get($this->baseUrl().$uri));
+            ->get($this->baseUrl().$uri), true);
     }
 
     /**
+     * POST no es idempotente para este cliente: el cuerpo de /api/sso/exchange
+     * es un código de un solo uso (repetirlo da un 400 engañoso) y /api/tokens
+     * emite tokens. No se reintentan; si cae, que caiga en frío.
+     *
      * @param  array<string, mixed>  $payload
      * @param  array<string, string>  $headers
      *
@@ -150,6 +159,8 @@ class UserServiceClient implements IdentityProvider
     }
 
     /**
+     * DELETE con token de revocación: idempotente. Repetirlo es inofensivo.
+     *
      * @param  array<string, string>  $headers
      *
      * @throws UserServiceUnavailableException
@@ -161,23 +172,76 @@ class UserServiceClient implements IdentityProvider
         return $this->send(fn () => Http::acceptJson()
             ->withHeaders($headers)
             ->timeout($this->timeout())
-            ->delete($this->baseUrl().$uri));
+            ->delete($this->baseUrl().$uri), true);
     }
 
     /**
+     * Ejecuta la petición con la política completa de resiliencia:
+     * circuit breaker + reintentos idempotentes.
+     *
+     * - Si el breaker está abierto, se lanza `UserServiceUnavailableException`
+     *   al instante: fallar en milisegundos en vez de esperar el timeout.
+     * - Cada intento que no logra conectar, y cada 5xx que se agota en
+     *   reintentos, son evidencia para el breaker. Toda respuesta recibida
+     *   (incluso un 4xx) prueba que el IdP está vivo y lo cierra.
+     * - Un 4xx se devuelve tal cual (es respuesta legítima). Un 5xx se
+     *   reintentará solo si es idempotente: el POST devuelve tal cual.
+     *
      * @param  callable(): Response  $callback
      *
      * @throws UserServiceUnavailableException
      */
-    private function send(callable $callback): Response
+    private function send(callable $callback, bool $retryable = false): Response
     {
-        try {
-            return $callback();
-        } catch (ConnectionException $exception) {
+        if ($this->breaker->isBlocked()) {
             throw new UserServiceUnavailableException(
-                'No se pudo contactar al user-service.',
-                previous: $exception,
+                'El user-service no está disponible (circuito abierto).'
             );
+        }
+
+        $attempts = $retryable
+            ? 1 + max(0, (int) config('user-service-client.retries', 2))
+            : 1;
+        $delayMs = max(0, (int) config('user-service-client.retry_delay_ms', 150));
+
+        for ($attempt = 1; ; $attempt++) {
+            $last = $attempt === $attempts;
+
+            try {
+                $response = $callback();
+            } catch (ConnectionException $exception) {
+                // Cada intento de conexión fallido es evidencia adicional.
+                $this->breaker->recordFailure();
+
+                if ($last) {
+                    throw new UserServiceUnavailableException(
+                        'No se pudo contactar al user-service.',
+                        previous: $exception,
+                    );
+                }
+
+                usleep($delayMs * 1000);
+
+                continue;
+            }
+
+            // El circuito solo se preocupa por la infraestructura: hasta un
+            // 4xx demuestra que el IdP está vivo y responde.
+            if ($response->successful() || $response->clientError()) {
+                $this->breaker->recordSuccess();
+
+                return $response;
+            }
+
+            if ($last || ! $retryable) {
+                if ($response->serverError()) {
+                    $this->breaker->recordFailure();
+                }
+
+                return $response;
+            }
+
+            usleep($delayMs * 1000);
         }
     }
 

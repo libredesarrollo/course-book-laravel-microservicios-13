@@ -10,6 +10,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Redirector;
 use Illuminate\Routing\UrlGenerator;
+use Illuminate\Support\Facades\Cache;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
@@ -21,7 +22,10 @@ use Symfony\Component\HttpFoundation\Response;
  *
  * Consecuencia directa: si el user-service está caído, el consumidor deja
  * de poder autenticar a nadie. Ese acoplamiento es inherente al diseño
- * "validar por HTTP" y es el trade-off que evita un JWT stateless.
+ * "validar por HTTP" y es el trade-off que evita un JWT stateless. Los que
+ * lo suavizan viven en el paquete: reintentos, circuit breaker y esta
+ * caché corta del resultado de verificación, para no repetir el salto HTTP
+ * en cada página que el usuario abre.
  *
  * Vive en el paquete porque es la última pieza de la frontera: el cliente
  * HTTP habla con el peer, el contrato abstrae esa frontera y este middleware
@@ -29,6 +33,8 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class AuthenticateWithUserService
 {
+    private const USER_CACHE_PREFIX = 'user-service-client.auth.';
+
     public function __construct(
         private readonly IdentityProvider $users,
         private readonly Redirector $redirector,
@@ -45,7 +51,7 @@ class AuthenticateWithUserService
             return $this->reject($request);
         }
 
-        $user = $this->users->authenticate($token);
+        $user = $this->resolveUser($token);
 
         if ($user === null) {
             // Token caducado o revocado: la sesión web tampoco sirve ya.
@@ -64,6 +70,40 @@ class AuthenticateWithUserService
         );
 
         return $next($request);
+    }
+
+    /**
+     * Resuelve quién es el dueño del token, con caché corta.
+     *
+     * Sin caché, cada página accedida por cada usuario del RP cuesta un
+     * salto de red al IdP. Guardar la verificación unos segundos solo vale
+     * si el precio queda declarado: hasta `cache_ttl` segundos de retraso
+     * para notar una revocación. También se recuerda el resultado negativo,
+     * para que un token podrido no repita su 401 contra el IdP.
+     *
+     * @return array{id: int, name: string, email: string}|null
+     */
+    private function resolveUser(string $token): ?array
+    {
+        $ttl = max(0, (int) config('user-service-client.cache_ttl', 60));
+
+        if ($ttl === 0) {
+            return $this->users->authenticate($token);
+        }
+
+        $key = self::USER_CACHE_PREFIX.hash('sha256', $token);
+
+        $cached = Cache::get($key);
+
+        if ($cached !== null) {
+            return $cached['user'] ?? null;
+        }
+
+        $user = $this->users->authenticate($token);
+
+        Cache::put($key, ['user' => $user], now()->addSeconds($ttl));
+
+        return $user;
     }
 
     /**

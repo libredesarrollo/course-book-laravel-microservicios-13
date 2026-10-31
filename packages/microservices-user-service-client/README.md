@@ -10,10 +10,11 @@ HTTP, el contrato, el middleware que la engancha al ciclo de vida de Laravel y e
 servicio de sesión con token remoto.
 
 - `IdentityProvider` — el contrato (interfaz) que consume la aplicación.
-- `UserServiceClient` — la implementación HTTP.
-- `AuthenticateWithUserService` — el middleware que autentica preguntando al peer.
+- `UserServiceClient` — la implementación HTTP (con reintentos y circuit breaker).
+- `AuthenticateWithUserService` — el middleware que autentica preguntando al peer (con caché de verificación).
 - `AuthenticatedUser` — la identidad que devuelve el peer, ya tipada.
 - `TokenSession` — el ciclo de vida de la sesión web respaldada por un token.
+- `CircuitBreaker` — el breaker del cliente HTTP, respaldado por la caché de la app.
 - `UserServiceUnavailableException` — el servicio no respondió (caída de red).
 - `UserServiceErrorException` — el servicio respondió con error.
 
@@ -44,6 +45,12 @@ USER_SERVICE_CLIENT=mi-app
 USER_SERVICE_CALLBACK_URL=
 # Opcional: nombre de la ruta que arranca el flujo SSO (por defecto sso.start).
 USER_SERVICE_SSO_START_ROUTE=sso.start
+# Resiliencia (defaults razonables; pon 0 para desactivar cada pieza).
+USER_SERVICE_RETRIES=2
+USER_SERVICE_RETRY_DELAY_MS=150
+USER_SERVICE_CACHE_TTL=60
+USER_SERVICE_CIRCUIT_THRESHOLD=3
+USER_SERVICE_CIRCUIT_COOLDOWN=30
 ```
 
 Para publicar el archivo de configuración en la aplicación:
@@ -153,6 +160,27 @@ error: es la respuesta normal a un token caducado o revocado.
 Todas las peticiones reenvían el `X-Request-Id` de la petición entrante, para que la
 traza cruce los dos servicios. Funciona junto con `demo/microservices-observability`.
 
+## Resiliencia
+
+El IdP es la única dependencia que puede tumbar a toda la aplicación: sin él, no
+puede autenticar a nadie. El paquete hace esa caída **degradación breve** en vez
+de "todo el sistema muerto con 3 s de espera por request":
+
+| Pieza | Qué hace | Dónde vive |
+|---|---|---|
+| Reintentos | Repite timeouts/5xx en peticiones idempotentes (GET y DELETE). Los POST no se repiten: el código SSO es de un solo uso. | `UserServiceClient::send()` |
+| Circuit breaker | Con `circuit_threshold` fallos consecutivos de infra queda abierto durante `circuit_cooldown` segundos y rechaza al instante (503 en ms, no en timeouts). Vencido el cooldown, vuelve a passar tráfico y un fallo lo reabre. | `Resiliency/CircuitBreaker` + `send()` |
+| Caché de verificación | El middleware guarda `sha256(token) → usuario` durante `cache_ttl` segundos, y también el resultado negativo. Menos saltos HTTP al IdP; precio declarado: hasta `cache_ttl` segundos de retraso para notar una revocación. | `AuthenticateWithUserService::resolveUser()` |
+
+Comportamiento medido con los tres servicios reales (IdP muerto, sin caché):
+primer request `503` en ~340 ms (3 intentos de conexión + backoff); los
+siguientes, `503` en ~5 ms por circuito abierto; con la caché viva, el usuario
+sigue navegando `200` sin enterarse de que el IdP ya no está.
+
+Las tres piezas se desactivan de forma independiente poniendo su valor a `0`
+(`retries`, `cache_ttl`), o se ajustan por `.env`; el breaker es de aplicación
+(vive en la caché de cada RP, no en memoria del proceso).
+
 ## Tests
 
 El cliente no necesita el otro servicio para probarse: `Http::fake()` basta.
@@ -160,6 +188,10 @@ El cliente no necesita el otro servicio para probarse: `Http::fake()` basta.
 ```php
 Http::fake(['*/api/user' => Http::response(['id' => 1, 'name' => 'Ana', 'email' => 'ana@example.com'])]);
 ```
+
+La resiliencia también es fake-able: `Http::sequence()` permite encadenar un
+5xx y un 200 para probar el reintento, y el breaker se manipula con
+`Cache::put('user-service-client.circuit.open_until', ...)`.
 
 ## Formateo
 

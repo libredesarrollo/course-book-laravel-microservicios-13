@@ -98,3 +98,12 @@ it('closes the local session and hands the logout to the user-service', function
         ]))
         ->assertSessionMissing(TokenSession::SESSION_KEY);
 });
+
+it('shows a 503 page when the user-service is unreachable', function () {
+    Http::fake(['*' => Http::failedConnection()]);
+
+    $this->withSession([TokenSession::SESSION_KEY => 'token'])
+        ->get('/facturas')
+        ->assertStatus(503)
+        ->assertSee('user-service no disponible');
+});
