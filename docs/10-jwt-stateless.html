@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="JWT stateless en el demo de microservicios: el IdP firma RS256, publica la JWKS y los relying parties verifican localmente con firebase/php-jwt, sin saltos de red por request.">
+<meta name="keywords" content="microservicios, laravel, jwt, rs256, jwks, stateless, sso, idp, firebase/php-jwt">
+<title>JWT stateless: la clave pública en vez del salto de red — demo-microservicios</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "JWT stateless: la clave pública en vez del salto de red",
+  "about": ["jwt", "rs256", "jwks", "stateless", "identity provider", "microservicios", "laravel"],
+  "inLanguage": "es"
+}
+</script>
+</head>
+<body>
+<article>
+
+<header>
+<h1>JWT stateless: la clave pública en vez del salto de red</h1>
+<p><em>Capítulo de la serie de microservicios. Tras la resiliencia
+(<code>docs/09-resiliencia.html</code>), ya supimos caer bien; ahora la pregunta es qué pasaba si
+ni siquiera hacía falta preguntar: el IdP firma un <strong>JWT con RS256</strong>, publica su
+clave pública en un endpoint JWKS, y los relying parties verifican la firma localmente. El salto
+de red de <code>GET /api/user</code> por cada request desaparece del camino. Todo sigue hablando
+el mismo contrato del paquete <code>demo/microservices-user-service-client</code>: ni un cambio
+en los RPs.</em></p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema que quedó pendiente</a></li>
+<li><a href="#idea">La idea: la identidad viaja en el token</a></li>
+<li><a href="#idp">En el IdP: emitir y publicar</a></li>
+<li><a href="#rp">En el paquete: verificar en local</a></li>
+<li><a href="#compat">Compatibilidad: los dos modos conviven</a></li>
+<li><a href="#revocacion">El talón de Aquiles: revocar lo que nadie guarda</a></li>
+<li><a href="#verificacion">Verificación real con los tres servicios</a></li>
+<li><a href="#config">Configuración</a></li>
+<li><a href="#elecciones">Elecciones y precios</a></li>
+</ol>
+</nav>
+
+<h2 id="problema">El problema que quedó pendiente</h2>
+<p>Con el diseño de token opaco (b0.6), el flujo regular de un request autenticado en el RP era:</p>
+<ol>
+<li>el cliente llega con un token opaco (cadena aleatoria);</li>
+<li>el middleware del RP pregunta al IdP <code>GET /api/user</code> — salto de red;</li>
+<li>el IdP busca la fila <code>api_tokens</code> por SHA-256 y carga al usuario;</li>
+<li>el IdP responde con el dueño del token.</li>
+</ol>
+<p>La resiliencia nos protege del paso 2 cuando el IdP está caído. Pero el paso 2 sigue
+existiendo: con 100 usuarios que abren su listado, y hay N usuarios, son N llamadas de red por nada. El precio es el <strong>salto de red por request</strong>, y hasta b0.7 quedaba en pie.</p>
+<p>¿Qué pasa si, en vez de preguntarle al IdP de quién es el token, el IdP nos entrega un token
+que <strong>ya trae</strong> la respuesta y va <strong>firmado</strong>?</p>
+
+<h2 id="idea">La idea: la identidad viaja en el token</h2>
+<p>Un JWT es una afirmación firmada: <code>header.payload.signature</code>. El payload dice:
+"quién es el usuario, quién firma, y hasta cuándo es válido". La firma, con la clave
+<strong>privada</strong> del IdP; la verificación, con la clave <strong>pública</strong> — que
+puede publicarse sin miedo: lo que protege al sistema es que nadie más tiene la privada, no que
+nadie vea la pública.</p>
+<p>La clave pública va en formato <strong>JWKS</strong>
+(<code>JSON Web Key Set</code>), el estándar que usa todo el mundo incluido OIDC: con
+<code>kty</code> (tipo), <code>n</code> y <code>e</code> (componentes RSA) y un
+<code>kid</code> (id de la clave) que el RP usa para saber con cuál verificar.</p>
+<p>El contrato del paquete se mantiene intacto. Los cambios de b0.7:</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Cosa</th><th>Antes (token opaco)</th><th>Ahora (JWT)</th></tr>
+<tr><td>Emitir (login y SSO)</td><td>Fila aleatoria SHA-256 en <code>api_tokens</code></td><td>JWT RS256 firmado por el IdP; no se guarda nada</td></tr>
+<tr><td>Verificar por request</td><td><code>GET /api/user</code> por HTTP</td><td>Firma verificada local con la JWKS cacheada</td></tr>
+<tr><td>Revocar</td><td>Borrar la fila (inmediato)</td><td>Expirar (hasta <code>JWT_TTL_MINUTES</code>, 15 min)</td></tr>
+</table>
+
+<h2 id="idp">En el IdP: emitir y publicar</h2>
+<h3>El par de claves</h3>
+<p><code>php artisan user-service:jwt-keys</code> genera el par RS2048 en
+<code>storage/app/jwt/</code> — privada nunca versionada (el <code>storage/app/.gitignore</code>
+del Laravel nuevo ya la excluye). El <code>kid</code> se deriva del hash del módulo de la
+pública: estable mientras dura el par, y distinto para el próximo par. Eso es la rotación:
+regenerar el par invalida todos los JWT vivos y los RPs refetch al ver un <code>kid</code>
+desconocido.</p>
+<h3>La firma</h3>
+<pre><code>// user-service/app/Services/Jwt/JwtTokenIssuer.php
+$payload = [
+    'iss' =&gt; (string) config('jwt.issuer'),   // user-service: a quién le da validez
+
+    // La foto de identidad: `sub` es el id del usuario; name y email van de
+    // conveniencia, para que el RP no pregunte de nuevo.
+    'sub' =&gt; (string) $user-&gt;id,
+    'name' =&gt; $user-&gt;name,
+    'email' =&gt; $user-&gt;email,
+
+    // Momentos: iat = cuándo se emitió, exp = cuándo vence (iat + TTL)
+    'iat' =&gt; (int) $issuedAt-&gt;getTimestamp(),
+    'exp' =&gt; (int) $expiresAt-&gt;getTimestamp(),
+
+    // jti: id único del token; sirve para correlacionar un token en los logs
+    // sin exponer su contenido.
+    'jti' =&gt; bin2hex(random_bytes(16)),
+    'device_name' =&gt; $deviceName,             // metadata
+];
+
+$token = JWT::encode($payload, $this-&gt;keys-&gt;privateKey(), 'RS256', $this-&gt;keys-&gt;kid());</code></pre>
+<h3>El endpoint JWKS</h3>
+<p><code>GET /api/jwks.json</code>, ruta pública a propósito:</p>
+
+<pre><code>{
+  "keys": [{
+    "kty": "RSA", "use": "sig", "alg": "RS256",
+    "kid": "e64e4ca4bb8d7e2a",
+    "n": "0wzG…", "e": "AQAB"
+  }]
+}</code></pre>
+
+<h3>La fachada de emisión</h3>
+<p>El conmutador de modo vive en <code>AccessTokenIssuer</code>.</p>
+
+<pre><code>// user-service/app/Services/Jwt/AccessTokenIssuer.php
+public function issue(User $user, string $deviceName): array
+{
+    if (config('tokens.mode') === 'jwt') {
+        $issued = $this-&gt;jwtIssuer-&gt;issue($user, $deviceName);
+
+        return [
+            'token' =&gt; $issued['token'],
+            'token_type' =&gt; 'Bearer',
+            'expires_at' =&gt; $issued['expires_at']-&gt;toIso8601String(),
+            'api_token' =&gt; null,
+        ];
+    }
+
+    $opaque = ApiToken::issueFor($user, $deviceName, now()-&gt;addMinutes((int) config('tokens.ttl_minutes')));
+
+    return [
+        'token' =&gt; $opaque['token'],
+        'token_type' =&gt; 'Bearer',
+        'expires_at' =&gt; $opaque['model']-&gt;expires_at?-&gt;toIso8601String(),
+        'api_token' =&gt; $opaque['model'],
+    ];
+}</code></pre>
+
+<h2 id="rp">En el paquete: verificar en local</h2>
+<h3>El store de claves pública</h3>
+<p><code>JwkKeyStore</code> baja la JWKS una vez, la guarda en la caché del RP durante
+<code>user-service-client.jwt.jwks_cache_ttl</code> (típico: 1 hora) y, cuando arranca un token
+con un <code>kid</code> desconocido, fuerza refetch: la rotación no requiere despliegue. Con ttl
+<code>0</code> pregunta por HTTP en cada verificación (el trade-off del cache del middleware
+ahora para las claves).</p>
+<h3>El verificador</h3>
+<p><code>JwtVerifier</code> usa la misma lib (<code>firebase/php-jwt</code>) que el IdP:</p>
+<pre><code>// packages/microservices-user-service-client/src/Jwt/JwtVerifier.php
+try {
+    JWT::$leeway = max(0, (int) config('user-service-client.jwt.leeway', 10));
+
+    $claims = JWT::decode($token, $this-&gt;keys-&gt;keySet($this-&gt;kidOf($token)));
+} catch (\Throwable) {
+    return null;   // firma corrupta, expirado, kid desconocido, formato roto
+}
+
+if ((string) ($claims-&gt;iss ?? '') !== (string) config('user-service-client.jwt.issuer', 'user-service')) {
+    return null;
+}
+
+return [
+    'id' =&gt; (int) $claims-&gt;sub,
+    'name' =&gt; (string) $claims-&gt;name,
+    'email' =&gt; (string) $claims-&gt;email,
+];</code></pre>
+<h3>La nueva implementación del contrato</h3>
+<pre><code>// packages/microservices-user-service-client/src/Jwt/JwtIdentityProvider.php
+public function authenticate(string $token): ?array
+{
+    $user = $this-&gt;verifier-&gt;verify($token);
+
+    if ($user !== null) {
+        return $user;
+    }
+
+    if (substr_count($token, '.') === 2) {
+        // Parecía JWT y no lo es: firmado por otro iss, expirado,
+        // corrompido. No hay a quién preguntarle vía HTTP — un JWT no
+        return null;
+    }
+
+    return $this-&gt;clients-&gt;authenticate($token);
+}</code></pre>
+
+<h3>El binding del service provider</h3>
+
+<pre><code>// packages/microservices-user-service-client/src/UserServiceClientServiceProvider.php
+$this-&gt;app-&gt;singleton(JwkKeyStore::class);
+$this-&gt;app-&gt;singleton(JwtVerifier::class);
+
+// Desde b0.7 el default verifica JWT localmente (con refetch de JWKS y el
+// cliente HTTP de respaldo para los opacos y para emitir).
+$this-&gt;app-&gt;bind(IdentityProvider::class, JwtIdentityProvider::class);</code></pre>
+
+<h2 id="compat">Compatibilidad: los dos modos conviven</h2>
+<p>No hay interruptor del lado RP, ni <code>memo</code>: el modo lo define el IdP al emitir, y el
+RP lo elige guiado por la <strong>forma del token</strong>. Tres segmentos separados por punto →
+verificación local. Lo demás → flecha del cliente HTTP. Un token opaco emitido con
+<code>TOKEN_MODE=opaque</code> sigue funcionando como toda la vida; un JWT expirado lo da 401 sin
+ir a la red (aunque es importante: el middleware cachea los <code>null</code> con el
+<code>cache_ttl</code> de b0.6 para no repetir verificaciones fallidas).</p>
+
+<p><code>DELETE /api/tokens</code> sigue siendo el contrato del logout en alguna cases: con un
+token opaco destruye la fila; con JWT es un no-op que responde 204 igual, para que los
+consumidores no dependan de lo que te pasa detrás.</p>
+
+<h2 id="revocacion">El talón de Aquiles: revocar lo que nadie guarda</h2>
+<p>El precio del stateless es puntual: si no hay filas que borrar, no hay cómo invalidar un
+token antes de que expire. Mitigamos con el TTL corto (<code>JWT_TTL_MINUTES=15</code>): el
+máximo daño de un token robado es un cuarto de hora. Y en el flujo web (SSO), el usuario ni lo
+nota: la sesión del IdP es la del flujo; el JWT viaja con la sesión del navegador, y el logout central del IdP invalida las
+sesiones de los RPs ya visitados (b0.5).</p>
+
+<h2 id="verificacion">Verificación real con los tres servicios</h2>
+<p>Levantados los tres servicios sobre <code>php artisan serve</code>, login real con curl e
+invocaciones de <code>kill -9</code> al user-service:</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Escenario</th><th>Modo</th><th>Resultado medido</th></tr>
+<tr>
+<td>Login real (<code>POST /api/tokens</code> con credenciales válidas)</td>
+<td>jwt</td>
+<td><strong>201</strong> con JWT en <code>token</code> y cero filas en <code>api_tokens</code></td>
+</tr>
+<tr>
+<td><code>GET /api/tasks</code> con JWT, request mismo arranque</td>
+<td>jwt</td>
+<td><strong>200 en 180 ms</strong> — JWKS fetch + verificación (cache generada)</td>
+</tr>
+<tr>
+<td><code>GET /api/tasks</code> repetida sobre la misma JWKS</td>
+<td>jwt</td>
+<td><strong>200 en 4–6 ms</strong> — cero llamadas al IdP</td>
+</tr>
+<tr>
+<td><strong>IdP <code>kill -9</code></strong>, JWKS cacheada y verificación local</td>
+<td>jwt</td>
+<td><strong>200 en 4–11 ms</strong> — task-service sigue autenticando con el IdP muerto</td>
+</tr>
+<tr>
+<td>Lo mismo con token opaco (b0.6)</td>
+<td>opaque</td>
+<td>503 en 5 ms (circuito abierto) o 200 con caché de verificación viva</td>
+</tr>
+</table>
+
+<p>El quinto renglón es el que se compara contra la historia: el 200 "con el IdP muerto" era un
+lujo de la caché (60 s); ahora es el camino regular.</p>
+
+<h2 id="config">Configuración</h2>
+<p>Del lado RP (<code>task-service</code> / <code>billing-service</code>):</p>
+
+<pre><code>USER_SERVICE_JWKS_URL=http://127.0.0.1:8000/api/jwks.json
+USER_SERVICE_JWT_ISSUER=user-service
+USER_SERVICE_JWT_LEEWAY=10
+USER_SERVICE_JWKS_CACHE_TTL=3600</code></pre>
+
+<p>Del lado IdP (<code>user-service</code>):</p>
+
+<pre><code>TOKEN_MODE=jwt          # jwt | opaque
+JWT_TTL_MINUTES=15
+JWT_ISSUER=user-service
+JWT_LEEWAY=10
+# Si mueves el par de sitio, declara JWT_PRIVATE_KEY / JWT_PUBLIC_KEY. Genera el par con:
+# php artisan user-service:jwt-keys</code></pre>
+
+<h2 id="elecciones">Elecciones y precios</h2>
+<ul>
+<li><strong>RS256, no HS256.</strong> Con secreto compartido cualquier RP podría <em>fabricar</em>
+tokens; con par asimétrico solo el IdP firma. El precio: el par vive en disco y hay que
+generarlo — es exactamente para eso el comando de claves.</li>
+<li><strong><code>iss</code> explícito.</strong> Un JWT bien firmado de otro emisor se rechaza:
+redundante con la verificación de firma y por eso defensa en profundidad.</li>
+<li><strong>Leeway en exp</strong> (10 s): los relojes entre máquinas se desvían; el margen
+e evita rechazar tokens legítimos por segundos. Vale 10 s más de vida para un recién expirado.</li>
+<li><strong><code>kid</code> derivado del material</strong>: estable mientras dura el par, y
+independiente del deployment — cada deploy no rota por accidente.</li>
+<li><strong>Verificar no toca ninguna base de datos.</strong> Ni la del RP ni la del IdP: la
+firma basta. El IdP solo consulta <code>users</code> cuando él mismo recibe su JWT — para que
+un <code>sub</code> con fila borrada no autentique por un claim viejo.</li>
+<li><strong>Sin refresh tokens todavía</strong>: está el sitio pensado
+(<code>/api/tokens/refresh</code>) como deja claro <code>config/tokens.php</code>.</li>
+</ul>
+
+</article>
+</body>
+</html>

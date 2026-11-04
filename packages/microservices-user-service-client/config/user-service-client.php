@@ -94,4 +94,37 @@ return [
 
     'sso_start_route' => env('USER_SERVICE_SSO_START_ROUTE', 'sso.start'),
 
+    /*
+    |--------------------------------------------------------------------------
+    | JWT del IdP (b0.7)
+    |--------------------------------------------------------------------------
+    |
+    | Con este bloque, el RP valida los access tokens por su cuenta: baja la
+    | clave pública del IdP una vez (JWKS), la cachea y verifica firmas
+    | RS256 sin llamar al IdP en cada request.
+    |
+    | jwks_url:       dónde viven las claves publicadas (GET del IdP).
+    | issuer:         el valor exacto del claim `iss` que emite el IdP; un
+    |                 JWT bien firmado pero de otro emisor no vale.
+    | leeway:         segundos de desvío de reloj tolerados entre servicios.
+    | jwks_cache_ttl: segundos que vive la JWKS en caché; con 0 se pregunta
+    |                 por HTTP en cada verificación (igual al trade-off de
+    |                 cache_ttl del middleware).
+    |
+    | No hay interruptor de modo: si el token tiene forma de JWT (tres
+    | segmentos) se verifica local; si es opaco, cae al cliente HTTP. El
+    | modo lo determina el IdP al emitir.
+    |
+    */
+
+    'jwt' => [
+        'jwks_url' => env('USER_SERVICE_JWKS_URL', 'http://127.0.0.1:8000/api/jwks.json'),
+
+        'issuer' => env('USER_SERVICE_JWT_ISSUER', 'user-service'),
+
+        'leeway' => (int) env('USER_SERVICE_JWT_LEEWAY', 10),
+
+        'jwks_cache_ttl' => (int) env('USER_SERVICE_JWKS_CACHE_TTL', 3600),
+    ],
+
 ];

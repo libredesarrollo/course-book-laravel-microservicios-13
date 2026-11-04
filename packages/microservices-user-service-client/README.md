@@ -51,6 +51,11 @@ USER_SERVICE_RETRY_DELAY_MS=150
 USER_SERVICE_CACHE_TTL=60
 USER_SERVICE_CIRCUIT_THRESHOLD=3
 USER_SERVICE_CIRCUIT_COOLDOWN=30
+# JWT stateless (verificación local; ver la sección "JWT stateless").
+USER_SERVICE_JWKS_URL=http://127.0.0.1:8000/api/jwks.json
+USER_SERVICE_JWT_ISSUER=user-service
+USER_SERVICE_JWT_LEEWAY=10
+USER_SERVICE_JWKS_CACHE_TTL=3600
 ```
 
 Para publicar el archivo de configuración en la aplicación:
@@ -180,6 +185,24 @@ sigue navegando `200` sin enterarse de que el IdP ya no está.
 Las tres piezas se desactivan de forma independiente poniendo su valor a `0`
 (`retries`, `cache_ttl`), o se ajustan por `.env`; el breaker es de aplicación
 (vive en la caché de cada RP, no en memoria del proceso).
+
+## JWT stateless
+
+Desde b0.7 el default de `IdentityProvider` verifica **JWT RS256 en local**
+(`JwtIdentityProvider`): si el token tiene tres segmentos, se valida la firma
+contra la JWKS del IdP — sin tocar el HTTP por request. La JWKS se cachea
+(`jwks_cache_ttl`, 1 h por defecto) y un `kid` desconocido fuerza refetch,
+así que la rotación de claves del IdP no pide desplegar.
+
+- **Modo lo decide el IdP**: mientras el IdP emita JWT (`TOKEN_MODE=jwt`), los
+  RPs verifican local. Un token opaco emitido antes sigue funcionando igual:
+  el RP mira la forma del token (tres segmentos = JWT, lo demás = opaco).
+- **Medición** (task-service real, IdP `kill -9`): `200` en 4–11 ms con JWT,
+  contra `503` en ~5 ms (circuito abierto) del modo opaco.
+- **Contrapartida**: un JWT no se puede revocar antes de su `exp`; el logout
+  central sigue matando sesiones, y el `DELETE /api/tokens` es no-op para JWT.
+- Test del JWT en el RP: `task-service/tests/Feature/UserServiceClientPackageTest.php`,
+  sección `Verificación local de JWT (b0.7)`, con `signTestJwt()`.
 
 ## Tests
 

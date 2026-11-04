@@ -33,7 +33,7 @@ ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por
 
 - ✅ Aislamiento real de datos: **tres bases de datos, cero FKs cruzadas**
 - ✅ Comunicación **síncrona por HTTP** en cada request (`UserServiceClient`)
-- ✅ **Tokens opacos** con SHA-256: revocables de inmediato, sin JWT
+- ✅ **Tokens de API en dos modos**: opaco revocable de inmediato o JWT RS256 con expiración corta; el modo es una llave de config
 - ✅ Un **middleware** que autentica contra el IdP (`AuthenticateWithUserService`)
 - ✅ **Login único**: solo `user-service` tiene formulario, credenciales y tabla `users`
 - ✅ **SSO por código de un solo uso** entre RPs, con whitelist de `redirect_uri`
@@ -43,7 +43,8 @@ ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por
 - ✅ **CRUD completo**: API REST + interfaz web Blade, ambos con el mismo cliente
 - ✅ **Degradación controlada**: si el user-service cae, la UI lo explica en vez de romperse
 - ✅ **Resiliencia ante la caída del IdP**: reintento idempotente, circuit breaker (503 en ms) y caché de verificación del token
-- ✅ 139 tests / 361 asserts, sin levantar los otros servicios (`Http::fake()`)
+- ✅ **JWT stateless (b0.7)**: el IdP firma con RS256 y publica `/api/jwks.json`; los RPs verifican localmente — **medido: IdP caído y el RP sigue autenticando con `200` en ~5 ms**
+- ✅ 158 tests / 431 asserts, sin levantar los otros servicios (`Http::fake()`)
 
 ## Requisitos
 
@@ -200,10 +201,23 @@ curl -X POST http://127.0.0.1:8001/api/tasks \
 # 6. Otro usuario intenta tocar una tarea ajena -> 403
 curl -i http://127.0.0.1:8001/api/tasks/1 -H "Authorization: Bearer $TOKEN_DE_LUIS"
 
-# 7. user-service apagado (Ctrl+C) -> 503: el primero en ~340 ms, los demás en ~5 ms
-#    (circuito abierto). Y mientras la caché de verificación siga viva (60 s),
-#    la UI web responde 200 sin enterarse de que el IdP ya no está.
+# 7. user-service apagado (Ctrl+C):
+#    - con TOKEN_MODE=opaque -> 503: el primero en ~340 ms, los demás en ~5 ms
+#      (circuito abierto). Con la caché de verificación viva (60 s), 200.
+#    - con TOKEN_MODE=jwt -> 200 en ~5 ms SIEMPRE: la verificación es local
+#      (firma RS256 con la clave pública cacheada del endpoint JWKS).
 curl -i http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+```
+
+```bash
+# 8. Login y decodificación del JWT, para verlo por dentro: header.payload.signature.
+#    El payload trae sub/name/email/iat/exp/jti; el header, kid y alg RS256.
+TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/tokens \
+  -H "Content-Type: application/json" \
+  -d '{"email":"ana.torres@example.com","password":"password"}' | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
+echo $TOKEN
+curl -s http://127.0.0.1:8000/api/jwks.json | python3 -m json.tool
+curl http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
 ```
 
 **Postman**: variables `user_service`, `task_service` y `token`; el request 1 guarda el `token`
@@ -403,6 +417,22 @@ USER_SERVICE_RETRY_DELAY_MS=150
 USER_SERVICE_CACHE_TTL=60
 USER_SERVICE_CIRCUIT_THRESHOLD=3
 USER_SERVICE_CIRCUIT_COOLDOWN=30
+
+# JWT stateless (b0.7): el RP baja una vez la clave pública del IdP
+# (JWKS) y verifica firmas localmente. Con 0 en el caché-ttl de la JWKS
+# se pregunta por HTTP en cada verificación.
+USER_SERVICE_JWKS_URL=http://127.0.0.1:8000/api/jwks.json
+USER_SERVICE_JWT_ISSUER=user-service
+USER_SERVICE_JWT_LEEWAY=10
+USER_SERVICE_JWKS_CACHE_TTL=3600
+```
+
+En el lado del IdP hay tres llaves más (`user-service/.env`):
+
+```bash
+TOKEN_MODE=jwt            # jwt | opaque
+JWT_TTL_MINUTES=15        # vida del access token; corto: no hay revocación
+# php artisan user-service:jwt-keys   # genera el par RS256 en storage/app/jwt
 ```
 
 Nada de URLs hardcodeadas: si el user-service cambia de host, solo tocas el `.env`.
@@ -421,10 +451,10 @@ middleware responde `401` en JSON, que es lo que necesita una API pura.
 
 ## Limitaciones honestas
 
-- **Un salto de red en cada request autenticado.** La caché de verificación lo suaviza (y absorbe picos), pero en frío el salto existe.
-- **La disponibilidad del task-service depende de la del user-service.** El circuit breaker y la caché la convierten en degradación breve (503 rápido, ventana de 60 s con caché viva), no en "todo roto"; dependencia inherente a validar la identidad por HTTP.
+- **Un salto de red en cada request autenticado… solo si `TOKEN_MODE=opaque`.** Con JWT la verificación es local (cero red por request); el salto queda en la JWKS de arranque y en el fallback de tokens opacos antiguos.
+- **La revocación de JWT no existe: expira.** `DELETE /api/tokens` con JWT es un no-op honesto; un token robado vive hasta el TTL (15 min). Es la regla del stateless y se paga con `JWT_TTL_MINUTES` corto. Con modo opaco, en cambio, la revocación es inmediata (borrado de fila).
 - **La caché de verificación tiene hasta 60 s de ventana.** Un token revocado puede seguir autorizando hasta `USER_SERVICE_CACHE_TTL` segundos. Es el precio de la pieza y se ajusta en el `.env` (o a `0` para desactivarla).
-- **Sin refresh tokens, sin roles.** Solo "es tuya o no es tuya".
+- **Sin refresh tokens, sin roles.** Solo "es tuya o no es tuya". Con JWT de 15 min, el usuario vuelve a loguearse cada cuarto de hora en flujos de API puro; el flujo web lo disimula con la sesión del IdP.
 - **El rate limit vive en caché de ficheros.** Con `CACHE_STORE=file` el límite es por instancia:
   con varias réplicas, el atacante dispone de N presupuestos. En producción, Redis.
 - **Sin `trustProxies`.** `X-Forwarded-For` se ignora, así que el límite por IP ve la IP real del

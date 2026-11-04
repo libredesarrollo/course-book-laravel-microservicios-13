@@ -17,9 +17,26 @@ it('issues a token for valid credentials', function () {
         'device_name' => 'pest',
     ])->assertCreated();
 
-    expect($response->json('token'))->toBeString()->toHaveLength(64)
+    // Con TOKEN_MODE=jwt el token es un JWT firmado: header.payload.signature.
+    expect($response->json('token'))->toBeString()
+        ->and(substr_count($response->json('token'), '.'))->toBe(2)
         ->and($response->json('token_type'))->toBe('Bearer')
         ->and($response->json('user.id'))->toBe($user->id);
+});
+
+it('issues an opaque token in opaque mode', function () {
+    User::factory()->create(['email' => 'ana@example.com']);
+
+    config(['tokens.mode' => 'opaque']);
+
+    $response = $this->postJson('/api/tokens', [
+        'email' => 'ana@example.com',
+        'password' => 'password',
+    ])->assertCreated();
+
+    expect($response->json('token'))->toBeString()->toHaveLength(64)
+        ->and($response->json('token_type'))->toBe('Bearer')
+        ->and($response->json('user.id'))->toBe(User::query()->where('email', 'ana@example.com')->first()->id);
 });
 
 it('stores only the hash of the token, never the plain text', function () {

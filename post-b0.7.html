@@ -1,0 +1,412 @@
+<h1>JSON Web Token: la verificación local y el fin del pregunta-por-request</h1>
+
+<p>Ahora sí, introdujimos lo que es el JSON Web Token para nuestra aplicación, nuestro sistema de
+microservicios. Voy a comentarte aquí un poquito los resúmenes, pero en definitiva, ya con esto
+tenemos una autenticación más segura. Y por otra parte, no hace falta estar enviando peticiones al
+servicio de usuario cada vez que nosotros queremos movernos en el CRUD de las tareas. Y ahorita
+vamos a iniciar la sesión y te explico un poco más.</p>
+
+<p>Por ejemplo, podemos, una vez iniciada la sesión, tener el servicio de usuarios apagado y va a
+seguir funcionando la aplicación perfectamente. Ya con la verificación la podemos hacer de manera
+local, en la misma aplicación cliente. Entonces, por lo demás, el flujo se mantiene exactamente
+igual. Ya te voy a mostrar cuáles son los archivos que se cambiaron.</p>
+
+<p>Entonces, el sistema actual va a soportar ambas implementaciones: el famoso token opaco, que
+era la implementación anterior, y lo que es el JSON Web Token. Y podemos variar mediante una
+sencilla configuración:</p>
+
+<pre><code>TOKEN_MODE=jwt</code></pre>
+
+<p>La idea es que vamos a tener para nuestro JSON Web Token unas claves públicas y privadas
+firmadas. Las mismas van a vivir justamente aquí, dentro de nuestra aplicación de usuarios; aquí
+las tenemos, las claves públicas y privadas. Para generarlas tenemos un comando de Artisan que
+genera dichas claves y que luego, mediante un controlador que ya te va a mostrar cuando pasemos a
+la implementación, simplemente leemos las claves para generar el JSON Web Token. Al igual que
+ocurre con cualquier servicio de hoy en día, en el cual, por ejemplo, PayPal, por ejemplo, Stripe,
+siempre manejan una clave pública y una privada — hay que hacer exactamente lo mismo:</p>
+
+<pre><code>php artisan user-service:jwt-keys</code></pre>
+
+<pre><code>// user-service/app/Console/Commands/GenerateJwtKeys.php
+$key = openssl_pkey_new([
+    'digest_alg' =&gt; 'sha256',
+    'private_key_bits' =&gt; 2048,
+    'private_key_type' =&gt; OPENSSL_KEYTYPE_RSA,
+]);</code></pre>
+
+<p>La clave pública se puede acceder de la siguiente forma. Fíjate que va a ser desde la
+aplicación de usuarios, el servicio de usuarios. Y por lo tanto, la van a consumir las
+aplicaciones clientes, que serían la de tareas y la de billing. Y obviamente la clave privada se
+mantiene privada para generar dicho token:</p>
+
+<pre><code>curl http://127.0.0.1:8000/api/jwks.json</code></pre>
+
+<pre><code>{
+  "keys": [{
+    "kty": "RSA",
+    "use": "sig",
+    "alg": "RS256",
+    "kid": "e64e4ca4bb8d7e2a",
+    "n": "0wzG…",
+    "e": "AQAB"
+  }]
+}</code></pre>
+
+<p>Por lo demás, tenemos algunos servicios para, por ejemplo, generar la clave, obtener las
+credenciales mostradas hace unos momentos — generadas mediante el comando de Artisan — y también
+comprobarla:</p>
+
+<pre><code>// user-service/app/Services/Jwt/JwtKeys.php
+public function privateKey(): string { ... }   // la privada, solo aquí
+public function publicKey(): string { ... }    // la pública
+public function kid(): string { ... }          // id de la clave, derivado de su hash
+public function jwks(): array { ... }          // la pública en formato JWKS
+public function keySet(): array { ... }        // keyset para verificar en local</code></pre>
+
+<p>Entonces, en este punto podemos pasar un poco a la implementación. Antes de comenzar también,
+fíjate cuáles son los archivos afectados. Fíjate que, por ejemplo, para tareas no cambia
+absolutamente nada, al igual que el de billing, porque son prácticamente el mismo tipo de
+servicios. No cambia absolutamente nada, salvo una prueba que se ajustó y también el de
+<code>.env</code>. Por lo tanto, fíjate que los clientes, por así decirlo, se mantienen
+exactamente igual, y cambiar de una forma de autenticación a otra es completamente
+transparente, gracias al buen esquema que tenemos.</p>
+
+<pre><code>USER_SERVICE_JWKS_URL=http://127.0.0.1:8000/api/jwks.json
+USER_SERVICE_JWT_ISSUER=user-service
+USER_SERVICE_JWT_LEEWAY=10
+USER_SERVICE_JWKS_CACHE_TTL=3600</code></pre>
+
+<h2>Se mantiene el flujo de antes</h2>
+
+<p>Se mantiene también lo explicado anteriormente — creo que era la clase justamente antes de la
+de resiliencia —: teníamos estos controladores que se ejecutan antes de hacer cualquier
+petición, con eso ver si estamos autenticados o no; y si no estamos autenticados, por ejemplo
+cuando vamos a pasar de tareas a billing, mandamos el token para que no tengamos que autenticar
+nuevamente la aplicación de billing, si vinimos desde la de tareas. Todo eso se mantiene. De
+igual manera, vamos a recargar un poquito el flujo para que todo quede un poquito más claro.</p>
+
+<p>Entonces, recordemos: todo comienza con este middleware que tenemos aquí, que lo tenemos
+configurado tipo un alias. Por lo tanto, aquí tenemos lo que es realmente el middleware que
+estamos utilizando:</p>
+
+<pre><code>// task-service/routes/api.php
+Route::middleware('auth.user-service')-&gt;group(function () {
+    Route::apiResource('tasks', ApiTaskController::class)-&gt;names('api.tasks');
+});</code></pre>
+
+<p>Fíjate, por el código, que se mantiene exactamente igual. No lo voy a explicar otra vez, pero
+era para que repasáramos un poquito cómo estaba funcionando: aquí revisa si tenemos la sesión
+iniciada; si no la tenemos, la rechazamos; resuelve el usuario del token, la sesión, dónde está
+el token del usuario. Todo eso se mantiene exactamente igual, ya que la estructura es exactamente
+la misma.</p>
+
+<p>Lo que cambia es que ahora ya no estamos utilizando un token chimbo que generábamos nosotros
+mediante un hash, sino que estamos empleando un JSON Web Token con todas las ventajas que esto
+nos trae: básicamente, teniendo la clave pública, nosotros la podemos decodificar y saber si es
+un token válido o no. Por lo tanto, aquí tenemos una optimización importante, porque este token
+es representativo: no solamente es una representación para saber si estamos autenticados o no,
+sino que también podemos extraer información del mismo, y con eso saber si es válido o no y
+actuar en consecuencia. Entonces, esto se mantiene exactamente igual.</p>
+
+<h2>El proveedor de identidad: ahí está el cambio</h2>
+
+<p>Aquí tenemos el Identity Provider, y ahí sí tenemos un cambio importante — ya vamos a regresar
+al provider. Recordemos que todo comienza justamente por aquí, con los métodos de autenticación,
+que rechazan o pasan. Por aquí, en la parte del proveedor, ya tenemos algunos registros; fíjate,
+algunos singleton adicionales que son para el JSON Web Token, ya vamos a analizarlos. Pero aquí
+tenemos un cambio fundamental, y es por eso que todo es completamente transparente:</p>
+
+<pre><code>// packages/microservices-user-service-client/src/UserServiceClientServiceProvider.php
+$this-&gt;app-&gt;singleton(JwkKeyStore::class);
+$this-&gt;app-&gt;singleton(JwtVerifier::class);
+
+// Desde b0.7 el default verifica JWT localmente (con refetch de JWKS y el
+// cliente HTTP de respaldo para los opacos y para emitir).
+$this-&gt;app-&gt;bind(IdentityProvider::class, JwtIdentityProvider::class);</code></pre>
+
+<p>Recuerda que antes se había implementado uno llamado <code>IdentityProvider</code>, que es
+simplemente una interfaz: authenticate con su token, y lo que puedes leer por ahí. Y antes, esto
+no era lo que teníamos, obviamente, porque esto es nuevo. Si revisas — bueno, voy a revisar
+ahorita el repositorio en GitHub — teníamos uno llamado <code>UserServiceClient</code>, que por
+supuesto todavía existe porque, como comentado al inicio, permitimos ambos sistemas de
+autenticación, y este se sigue manteniendo por aquí. Lo dejo por aquí presente para que lo
+tengas ahí pendiente.</p>
+
+<p>Aquí están los controladores correspondientes y, bueno, ahora tenemos uno llamado
+<code>JwtIdentityProvider</code>. Por lo tanto, es completamente transparente: tal cual viste
+hace unos momentos, cuando está cargando el IdentityProvider, no está cargando su interfaz, sino
+su implementación. Y la implementación la resolvemos por aquí, donde hacemos el match
+entre la interfaz y lo que es la clase que implementa dicha interfaz.</p>
+
+<h2>Comparando con lo que teníamos antes</h2>
+
+<p>Y aquí puedes ver un poquito el chiste, es decir, por qué se emplea este tipo de estructuras: ya
+esto es programación orientada a objetos en todo su esplendor. Obviamente va a implementar
+exactamente los mismos métodos que teníamos antes. Y en este punto podemos compararlos un poco
+para que vea exactamente qué es lo que cambia.</p>
+
+<p>Aquí recuerda que en el <code>authenticate</code> de la implementación anterior lo que
+hacíamos era, siempre, pero siempre, hacer una petición a la aplicación de usuarios, al servicio
+de usuarios. Y era por eso que luego de sacar esta clase implementamos lo que era la resiliencia,
+para evitar, bueno, prácticamente matar al pobre servicio de usuarios — lo comentado antes: si
+tenemos 100 usuarios que se conectan al mismo tiempo y el servidor está saturado, vamos a
+terminar de matarlo. Por eso implementamos una estructura de resiliencia, que es buena de conocer
+porque puede servirte para otras cosas. Pero en este caso, la solución más limpia es precisamente
+la del JSON Web Token: con eso ahorrábamos prácticamente la petición que hacíamos anteriormente.
+Recuerda que estos son recursos educativos y por lo tanto vamos variando entre una implementación
+y otra; pero se retira la implementación anterior cuando llega algo mejor.</p>
+
+<p>Ahora, ¿qué es lo que estamos implementando en el JWT? Fíjate que para la nueva
+implementación — el <code>JwtIdentityProvider</code> que comento hace unos momentos en el
+provider — por aquí ya no hacemos la conexión anterior. Allá teníamos — siempre, pero siempre —
+la conexión al servicio de usuarios, y ahora por aquí ya no la hacemos. Todo se mantiene
+perfectamente en local, con las ventajas que esto nos trae: no tenemos que hacer una petición de
+red, con lo que nos ahorramos esos recursos:</p>
+
+<pre><code>// packages/microservices-user-service-client/src/Jwt/JwtIdentityProvider.php
+public function authenticate(string $token): ?array
+{
+    $user = $this-&gt;verifier-&gt;verify($token);   // ← la verificación es LOCAL
+
+    if ($user !== null) {
+        return $user;
+    }
+
+    if (substr_count($token, '.') === 2) {
+        return null;   // tenía forma de JWT y no validó
+    }
+
+    // No parece JWT: es el token opaco. Client HTTP, la vida de antes.
+    return $this-&gt;clients-&gt;authenticate($token);
+}</code></pre>
+
+<p>Entonces, ¿cómo se hace? Toda la verificación se hace aquí en local. Fíjate que se realiza
+aquí este llamado al <code>verify</code> de <code>JwtVerifier</code>, y ya vamos a analizarlo.
+Básicamente: le pasamos el token al igual que antes, y por aquí básicamente discrimina si es el
+token de antes (el esquema tradicional) o si es el nuevo, cuyo formato es básicamente una
+estructura diferente. Si esto no se cumple y no tenemos usuario, entonces tenemos problemas: retornamos
+un <code>null</code> — y bueno, te toca pedir otra vez el login y todo el flujo que te enseñaba antes; eso
+es lo que te decía la clase sobre el flujo con el SSO. Y fíjate lo bonito de esto: si quieres implementar
+o utilizar la implementación anterior por cualquier razón, llamas al <code>authenticate</code>
+de <code>UserServiceClient</code> — era por eso que te mencionaba que todavía existe esta clase
+con lo que teníamos antes.</p>
+
+<p>Fíjate que este <code>$clients</code> que ahora tenemos aquí en el constructor apunta a
+nuestro <code>UserServiceClient</code>. Para hablar claros: esto no se debería de emplear, y
+perfectamente en una aplicación real podrías quitarlo. Pero otra vez, por propósito didácticos,
+y para que veas que se puede hacer este tipo de implementaciones — por lo didáctico, tienes
+múltiples formas de autenticación —, puedes llegar a usar esto. Y lo bonito y lo estructurado que
+está eso.</p>
+
+<h2>Los archivos nuevos del IdP</h2>
+
+<p>Por lo demás, lo que se mantiene aquí es el flujo normal de administración del JSON Web Token,
+y ya vamos a analizarlo. Ahora sí: aquí podemos analizar un poquito estos archivos que son lo que
+tenemos acá. Por aquí tienen la descripción, en caso de que te pierdas un poquito.</p>
+
+<p>Primero, este par de configuraciones que apuntan hacia los directorios mostrados antes,
+donde tenemos nuestras credenciales:</p>
+
+<pre><code>// user-service/config/jwt.php
+'private_key' =&gt; env('JWT_PRIVATE_KEY', storage_path('app/jwt/jwt-private.pem')),
+'public_key'  =&gt; env('JWT_PUBLIC_KEY',  storage_path('app/jwt/jwt-public.pem')),</code></pre>
+
+<p>Este primer archivo — <code>JwtKeys</code> — lee dichos archivos para obtener el contenido,
+obtener la clave pública, y después ya poder generar la URL de la JWKS y demás. Aquí está el
+<code>kid</code>, que es el identificador de la clave pública derivado del hash de la misma. Aquí
+también, por cierto, está el comando de Artisan personalizado por nosotros para generar dichas
+claves, y lo puedes sobrescribir ahí.</p>
+
+<p>Por lo demás, aquí tenemos uno que lo que hace es verificar el token: recibe el token y
+verifica si el mismo es válido o no:</p>
+
+<pre><code>// user-service/app/Services/Jwt/JwtTokenVerifier.php
+try {
+    JWT::$leeway = max(0, (int) config('jwt.leeway', 10));
+
+    $claims = JWT::decode($token, $this-&gt;keys-&gt;keySet());
+} catch (\Throwable) {
+    return null;
+}
+
+if ((string) ($claims-&gt;iss ?? '') !== (string) config('jwt.issuer')) {
+    return null;
+}
+
+return (array) $claims;</code></pre>
+
+<p>Y este otro servicio, <code>JwtTokenIssuer</code>, lo que hace es generar el token. Fíjate que
+por aquí tenemos información del usuario; ya que — otra vez — aquí estamos con información real:
+por lo tanto, cuando lo decodificamos podemos saber si es válido o no y, obviamente, también
+saber si el mismo está expirado o no. Por lo tanto, no hace falta hacer una petición al servicio
+de usuarios:</p>
+
+<pre><code>// user-service/app/Services/Jwt/JwtTokenIssuer.php
+$payload = [
+    'iss' =&gt; (string) config('jwt.issuer'),   // issuer o emisor: user-service
+
+    'sub' =&gt; (string) $user-&gt;id,             // la foto de identidad
+    'name' =&gt; $user-&gt;name,
+    'email' =&gt; $user-&gt;email,
+
+    'iat' =&gt; (int) $issuedAt-&gt;getTimestamp(), // cuándo se emitió
+    'exp' =&gt; (int) $expiresAt-&gt;getTimestamp(),// cuándo vence (iat + TTL)
+
+    'jti' =&gt; bin2hex(random_bytes(16)),       // id único del token
+    'device_name' =&gt; $deviceName,
+];
+
+$token = JWT::encode($payload, $this-&gt;keys-&gt;privateKey(), 'RS256', $this-&gt;keys-&gt;kid());</code></pre>
+
+<p>Y en esta otra clase, <code>AccessTokenIssuer</code>, se determina si es el JSON Web Token
+nuestro o el token que teníamos anteriormente, y pues nada, lo retorna. Es por eso que la
+implementación es extremadamente limpia: al final es un token que se maneja exactamente igual.
+Entiéndase que "se maneja exactamente igual" se refiere a la sesión iniciada o definida. Lo que
+cambia es la forma de generarlo, obviamente, y a partir de ahí la ventaja que este nos trae, que
+te lo he mencionado antes: ya el mismo trae datos del usuario, y aquí puedes ver un poquito el
+flujo. Y obviamente aquí es donde se genera el token:</p>
+
+<pre><code>// user-service/app/Services/Jwt/AccessTokenIssuer.php
+if (config('tokens.mode') === 'jwt') {
+    $issued = $this-&gt;jwtIssuer-&gt;issue($user, $deviceName);
+
+    return [
+        'token' =&gt; $issued['token'],
+        'token_type' =&gt; 'Bearer',
+        'expires_at' =&gt; $issued['expires_at']-&gt;toIso8601String(),
+        'api_token' =&gt; null,   // no hay fila en ninguna tabla
+    ];
+}
+
+// modo opaque: el token de toda la serie hasta b0.6, intacto</code></pre>
+
+<p>Este es el que determina cuál llamamos, y el <code>AccessTokenIssuer</code> es el que se
+emplea ya directamente desde la aplicación. Por ejemplo, fíjate que la parte de el endpoint para
+emitir el token — punto en el cual finalmente llegamos —: aquí tenemos el servicio como parte
+del constructor de <code>AuthController</code>. Lo de antes: verificamos credenciales y generamos
+el token correspondiente. Es simplemente buscar por los nombres y ver exactamente dónde se está
+empleando, para ver cómo funciona:</p>
+
+<pre><code>// user-service/app/Http/Controllers/AuthController.php
+public function __construct(private readonly AccessTokenIssuer $accessTokens) {}
+
+public function store(Request $request): JsonResponse
+{
+    $validated = $request-&gt;validate([
+        'email' =&gt; ['required', 'email'],
+        'password' =&gt; ['required', 'string'],
+        'device_name' =&gt; ['sometimes', 'string', 'max:100'],
+    ]);
+
+    $user = User::query()-&gt;where('email', $validated['email'])-&gt;first();
+
+    if (! $user || ! $user-&gt;passwordMatches($validated['password'])) {
+        return response()-&gt;json(['error' =&gt; 'Credenciales inválidas'], 401);
+    }
+
+    $issued = $this-&gt;accessTokens-&gt;issue($user, $validated['device_name'] ?? 'api-token');
+}</code></pre>
+
+<p>Para esto, por cierto, para el JSON Web Token no estamos empleando Sanctum, porque aquí no
+pinta nada de eso. Estamos empleando un paquete llamado <code>firebase/php-jwt</code>, que es una
+biblioteca de Firebase, un paquete bastante empleado en PHP precisamente para la parte de
+codificar y decodificar JWT:</p>
+
+<pre><code>"firebase/php-jwt": "^7.2",</code></pre>
+
+<h2>El kid y la caché de la clave pública</h2>
+
+<p>Seguramente viste también una definición llamada <code>kid</code> — key identifier, identificador
+de clave. Esto simplemente es una clave. Fíjate que aquí ya tenemos un flujo en el
+<code>JwkKeyStore</code>, y es precisamente para cuando se vuelven a regenerar las claves por
+cualquier motivo. Entonces fíjate que por aquí ya tenemos una caché para evitar estar consumiendo
+cada rato la clave pública mostrada anteriormente. Básicamente, cuando tenemos una key diferente
+— más otros que tenemos cacheados —, se fuerza una recarga. Aquí lo puedes ver: el
+<code>force: true</code> para hacer nuevamente la petición de red:</p>
+
+<pre><code>// packages/microservices-user-service-client/src/Jwt/JwkKeyStore.php
+$raw = $this-&gt;raw(force: false);
+
+if ($missingKid !== null &amp;&amp; ! $this-&gt;hasKid($raw, $missingKid)) {
+    $raw = $this-&gt;raw(force: true);   // la JWKS ya cacheada no tiene ese kid
+}
+
+return JWK::parseKeySet($raw, 'RS256');</code></pre>
+
+<p>Y es por eso que, a diferencia de la resiliencia — el circuit breaker —, para esta
+implementación prácticamente no se está utilizando, porque siempre todo se mantiene cacheado.</p>
+
+<h2>La prueba: con el servicio de usuarios apagado</h2>
+
+<p>Entonces fíjate, ya para hacer un poco la prueba, voy a autenticarme empleando el nuevo
+esquema. Recuerda que todo se mantiene: toda la parte de middlewares, providers y controladores,
+el SSO se mantiene exactamente igual. Fíjate que por aquí puedo hacer mis operaciones
+perfectamente, puedo navegar de un módulo al otro. Ahora, lo mencionado desde los anteriores
+videos: fíjate que vengo aquí a usuarios y detengo el servicio:</p>
+
+<pre><code># Autenticarse con el nuevo esquema (JWT)
+curl -X POST http://127.0.0.1:8000/api/tokens -H "Content-Type: application/json" \
+  -d '{"email":"ana.torres@example.com","password":"password"}'
+# {"token":"eyJ...", "token_type":"Bearer", ...}   201
+
+# Navegar la aplicación normalmente
+curl http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+# 200 — y tras la primera verificación, en 4–6 ms
+
+# Ahora sí: detengo el servicio de usuarios...
+kill -9 $(lsof -ti tcp:8000)
+
+# ...y la aplicación de tareas sigue siendo perfectamente operable:
+curl http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
+# 200 — la verificación es local; el IdP ya no participa</code></pre>
+
+<p>Antes fallaba, crasheaba; no podíamos hacer ninguna operación. Ahora fíjate que podemos
+trabajar perfectamente, por lo mencionado antes. Porque ahora este token — y lo puedes checkear
+en el código — lo que hace es intentar primero decodificar el token. Si se dispara una excepción
+— que el token esté, chimbo, no firmado como debe, corrupto, expirado, que sé yo —, retornamos un
+<code>null</code>. Y una vez decodificado, si no coincide cierta información clave — por ejemplo,
+si el <code>iss</code> es nulo o, por ejemplo, no coincide con lo que es nuestro user-service en
+la configuración de la app que está empleando —, entonces otra vez es <code>null</code>; si está
+bien, continúa adelante:</p>
+
+<pre><code>// packages/.../src/Jwt/JwtVerifier.php
+try {
+    JWT::$leeway = max(0, (int) config('user-service-client.jwt.leeway', 10));
+
+    $claims = JWT::decode($token, $this-&gt;keys-&gt;keySet($this-&gt;kidOf($token)));
+} catch (\Throwable) {
+    return null;   // expirado, firma corrupta, kid desconocido...
+}
+
+if ((string) ($claims-&gt;iss ?? '') !== (string) config('user-service-client.jwt.issuer', 'user-service')) {
+    return null;
+}
+
+return [
+    'id' =&gt; (int) $claims-&gt;sub,
+    'name' =&gt; (string) $claims-&gt;name,
+    'email' =&gt; (string) $claims-&gt;email,
+];</code></pre>
+
+<p>ISS es simplemente issuer o emisor, en caso de que te lo preguntes; y ¿cuál es el emisor?
+Nuestro servicio de usuarios. Sé que es algo bastante complejo, y es por eso que simplemente
+explico la estructura por encima, pero ya queda de tarea tuya descargarlo y hacer pruebas con él
+para que entiendas más en detalle cómo funciona.</p>
+
+<h2>El precio y el cierre</h2>
+
+<p>Problema que tenemos actualmente: el token no se está almacenando en ninguna parte. Por lo
+tanto, ¿qué pasa si hay un token robado que nosotros queremos eliminar? Pues la cosa no está
+sencilla: prácticamente con la estructura que tenemos actualmente es imposible de eliminar el
+token. Lo que sí nos apoya es que la vida del token es corta — configurable, quince minutos — y
+al expirar desaparece.</p>
+
+<p>Pero por lo demás logramos algo importante en los microservicios, que es la independencia
+entre los servicios. Ya que otra vez el de tareas va por su lado, el de billing va por su lado,
+y le da absolutamente igual si uno de los dos se ha caído: puedes acceder perfectamente. Y
+siempre el talón de Aquiles era el de usuarios, que era el central. Pero fíjate que con esta
+implementación simplemente nos autenticamos una vez, generamos el token, y ya por el tiempo que
+tú quieras estipular en la caché puedes utilizar el resto de la aplicación independientemente de
+si se cayó el de usuarios o no: la aplicación va a seguir funcionando — no por unos pocos
+segundos o pocos minutos, como sucedía con la resiliencia, sino por horas o días. Y eso depende
+de cuánto tiempo de expiración le quieras dar a los tokens.</p>

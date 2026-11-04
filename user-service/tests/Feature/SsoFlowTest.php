@@ -170,12 +170,31 @@ it('exchanges a valid code for a token', function () {
         'client' => 'task',
     ])->assertCreated();
 
-    expect($response->json('token'))->toBeString()->toHaveLength(64)
+    // Mode=jwt: el canje entrega un JWT firmado y no toca la tabla de tokens.
+    expect(substr_count($response->json('token'), '.'))->toBe(2)
         ->and($response->json('token_type'))->toBe('Bearer')
         ->and($response->json('user.email'))->toBe('ana@example.com');
 
     expect(SsoTicket::query()->first()->isUsed())->toBeTrue()
-        ->and(ApiToken::query()->where('user_id', $user->id)->count())->toBe(1);
+        ->and(ApiToken::query()->where('user_id', $user->id)->count())->toBe(0);
+});
+
+it('exchanges a valid code for an opaque token in opaque mode', function () {
+    $user = User::factory()->create(['email' => 'ana@example.com']);
+    issueSsoTicket($user, 'codigo-valido-opaco');
+
+    config(['tokens.mode' => 'opaque']);
+
+    $response = $this->postJson('/api/sso/exchange', [
+        'code' => 'codigo-valido-opaco',
+        'client' => 'task',
+    ])->assertCreated();
+
+    expect($response->json('token'))->toBeString()->toHaveLength(64)
+        ->and($response->json('token_type'))->toBe('Bearer')
+        ->and($response->json('user.email'))->toBe('ana@example.com');
+
+    expect(ApiToken::query()->where('user_id', $user->id)->count())->toBe(1);
 });
 
 it('marks the code as used so it cannot be exchanged twice', function () {

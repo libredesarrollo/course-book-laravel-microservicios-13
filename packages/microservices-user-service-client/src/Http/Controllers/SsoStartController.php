@@ -9,7 +9,7 @@ class SsoStartController extends Controller
 {
     public function __invoke(Request $request): RedirectResponse
     {
-        // dd(config('user-service-client.url'));
+        //  dd(config('user-service-client.url'));
         $client = (string) config('user-service-client.client');
         $base = rtrim((string) config('user-service-client.url'), '/');
         $callback = config('user-service-client.callback_url');
@@ -22,7 +22,7 @@ class SsoStartController extends Controller
             'client' => $client,
             'redirect_uri' => $callback,
         ]);
-
+        // dd($authorize );
         return redirect()->away($authorize);
     }
 }

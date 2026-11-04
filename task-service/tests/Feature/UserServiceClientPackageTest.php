@@ -4,8 +4,12 @@ use Demo\Microservices\UserServiceClient\AuthenticatedUser;
 use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceErrorException;
 use Demo\Microservices\UserServiceClient\Exceptions\UserServiceUnavailableException;
+use Demo\Microservices\UserServiceClient\Jwt\JwkKeyStore;
+use Demo\Microservices\UserServiceClient\Jwt\JwtIdentityProvider;
+use Demo\Microservices\UserServiceClient\Jwt\JwtVerifier;
 use Demo\Microservices\UserServiceClient\TokenSession;
 use Demo\Microservices\UserServiceClient\UserServiceClient;
+use Firebase\JWT\JWT;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
@@ -99,12 +103,26 @@ it('propagates the correlation id of the incoming request', function () {
     Http::assertSent(fn (Request $request) => $request->hasHeader('X-Request-Id', 'traza-123'));
 });
 
-it('binds the contract to the concrete client', function () {
-    expect(app(IdentityProvider::class))->toBeInstanceOf(UserServiceClient::class);
+it('binds the contract to the JWT verification (b0.7)', function () {
+    expect(app(IdentityProvider::class))->toBeInstanceOf(JwtIdentityProvider::class);
 });
 
-it('resolves the same client instance every time', function () {
+it('still resolves the same HTTP client instance every time', function () {
     expect(app(UserServiceClient::class))->toBe(app(UserServiceClient::class));
+});
+
+it('delegates opaque work to the HTTP client inside the JWT provider', function () {
+    $provider = app(JwtIdentityProvider::class);
+
+    $clients = (new ReflectionProperty(JwtIdentityProvider::class, 'clients'))
+        ->getValue($provider);
+
+    expect($clients)->toBe(app(UserServiceClient::class));
+});
+
+it('registers the JWKS store as a singleton', function () {
+    expect(app(JwkKeyStore::class))->toBe(app(JwkKeyStore::class))
+        ->and(app(JwtVerifier::class))->toBe(app(JwtVerifier::class));
 });
 
 /*
@@ -422,4 +440,162 @@ it('answers with a fast 503 when the circuit is open', function () {
         ->assertStatus(503);
 
     Http::assertSentCount(1);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Verificación local de JWT (b0.7)
+|--------------------------------------------------------------------------
+|
+| El IdP firma con RS256 y publica su clave pública en la JWKS. Estas
+| pruebas llevan la otra mitad del pacto: que el RP verifica en local,
+| con la JWKS cacheada, sin llamar a /api/user por cada request — y que
+| la rotación de claves (kid nuevo) hace refetch sin despliegue.
+|
+*/
+
+function makeTestKeyAndJwk(string $kid): array
+{
+    $key = openssl_pkey_new([
+        'private_key_bits' => 2048,
+        'private_key_type' => OPENSSL_KEYTYPE_RSA,
+    ]);
+
+    openssl_pkey_export($key, $private);
+
+    $details = openssl_pkey_get_details($key);
+
+    $b64url = fn (string $bytes) => rtrim(strtr(base64_encode($bytes), '+/', '-_'), '=');
+
+    $jwk = [
+        'kty' => 'RSA',
+        'use' => 'sig',
+        'alg' => 'RS256',
+        'kid' => $kid,
+        'n' => $b64url($details['rsa']['n']),
+        'e' => $b64url($details['rsa']['e']),
+    ];
+
+    return [$private, $jwk];
+}
+
+function signTestJwt(string $private, string $kid): string
+{
+    return JWT::encode([
+        'iss' => 'user-service',
+        'sub' => '7',
+        'name' => 'Ana Torres',
+        'email' => 'ana@example.com',
+        'iat' => time(),
+        'exp' => time() + 15 * 60,
+        'jti' => bin2hex(random_bytes(16)),
+        'device_name' => 'pest',
+    ], $private, 'RS256', $kid);
+}
+
+it('verifies a JWT locally against the cached JWKS', function () {
+    [$private, $jwk] = makeTestKeyAndJwk('k-test');
+
+    Http::fake(['*/api/jwks.json' => Http::response(['keys' => [$jwk]]), '*/api/user' => Http::response([], 500)]);
+
+    expect(app(JwtVerifier::class)->verify(signTestJwt($private, 'k-test')))->toBe([
+        'id' => 7,
+        'name' => 'Ana Torres',
+        'email' => 'ana@example.com',
+    ]);
+
+    // Lo único que tocó la red para poder verificar TODO el futuro inmediato
+    // fue la JWKS (se queda en caché): cero llamadas a /api/user.
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request) => str_ends_with($request->url(), '/api/jwks.json'));
+});
+
+it('authenticates any middleware request with a JWT and never touches /api/user', function () {
+    [$private, $jwk] = makeTestKeyAndJwk('rot');
+
+    Http::fake([
+        '*/api/jwks.json' => Http::response(['keys' => [$jwk]]),
+        '*/api/user' => Http::response([], 500),
+    ]);
+
+    $this->withToken(signTestJwt($private, 'rot'))
+        ->getJson('/api/tasks')
+        ->assertOk();
+
+    // Si una sola verificación hubiera ido a /api/user, la suite se habría
+    // roto: el fake lo devuelve 500. Se sirvió la JWKS, y nada más.
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request) => str_ends_with($request->url(), '/api/jwks.json'));
+
+    // La firma de vida de la JWKS: el segundo request ni siquiera vuelve a
+    // preguntarla, porque el ttl la guarda en caché.
+    $this->withToken(signTestJwt($private, 'rot'))
+        ->getJson('/api/tasks')
+        ->assertOk();
+
+    Http::assertSentCount(1);
+});
+
+it('rejects an expired JWT locally', function () {
+    [$private, $jwk] = makeTestKeyAndJwk('exp');
+
+    Http::fake(['*/api/jwks.json' => Http::response(['keys' => [$jwk]]), '*/api/user' => Http::response([], 500)]);
+
+    $expired = JWT::encode([
+        'iss' => 'user-service',
+        'sub' => '7',
+        'name' => 'Ana',
+        'email' => 'ana@example.com',
+        'iat' => time() - 16 * 60,
+        'exp' => time() - 60,
+    ], $private, 'RS256', 'exp');
+
+    expect(app(JwtVerifier::class)->verify($expired))->toBeNull();
+});
+
+it('refetches the JWKS when an unknown kid arrives, and recovers without deploy', function () {
+    [$privateA, $jwkA] = makeTestKeyAndJwk('key-you-have');
+    [$privateB, $jwkB] = makeTestKeyAndJwk('new-key-after-rotation');
+
+    // Primera respuesta: solo la clave vieja. Tras el refetch forzado por
+    // un kid desconocido, ya contiene la nueva.
+    Http::fake([
+        '*/api/jwks.json' => Http::sequence()
+            ->push(['keys' => [$jwkA]])
+            ->push(['keys' => [$jwkA, $jwkB]]),
+        '*/api/user' => Http::response([], 500),
+    ]);
+
+    $usuario = [
+        'id' => 7,
+        'name' => 'Ana Torres',
+        'email' => 'ana@example.com',
+    ];
+
+    // kid conocido: fetch 1 y listo.
+    expect(app(JwtVerifier::class)->verify(signTestJwt($privateA, 'key-you-have')))->toBe($usuario);
+
+    // kid desconocido: la verificación fuerza el refetch (fetch 2), la
+    // JWKS ya contiene la clave nueva y el token queda verificado en el
+    // mismo paso. La rotación de claves del IdP no requirió tocar los RPs.
+    expect(app(JwtVerifier::class)->verify(signTestJwt($privateB, 'new-key-after-rotation')))->toBe($usuario);
+
+    Http::assertSentCount(2);
+});
+
+it('rejects a validly signed JWT with a foreign issuer claim', function () {
+    [$private, $jwk] = makeTestKeyAndJwk('impostor');
+
+    Http::fake(['*/api/jwks.json' => Http::response(['keys' => [$jwk]]), '*/api/user' => Http::response([], 500)]);
+
+    $forged = JWT::encode([
+        'iss' => 'otro-identificador',
+        'sub' => '7',
+        'name' => 'Ana',
+        'email' => 'ana@example.com',
+        'iat' => time(),
+        'exp' => time() + 15 * 60,
+    ], $private, 'RS256', 'impostor');
+
+    expect(app(JwtVerifier::class)->verify($forged))->toBeNull();
 });

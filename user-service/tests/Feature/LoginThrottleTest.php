@@ -149,6 +149,8 @@ it('never logs the attempted password', function () {
 it('gives a fresh token a TTL taken from the configuration', function () {
     User::factory()->create(['email' => 'ana@example.com']);
 
+    config(['jwt.ttl_minutes' => 30]);
+
     $response = $this->postJson('/api/tokens', [
         'email' => 'ana@example.com',
         'password' => 'password',
@@ -158,11 +160,36 @@ it('gives a fresh token a TTL taken from the configuration', function () {
 
     expect($expiresAt)->not->toBeNull();
 
-    // La caducidad debe ser "ahora + 60 min", con un margen para el reloj.
+    // La caducidad declarada debe ser "ahora + 30 min", con margen de reloj.
+    expect(strtotime($expiresAt))
+        ->toBeBetween(now()->addMinutes(28)->getTimestamp(), now()->addMinutes(30)->getTimestamp());
+
+    // Y no solo declarada: el claim exp del propio JWT manda. Los RP no
+    // creen en expires_at, lo verificado es la firma.
+    $payload = json_decode(base64_decode(
+        explode('.', $response->json('token'))[1]
+    ), true);
+
+    expect($payload['exp'])
+        ->toBeBetween(now()->addMinutes(28)->getTimestamp(), now()->addMinutes(30)->getTimestamp())
+        ->and($payload['iat'])->toBeBetween(now()->getTimestamp() - 2, now()->getTimestamp());
+});
+
+it('keeps the opaque TTL on the api_tokens row in opaque mode', function () {
+    User::factory()->create(['email' => 'ana@example.com']);
+
+    config(['tokens.mode' => 'opaque']);
+    config(['tokens.ttl_minutes' => 30]);
+
+    $this->postJson('/api/tokens', [
+        'email' => 'ana@example.com',
+        'password' => 'password',
+    ])->assertCreated();
+
     $model = ApiToken::query()->latest('id')->first();
 
     expect($model->expires_at->getTimestamp())
-        ->toBeBetween(now()->addMinutes(58)->getTimestamp(), now()->addMinutes(60)->getTimestamp());
+        ->toBeBetween(now()->addMinutes(28)->getTimestamp(), now()->addMinutes(30)->getTimestamp());
 });
 
 it('accepts a token that has not expired', function () {

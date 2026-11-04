@@ -2,8 +2,8 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\ApiToken;
 use App\Models\SsoTicket;
+use App\Services\Jwt\AccessTokenIssuer;
 use App\Services\SsoTicketIssuer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
@@ -14,6 +14,8 @@ use Illuminate\View\View;
 
 class SsoController extends Controller
 {
+    public function __construct(private readonly AccessTokenIssuer $accessTokens) {}
+
     public function authorize(Request $request, SsoTicketIssuer $issuer): RedirectResponse|View
     {
         if (! Auth::check()) {
@@ -61,25 +63,27 @@ class SsoController extends Controller
 
         $deviceName = $ticket->client.'-sso';
 
-        $issued = ApiToken::issueFor(
-            $ticket->user,
-            $deviceName,
-            now()->addMinutes((int) config('tokens.ttl_minutes')),
-        );
+        $issued = $this->accessTokens->issue($ticket->user, $deviceName);
 
         $ticket->update(['used_at' => now()]);
 
-        Log::info('idp.sso.exchanged', [
+        Log::info('idp.sso.exchanged', $issued['api_token'] === null ? [
             'user_id' => $ticket->user_id,
             'client' => $ticket->client,
-            'token_id' => $issued['model']->id,
+            'token_type' => 'jwt',
+            'request_id' => $request->attributes->get('request_id'),
+        ] : [
+            'user_id' => $ticket->user_id,
+            'client' => $ticket->client,
+            'token_type' => 'opaque',
+            'token_id' => $issued['api_token']->id,
             'request_id' => $request->attributes->get('request_id'),
         ]);
 
         return response()->json([
             'token' => $issued['token'],
             'token_type' => 'Bearer',
-            'expires_at' => $issued['model']->expires_at?->toIso8601String(),
+            'expires_at' => $issued['expires_at'],
             'user' => [
                 'id' => $ticket->user->id,
                 'name' => $ticket->user->name,

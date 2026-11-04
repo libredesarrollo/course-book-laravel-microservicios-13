@@ -4,6 +4,9 @@ namespace Demo\Microservices\UserServiceClient;
 
 use Demo\Microservices\UserServiceClient\Contracts\IdentityProvider;
 use Demo\Microservices\UserServiceClient\Http\Middleware\AuthenticateWithUserService;
+use Demo\Microservices\UserServiceClient\Jwt\JwkKeyStore;
+use Demo\Microservices\UserServiceClient\Jwt\JwtIdentityProvider;
+use Demo\Microservices\UserServiceClient\Jwt\JwtVerifier;
 use Illuminate\Routing\Router;
 use Illuminate\Support\ServiceProvider;
 
@@ -30,10 +33,16 @@ class UserServiceClientServiceProvider extends ServiceProvider
 
         $this->app->singleton(UserServiceClient::class);
 
-        // El contrato es lo que consumen la aplicación; la implementación
+        // El store de claves públicas lee y cachea; su estado va en la caché
+        // de la aplicación, así que el objeto en memoria es intercambiable.
+        $this->app->singleton(JwkKeyStore::class);
+        $this->app->singleton(JwtVerifier::class);
+
+        // El contrato es lo que consume la aplicación; la implementación
         // concreta es un detalle que puede cambiar sin tocar a nadie.
-        // Cuando se pida la interfaz, entrega la implementación de UserServiceClient
-        $this->app->bind(IdentityProvider::class, UserServiceClient::class);
+        // Desde b0.7 el default verifica JWT localmente (con refetch de JWKS
+        // y el cliente HTTP de respaldo para los opacos y para emitir).
+        $this->app->bind(IdentityProvider::class, JwtIdentityProvider::class);
 
         // La sesión con token remoto comparte el cliente, así que también
         // puede ser un singleton: no guarda estado entre peticiones.

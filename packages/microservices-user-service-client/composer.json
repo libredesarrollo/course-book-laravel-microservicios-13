@@ -6,6 +6,7 @@
   "keywords": ["laravel", "microservices", "http-client", "user-service"],
   "require": {
     "php": "^8.2",
+    "firebase/php-jwt": "^7.2",
     "illuminate/support": "^13.0",
     "illuminate/http": "^13.0",
     "illuminate/routing": "^13.0"

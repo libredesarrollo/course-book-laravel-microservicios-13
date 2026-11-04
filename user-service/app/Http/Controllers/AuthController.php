@@ -4,12 +4,15 @@ namespace App\Http\Controllers;
 
 use App\Models\ApiToken;
 use App\Models\User;
+use App\Services\Jwt\AccessTokenIssuer;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 
 class AuthController extends Controller
 {
+    public function __construct(private readonly AccessTokenIssuer $accessTokens) {}
+
     /**
      * Emite un token de API a partir de email + contraseña.
      *
@@ -39,23 +42,25 @@ class AuthController extends Controller
             ], 401);
         }
 
-        $issued = ApiToken::issueFor(
-            $user,
-            $validated['device_name'] ?? 'api-token',
-            now()->addMinutes((int) config('tokens.ttl_minutes')),
-        );
+        $issued = $this->accessTokens->issue($user, $validated['device_name'] ?? 'api-token');
 
-        Log::info('API token issued', [
+        Log::info('API token issued', $issued['api_token'] === null ? [
             'user_id' => $user->id,
-            'token_id' => $issued['model']->id,
-            'device' => $issued['model']->name,
-            'expires_at' => $issued['model']->expires_at?->toIso8601String(),
+            'token_type' => 'jwt',
+            'device' => $validated['device_name'] ?? 'api-token',
+            'expires_at' => $issued['expires_at'],
+        ] : [
+            'user_id' => $user->id,
+            'token_type' => 'opaque',
+            'token_id' => $issued['api_token']->id,
+            'device' => $issued['api_token']->name,
+            'expires_at' => $issued['api_token']->expires_at?->toIso8601String(),
         ]);
 
         return response()->json([
             'token' => $issued['token'],
             'token_type' => 'Bearer',
-            'expires_at' => $issued['model']->expires_at?->toIso8601String(),
+            'expires_at' => $issued['expires_at'],
             'user' => $user,
         ], 201);
     }
@@ -88,11 +93,26 @@ class AuthController extends Controller
      * Revoca el token con el que se hizo el request.
      *
      * DELETE /api/tokens
+     *
+     * Con token opaco borra la fila: una revocación real e inmediata. Con
+     * JWT no hay nada que borrar — el stateless no mantiene filas —, así
+     * que es un no-op que responde igual (204): la revocación real es la
+     * expiración corta del propio token. El trade-off, de frente.
      */
     public function destroy(Request $request): JsonResponse
     {
-        /** @var ApiToken $token */
+        /** @var ApiToken|null $token */
         $token = $request->attributes->get('api_token');
+
+        if ($token === null) {
+            $user = $request->attributes->get('user');
+
+            Log::info('JWT logout: no-op (stateless)', [
+                'user_id' => $user instanceof User ? $user->id : null,
+            ]);
+
+            return response()->json(status: 204);
+        }
 
         $token->delete();
 
