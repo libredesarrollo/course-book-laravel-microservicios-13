@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreTaskRequest;
 use App\Http\Requests\UpdateTaskRequest;
 use App\Models\Task;
+use App\Services\TaskCompletion;
 use Illuminate\Http\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
 
@@ -33,7 +34,7 @@ class TaskController extends Controller
      * usuario existe. Una segunda llamada solo volvería a preguntar lo que ya
      * sabemos, y a pagar la latencia otra vez.
      */
-    public function store(StoreTaskRequest $request): JsonResponse
+    public function store(StoreTaskRequest $request, TaskCompletion $completion): JsonResponse
     {
         $validated = $request->validated();
 
@@ -42,6 +43,10 @@ class TaskController extends Controller
             'user_id' => $this->user()->id,
             'status' => $validated['status'] ?? Task::STATUS_PENDING,
         ]);
+
+        if ($task->status === Task::STATUS_COMPLETED) {
+            $completion->complete($task, $this->actor(), $this->traceId());
+        }
 
         return response()->json($task, 201);
     }
@@ -57,11 +62,16 @@ class TaskController extends Controller
     /**
      * Update the specified task.
      */
-    public function update(UpdateTaskRequest $request, int $task): JsonResponse
+    public function update(UpdateTaskRequest $request, int $task, TaskCompletion $completion): JsonResponse
     {
         $model = $this->findOwnedTask($task);
 
-        $model->update($request->validated());
+        if (($request->validated('status') ?? $model->status) === Task::STATUS_COMPLETED
+            && $model->status !== Task::STATUS_COMPLETED) {
+            $completion->complete($model, $this->actor(), $request->validated(), $this->traceId());
+        } else {
+            $model->update($request->validated());
+        }
 
         return response()->json($model->fresh());
     }
@@ -74,5 +84,17 @@ class TaskController extends Controller
         $this->findOwnedTask($task)->delete();
 
         return response()->json(status: 204);
+    }
+
+    /**
+     * @return array{id: int, name: string, email: string}
+     */
+    private function actor(): array
+    {
+        return [
+            'id' => $this->user()->id,
+            'name' => $this->user()->name,
+            'email' => $this->user()->email,
+        ];
     }
 }

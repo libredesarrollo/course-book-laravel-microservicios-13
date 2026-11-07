@@ -1,0 +1,28 @@
+{
+  "name": "demo/microservices-events",
+  "description": "Patrón outbox + reparto de eventos de dominio entre microservicios Laravel (firma HMAC, reintentos y verificación receptora)",
+  "type": "library",
+  "license": "MIT",
+  "keywords": ["laravel", "microservices", "events", "outbox", "webhooks", "hmac", "queues"],
+  "require": {
+    "php": "^8.2",
+    "illuminate/support": "^13.0",
+    "illuminate/queue": "^13.0",
+    "illuminate/routing": "^13.0",
+    "illuminate/contracts": "^13.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Demo\\Microservices\\Events\\": "src/"
+    }
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Demo\\Microservices\\Events\\MicroservicesEventsServiceProvider"
+      ]
+    }
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}

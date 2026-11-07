@@ -56,3 +56,15 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+---
+
+## Colas y eventos (b0.9)
+
+El user-service es el IdP y **no participa en las colas del capítulo**: no
+emite eventos de negocio ni cuenta con worker propio. No necesitas correr
+nada aquí.
+
+Las colas viven en task-service (mails + scheduler del outbox con
+`schedule:work`) y en billing-service (worker de `invoices`; el endpoint
+receptor es `POST /api/events`). Ver los README de cada servicio.

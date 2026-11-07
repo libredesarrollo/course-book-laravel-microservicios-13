@@ -56,3 +56,35 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+---
+
+## Colas y eventos (b0.9)
+
+billing-service es **consumidor**: recibe `POST /api/events` (verificado con
+HMAC por el paquete `demo/microservices-events`), responde `202` y encola el
+trabajo en la cola `invoices`. Con `QUEUE_CONNECTION=database`, los jobs
+esperan en la tabla `jobs` de esta misma base de datos hasta que haya un
+worker.
+
+Para que las facturas nazcan, corre el worker **desde este directorio**:
+
+```bash
+# El worker de la cola de facturas
+php artisan queue:work --queue=invoices
+# App\Jobs\CreateInvoiceFromEvent .. DONE  (y la factura nace)
+```
+
+> Si no hay worker: el usuario no nota nada (el webhook ya respondió 202),
+> pero las facturas quedan esperando en la tabla. Y cuidado: un
+> `queue:work` corrido desde task-service no drena esta cola — cada worker
+> drena la base de datos del directorio en el que lo arrancaste.
+
+Alternativas de mano para pruebas:
+
+```bash
+php artisan queue:work --queue=invoices --stop-when-empty    # procesa y se apaga
+php artisan queue:failed                                     # ver los fallidos (failed_jobs)
+php artisan queue:retry                                      # reintentar fallidos
+php artisan queue:restart                                    # tras cambiar código
+```

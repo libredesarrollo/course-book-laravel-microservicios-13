@@ -18,6 +18,18 @@ abstract class Controller
     }
 
     /**
+     * El request-id del paquete de observabilidad (o null si no llegó):
+     * viaja con los eventos al outbox para seguir el hilo en la trazas del
+     * reparto.
+     */
+    protected function traceId(): ?string
+    {
+        $traceId = request()?->attributes->get('request_id');
+
+        return is_string($traceId) && $traceId !== '' ? $traceId : null;
+    }
+
+    /**
      * Resuelve una tarea y comprueba que sea del usuario en sesión.
      *
      * El modelo se busca aquí y no con route model binding a propósito. El

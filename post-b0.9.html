@@ -1,0 +1,324 @@
+<h1>Colas y eventos: el outbox, el webhook firmado y la idempotencia</h1>
+
+<p>Ahora sí, introdujimos las colas y los eventos en nuestro sistema de microservicios. El
+objetivo del capítulo era doble: por un lado, que ciertas cosas dejen de correr pegadas al
+request del usuario — como el mail de "tarea completada" —; y por el otro, que
+<em>task-service</em> y <em>billing-service</em> por fin se hablen: la frase del capítulo era
+"billing factura al usuario por cada tarea que completa", y hasta ahora no existía en el
+código. Voy a comentarte aquí los resúmenes de lo que hicimos y, por supuesto, los archivos
+que se cambiaron.</p>
+
+<p>Antes de código, el problema que queríamos evitar. Lo natural cuando quieres avisar a otro
+servicio es esto:</p>
+
+<pre><code>// Mal: la tarea vive, el evento no.
+DB::transaction(function () use ($task) {
+    $task->update(['status' => 'completed']);
+});
+
+Http::post('http://127.0.0.1:8002/api/events', [...]);   // aquí puede morir la historia</code></pre>
+
+<p>Si esa petición falla — billing está caído, hay timeout, responde 500 — el evento nunca
+cruzó, y la tarea queda a media historia. Llevarlo a una cola tampoco arregla la raíz del
+problema: entre el commit y la cola se puede perder el mensaje igual. Por eso usamos el
+patrón <strong>outbox</strong>: el evento nace <strong>dentro</strong> de la misma
+transacción que la operación de negocio, como una fila normal de nuestra base de datos local.
+Se confirma la transacción, existe el evento; se cae, nunca existió. Después de eso, la red
+va en otro momento, ya sin responsabilidad sobre si el negocio "realmente pasó".</p>
+
+<p>Y ahí viene la segunda parte del contrato: el reparto es <strong>at-least-once</strong>.
+Es decir, el mismo evento puede llegarle dos veces a billing — por un proceso matado en
+medio, por una red resbaladiza. Y como una factura no se puede duplicar, el receptor carga
+con la <strong>idempotencia</strong>. Ese equilibrio es el corazón del capítulo.</p>
+
+<h2>El paquete demo/microservices-events</h2>
+
+<p>Todo el mecanismo vive en un paquete nuevo, <code>demo/microservices-events</code>, con la
+misma filosofía de la serie: <strong>mecanismo sin política</strong>. El paquete sabe firmar,
+reintentar y marcar entregas como falladas, pero no sabe qué es
+<code>task.completed</code> ni que billing existe — eso lo declara cada aplicación en su
+propio archivo de configuración.</p>
+
+<p>Instalación en task-service (el productor) y en billing-service (el receptor) por
+repositorio local de tipo <code>path</code>, como los otros paquetes:</p>
+
+<pre><code>composer require demo/microservices-events
+php artisan vendor:publish --tag=events-migrations && php artisan migrate</code></pre>
+
+<p>El paquete trae cinco piezas: los modelos del outbox (<code>OutboxEvent</code> y
+<code>OutboxDelivery</code>), el despachador (<code>OutboxDispatcher</code>), la firma
+(<code>Signature</code>), el middleware del receptor (<code>VerifyEventSignature</code>) y el
+comando <code>outbox:dispatch</code>. Y son dos tablas las que lo sostienen:</p>
+
+<pre><code>outbox_events:     id, event_id UNIQUE, type, payload, trace_id,
+                   occurred_at, available_at
+outbox_deliveries: outbox_event_id → outbox_events ON DELETE CASCADE,
+                   subscriber,  UNIQUE(event_id, subscriber),
+                   status pending|delivered|failed, attempts, last_error,
+                   available_at, delivered_at</code></pre>
+
+<p>Fíjate en el detalle: una fila de entrega por cada evento y cada subscriptor. Ahí vive
+toda la vida de la entrega: cuántos intentos costó, cuándo se entregó, si sigue pendiente de
+reintentar. Una fila con <code>available_at</code> a futuro significa "esperando el
+backoff", no "perdida".</p>
+
+<h2>En task-service: emitir en la misma transacción</h2>
+
+<p>El servicio ya tenía un único lugar que marca tareas completadas — el service
+<code>TaskCompletion</code> — y web y API pasan los dos por ahí. Con el outbox, crear el
+evento es una línea dentro de la misma transacción:</p>
+
+<pre><code>// task-service/app/Services/TaskCompletion.php
+$completed = DB::transaction(function () use ($task, $attributes, $actor, $traceId) {
+    if ($task->status !== Task::STATUS_COMPLETED) {
+        $task->update($attributes);   // título extra si viene en el mismo PUT
+
+        OutboxEvent::record('task.completed', [
+            'task_id' => $task->id,
+            'task_title' => $task->title,
+            'user_id' => $task->user_id,
+            'actor' => $actor,
+        ], $traceId);
+    }
+
+    return $task->fresh();
+});
+
+// El mail va en cola, fuera de la transacción: no participa del commit.
+SendTaskCompletedEmail::dispatch($completed, $actor)->onQueue('mails');</code></pre>
+
+<p>Ojo con un detalle de política: el evento se emite solo en la transición. Un PUT repetido
+sobre una tarea ya completada no crea un segundo evento. Y de regalo, el
+<code>trace_id</code> que ya llevábamos del middleware de observabilidad viaja luego en el
+webhook como <code>X-Request-Id</code>: la traza cruza los servicios sin esfuerzo
+extra.</p>
+
+<h2>¿Y cómo cruza el evento hacia billing?</h2>
+
+<p>Con el comando <code>outbox:dispatch</code>, que corre bajo el scheduler cada minuto (o a
+mano, que es como lo verás en el video):</p>
+
+<pre><code>php artisan outbox:dispatch
+# Entregas nuevas: 1 (60 ms)</code></pre>
+
+<pre><code>// task-service/routes/console.php
+Schedule::command(DispatchOutbox::class)->everyMinute()->withoutOverlapping();</code></pre>
+
+<p>El despachador recorre los eventos pendientes, y para cada uno pregunta en la
+configuración quiénes se suscribieron a ese tipo de evento:</p>
+
+<pre><code>// task-service/config/events.php
+'subscribers' => [
+    'billing' => [
+        'url' => env('BILLING_EVENTS_URL'),
+        'secret' => env('BILLING_EVENTS_SECRET'),
+        'events' => ['task.completed'],
+    ],
+],</code></pre>
+
+<p>Y entrega con un webhook firmado. El cuerpo exacto que viaja es el mismo que se firma:
+<code>json_encode</code> una vez, firmar ese string, mandar ese mismo string. Nada de
+rehacer el JSON al momento de firmar — ahí viven los bugs:</p>
+
+<pre><code>// packages/microservices-events/src/Outbox/OutboxDispatcher.php
+$body = (string) json_encode($this->manifest($event));
+$signature = Signature::sign($body, (string) $subscriber['secret']);
+
+$response = Http::withHeaders([
+    'X-Event-Signature' => $signature,
+    'X-Event-Id' => $event->event_id,
+    'X-Event-Type' => $event->type,
+    'X-Event-Timestamp' => (string) now()->getTimestamp(),
+    'X-Request-Id' => $event->trace_id ?? '',
+])
+    ->acceptJson()
+    ->timeout((int) config('events.timeout', 3))
+    ->withBody($body, 'application/json')
+    ->post((string) $subscriber['url']);</code></pre>
+
+<p>La firma es un HMAC SHA-256 del cuerpo crudo, con <code>hash_equals</code> del lado
+receptor para comparar en tiempo constante:</p>
+
+<pre><code>// packages/microservices-events/src/Outbox/Signature.php
+public static function sign(string $body, string $secret): string
+{
+    return hash_hmac('sha256', $body, $secret);
+}</code></pre>
+
+<p>Y los reintentos. Si la entrega falla — billing caído, 5xx, conexión rechazada — la
+entrega queda <code>pending</code> con su intento anotado y vuelve al cabo del backoff
+(<code>10, 30, 120</code> segundos). Se agotan cinco intentos: queda <code>failed</code>
+con su error en el log, y el sistema entero sigue funcionando. Una entrega fallida nunca
+aborta a las demás.</p>
+
+<h2>En billing-service: recibir firmado, obrar en cola</h2>
+
+<p>El receptor declara su endpoint con el middleware de verificación:</p>
+
+<pre><code>// billing-service/routes/api.php
+Route::post('/events', EventController::class)->middleware('events.verify');</code></pre>
+
+<p>El middleware rechaza barato y en orden: primero la configuración del receptor (un 500
+con un mensaje que te dice cómo arreglarlo), luego la firma (401), luego la frescura del
+timestamp (401) y por último el <strong>anti-replay</strong>: el mismo
+<code>event_id</code> dentro de la ventana se responde <code>200</code> con
+<code>{"status": "duplicate"}</code> sin volver a procesar. La marca atómica es
+<code>Cache::add</code>: devuelve <code>true</code> solo la primera vez:</p>
+
+<pre><code>// packages/microservices-events/src/Http/VerifyEventSignature.php
+private function alreadySeen(string $eventId): bool
+{
+    return ! Cache::add(
+        self::CACHE_PREFIX.$eventId,
+        now()->toIso8601String(),
+        now()->addSeconds(max(60, (int) config('events.max_age', 120)) * 2),
+    );
+}</code></pre>
+
+<p>Y el controlador responde <code>202</code> al vuelo — el código honesto de lo asincrónico
+— y encola el trabajo pesado:</p>
+
+<pre><code>// billing-service/app/Http/Controllers/Api/EventController.php
+public function __invoke(Request $request)
+{
+    $envelope = $request->attributes->get('event_envelope');
+
+    if ($request->attributes->get('event_type') !== 'task.completed') {
+        return response()->noContent();   // 204: recibido, no para mí
+    }
+
+    CreateInvoiceFromEvent::dispatch(
+        $request->attributes->get('event_id'),
+        $request->attributes->get('event_payload'),
+    )->onQueue('invoices');
+
+    return response()->json([
+        'received' => true,
+        'event_id' => $request->attributes->get('event_id'),
+    ], 202);
+}</code></pre>
+
+<p>La política de billing queda en su propio job; allí es donde la idempotencia existe de
+verdad:</p>
+
+<h2>Las dos líneas de la idempotencia</h2>
+
+<p>Aquí está la parte que más mis alumnos me preguntan. Con at-least-once, el mismo evento
+puede llegar dos veces. ¿Cómo garantizamos una sola factura? Con dos líneas de defensa, y
+ninguna es el webhook:</p>
+
+<pre><code>// billing-service/app/Jobs/CreateInvoiceFromEvent.php
+public function handle(): void
+{
+    if (! $this->hasValidActor()) {
+        Log::warning('Evento sin actor utilizable, no factura', ['event_id' => $this->eventId]);
+        return;
+    }
+
+    if (Invoice::query()->where('event_id', $this->eventId)->exists()) {
+        Log::info('Evento ya facturado (idempotente por event_id)', ['event_id' => $this->eventId]);
+        return;   // at-least-once: la segunda vez es camino feliz, no error
+    }
+
+    try {
+        Invoice::create([
+            'user_id' => (int) $this->payload['user_id'],
+            'event_id' => $this->eventId,     // UNIQUE en la migración
+            'task_id' => $this->payload['task_id'],
+            'task_title' => (string) $this->payload['task_title'],
+            'amount' => (float) config('events.charge_per_task', 10.00),
+        ]);
+    } catch (UniqueConstraintViolationException) {
+        // Carrera perdida contra otra corrida del job: la factura ya existe.
+        Log::info('Duplicación impedida por UNIQUE', ['event_id' => $this->eventId]);
+    }
+}</code></pre>
+
+<p>Primera línea: la caché anti-replay del middleware, que se come la re-entrega que llega a
+los pocos segundos (sin job, sin toques a tablas). Última línea: la columna
+<code>UNIQUE</code> en <code>event_id</code> de la tabla <code>invoices</code>, que es la
+única que garantiza el negocio aunque la caché se evapore — por ejemplo si el receptor usa
+driver <code>array</code> y se despliega. La garantía no vive en el middleware: vive en el
+dominio. El middleware es aceleración; el constraint es la regla.</p>
+
+<h2>El mail también va a la cola</h2>
+
+<p>Otra pieza del capítulo: el mail de "tarea completada" ya no corre dentro del request del
+usuario. Es un job en la cola <code>mails</code> con sus propios reintentos:</p>
+
+<pre><code>// task-service/app/Jobs/SendTaskCompletedEmail.php
+class SendTaskCompletedEmail implements ShouldQueue
+{
+    public int $tries = 3;
+    public array $backoff = [5, 15];
+
+    public function __construct(public readonly Task $task, public readonly array $actor) {}
+
+    public function handle(): void
+    {
+        Mail::to($this->actor['email'])->send(new TaskCompletedMail($this->task, $this->actor));
+    }
+}</code></pre>
+
+<p>Detallito que aprendimos por la vía dolorosa: el <code>TaskCompletedMail</code> tenía
+<code>ShouldQueue</code>, y al enviar un Mailable encolable dentro de un job, Laravel lo
+re-encola — pero a la cola <code>default</code>, no a <code>mails</code>. El resultado: dos
+encolados de la misma notificación y una cola <code>default</code> que nadie drena. La cola
+pertenece a la unidad de trabajo, y la unidad de trabajo es el job: el Mailable se envía en
+línea (<code>send()</code>) dentro del job.</p>
+
+<h2>Verificación con los tres servicios</h2>
+
+<p>Como siempre, el sistema completo corriendo en local y medidas del minuto. Con billing
+matado con <code>kill -9</code>:</p>
+
+<pre><code>curl -X PUT http://127.0.0.1:8001/api/tasks/3 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"completed"}'
+# 200 OK en ~8 ms     <- el usuario no se entera de nada</code></pre>
+
+<p>Y el evento queda en el outbox. Despachamos:</p>
+
+<pre><code>cd task-service
+php artisan outbox:dispatch
+# Entregas nuevas: 1 (57 ms)
+php artisan tinker --execute 'var_export(\Illuminate\Support\Facades\DB::table("outbox_deliveries")->first()->status);'
+# 'delivered'</code></pre>
+
+<p>Y el worker de billing hace el resto:</p>
+
+<pre><code>cd billing-service
+php artisan queue:work --queue=invoices --stop-when-empty
+# App\Jobs\CreateInvoiceFromEvent .. DONE</code></pre>
+
+<p>Las dos pruebas difíciles. Re-enviamos el mismo webhook firmado a mano, dos veces:</p>
+
+<pre><code>curl -s -X POST http://127.0.0.1:8002/api/events \
+  -H "X-Event-Signature: $SIG" -H "X-Event-Id: $EID" \
+  -H "X-Event-Type: task.completed" -H "X-Event-Timestamp: $(date +%s)" \
+  -H "Content-Type: application/json" --data-binary @event.json
+# {"received":true,"event_id":"...","status":"duplicate"}
+# ... y las facturas siguen siendo exactamente 1</code></pre>
+
+<p>Y con billing muerto:</p>
+
+<pre><code>php artisan outbox:dispatch
+# El intento queda anotado (attempts=1, pending, backoff a 10 s). Nada se
+# cae, el resto de las entregas siguen su curso. Al volver billing:
+php artisan outbox:dispatch
+# Entregas nuevas: 1 — la entrega finalmente "delivered" con su historial.</code></pre>
+
+<p>Los tests de todo esto corren sin levantar servicios: el webhook se firma igual que el
+productor real y la entrega se simula con <code>Http::fake()</code>. En el receptor hay
+cinco pruebas: firma rota <code>401</code>, timestamp viejo <code>401</code>, entrega
+válida <code>202</code> con el job en la cola de <code>invoices</code>, tipo desconocido
+<code>204</code>, y el evento repetido que no duplica factura ni con el job corriendo en
+serio. En task-service, además, el outbox se prueba de punta: evento en la misma
+transacción, entrega firmada con los headers, segundo despacho sin re-entrega, y los
+reintentos hasta <code>failed</code>. En total: 65/220 (user), 91/215 (task), 17/53
+(billing) — todos verdes.</p>
+
+<p>¿RabbitMQ? Todavía no. Con el outbox y la idempotencia ya metidos, migrar a un broker de
+verdad en el futuro es cambiar una llave de configuración — la aplicación no cambia de
+forma. En el próximo capítulo seguiremos sumando piezas sobre esta base. ¡Te espero allá!</p>

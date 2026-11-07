@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Http\Requests\StoreTaskRequest;
 use App\Http\Requests\UpdateTaskRequest;
 use App\Models\Task;
+use App\Services\TaskCompletion;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\View\View;
@@ -34,15 +35,21 @@ class TaskController extends Controller
         ]);
     }
 
-    public function store(StoreTaskRequest $request): RedirectResponse
+    public function store(StoreTaskRequest $request, TaskCompletion $completion): RedirectResponse
     {
         $validated = $request->validated();
 
-        Task::query()->create([
+        $task = Task::query()->create([
             'title' => $validated['title'],
             'user_id' => $this->user()->id,
             'status' => $validated['status'] ?? Task::STATUS_PENDING,
         ]);
+
+        // Creada ya completada empieza contando: el evento sale igual que
+        // si el cambio hubiera venido del update.
+        if ($task->status === Task::STATUS_COMPLETED) {
+            $completion->complete($task, $this->actor(), [], $this->traceId());
+        }
 
         Log::info('El usuario creó una tarea');
 
@@ -61,11 +68,18 @@ class TaskController extends Controller
         return view('tasks.edit', ['task' => $this->findOwnedTask($task)]);
     }
 
-    public function update(UpdateTaskRequest $request, int $task): RedirectResponse
+    public function update(UpdateTaskRequest $request, int $task, TaskCompletion $completion): RedirectResponse
     {
         Log::info('El usuario actualizó una tarea');
 
-        $this->findOwnedTask($task)->update($request->validated());
+        $model = $this->findOwnedTask($task);
+
+        if (($request->validated('status') ?? $model->status) === Task::STATUS_COMPLETED
+            && $model->status !== Task::STATUS_COMPLETED) {
+            $completion->complete($model, $this->actor(), $request->validated(), $this->traceId());
+        } else {
+            $model->update($request->validated());
+        }
 
         return redirect()
             ->route('tasks.index')
@@ -79,5 +93,17 @@ class TaskController extends Controller
         return redirect()
             ->route('tasks.index')
             ->with('success', 'Tarea eliminada.');
+    }
+
+    /**
+     * @return array{id: int, name: string, email: string}
+     */
+    private function actor(): array
+    {
+        return [
+            'id' => $this->user()->id,
+            'name' => $this->user()->name,
+            'email' => $this->user()->email,
+        ];
     }
 }

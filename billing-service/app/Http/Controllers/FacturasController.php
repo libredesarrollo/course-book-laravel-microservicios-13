@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Invoice;
 use Demo\Microservices\UserServiceClient\AuthenticatedUser;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
@@ -12,11 +13,7 @@ class FacturasController extends Controller
     {
         $user = AuthenticatedUser::fromRequest($request);
 
-        $invoices = [
-            ['id' => 101, 'amount' => 149.99, 'status' => 'paid'],
-            ['id' => 102, 'amount' => 59.00, 'status' => 'pending'],
-            ['id' => 103, 'amount' => 24.99, 'status' => 'paid'],
-        ];
+        $invoices = Invoice::query()->when($user !== null, fn ($query) => $query->forUser($user->id))->orderByDesc('created_at')->paginate(10);
 
         return view('facturas.index', [
             'invoices' => $invoices,

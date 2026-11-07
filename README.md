@@ -44,7 +44,9 @@ ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por
 - ✅ **Degradación controlada**: si el user-service cae, la UI lo explica en vez de romperse
 - ✅ **Resiliencia ante la caída del IdP**: reintento idempotente, circuit breaker (503 en ms) y caché de verificación del token
 - ✅ **JWT stateless (b0.7)**: el IdP firma con RS256 y publica `/api/jwks.json`; los RPs verifican localmente — **medido: IdP caído y el RP sigue autenticando con `200` en ~5 ms**
-- ✅ 158 tests / 431 asserts, sin levantar los otros servicios (`Http::fake()`)
+- ✅ **Colas y eventos (b0.9)**: `task.completed` nace en el **outbox** dentro de la misma transacción que la tarea; `outbox:dispatch` lo entrega a billing por webhook firmado con HMAC (reintentos con backoff), billing responde `202` y la factura se crea en la cola `invoices` — **medido: `200 OK` al usuario en ~8 ms con billing muerto, y una única factura aunque el evento llegue dos veces**
+- ✅ Mails desacoplados en cola (`mails`) y facturas en cola (`invoices`), con `QUEUE_CONNECTION=database` local
+- ✅ 173 tests / 488 asserts, sin levantar los otros servicios (`Http::fake()`)
 
 ## Requisitos
 
@@ -104,7 +106,7 @@ servicio: el segundo no vuelve a pedir contraseña.
 |---|---|---|---|
 | Puerto | `:8000` | `:8001` | `:8002` |
 | Base de datos | `db_users.sqlite` | `db_tasks.sqlite` | `db_billing.sqlite` |
-| Tablas | `users`, `api_tokens`, `sso_tickets` | `tasks`, `cache`, `jobs` | `invoices`, `cache`, `jobs` |
+| Tablas | `users`, `api_tokens`, `sso_tickets` | `tasks`, `cache`, `jobs`, `outbox_events`, `outbox_deliveries` | `invoices`, `cache`, `jobs` |
 | Rol | **IdP**: login, SSO, emite y valida tokens | Tareas del usuario autenticado | Facturas del usuario autenticado |
 | ¿Conoce usuarios? | **Sí**, es el dueño | **No** — solo guarda el `user_id` | **No** — solo usa la identidad |
 | Interfaz | Login + `/authorize` + API | API REST **+ UI web** | API REST **+ UI web** |
@@ -148,7 +150,14 @@ móviles). El flujo web usa el código SSO.
 | Método | API | UI web |
 |---|---|---|
 | `GET` | `/api/invoices` | `/facturas` |
+| `POST` | `/api/events` (`events.verify`) | — |
 | — | — | `/sso/start` · `/sso/callback` · `POST /logout` |
+
+`POST /api/events` es el receptor de eventos: recibe `{event_id, type,
+occurred_at, payload}` con los headers HMAC (`X-Event-Signature`,
+`X-Event-Id`, `X-Event-Type`, `X-Event-Timestamp`). Firma inválida o headers
+viejos → `401`; firma válida → `202` y el trabajo corre en la cola; evento
+repetido → `200` `{"status":"duplicate"}` sin crear nada.
 
 ### Matriz de respuestas
 
@@ -220,22 +229,80 @@ curl -s http://127.0.0.1:8000/api/jwks.json | python3 -m json.tool
 curl http://127.0.0.1:8001/api/tasks -H "Authorization: Bearer $TOKEN"
 ```
 
+```bash
+# 9. Colas y eventos: completa una tarea y el evento cruza los servicios
+#    sin que el usuario note. Necesita workers (ver "Los workers" abajo).
+TASK_ID=$(curl -s -X POST http://127.0.0.1:8001/api/tasks \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Instalar el grifo del baño"}' | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
+
+curl -s -X PUT http://127.0.0.1:8001/api/tasks/$TASK_ID \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{"status":"completed"}' > /dev/null        # 200, ya. El mail va en cola.
+
+cd task-service
+
+echo "1. El evento nació en el outbox, en la misma transacción del PUT:"
+php artisan tinker --execute 'print_r(\Illuminate\Support\Facades\DB::table("outbox_events")->latest("id")->first());'
+
+php artisan outbox:dispatch
+#  Entregas nuevas: 1 (~60 ms)   <- webhook firmado, billing responde 202
+
+php artisan queue:work --queue=mails --stop-when-empty
+#  App\Jobs\SendTaskCompletedEmail .. DONE
+
+echo "2. Que el worker de billing facture:"
+cd ../billing-service && php artisan queue:work --queue=invoices --stop-when-empty
+#  App\Jobs\CreateInvoiceFromEvent .. DONE
+
+echo "3. La factura (una sola, aunque re-envíes el evento):"
+curl -s http://127.0.0.1:8002/api/invoices -H "Authorization: Bearer $TOKEN"
+```
+
 **Postman**: variables `user_service`, `task_service` y `token`; el request 1 guarda el `token`
 en la variable de entorno y el resto manda `Authorization: Bearer {{token}}`.
+
+---
+
+## Los workers
+
+Con `QUEUE_CONNECTION=database` el desacoplamiento es local: los jobs viven en
+la tabla `jobs` de cada base de datos. Sin worker, los jobs **esperan**; esa es
+exactamente la gracia del capítulo. Para que trabajen (cada comando en **su**
+directorio — un worker drena la BD del servicio donde arranca):
+
+```bash
+# terminal task-service: mails + cron local del outbox
+php artisan queue:work --queue=mails,default
+php artisan schedule:work          # corre outbox:dispatch cada minuto
+
+# terminal billing-service: facturas
+php artisan queue:work --queue=invoices
+```
+
+`outbox:dispatch` no es un worker: es el "cartero" que reparte eventos del
+outbox a los webhooks subscriptores. Con `schedule:work` corre cada minuto
+(`withoutOverlapping`); a mano, `php artisan outbox:dispatch` en task-service.
+Los tres README de los servicios documentan sus comandos en "Colas y eventos
+(b0.9)".
 
 ---
 
 ## Tests
 
 ```bash
-cd user-service && vendor/bin/pest --compact    # 53 tests, 166 asserts
-cd task-service && vendor/bin/pest --compact    # 76 tests, 165 asserts
-cd billing-service && vendor/bin/pest --compact # 10 tests, 30 asserts
+cd user-service && vendor/bin/pest --compact    # 65 tests, 220 asserts
+cd task-service && vendor/bin/pest --compact    # 91 tests, 215 asserts
+cd billing-service && vendor/bin/pest --compact # 17 tests, 53 asserts
 ```
 
 Ningún test necesita el otro servicio: `Http::fake()` simula `200`, `401`, `404`, `500` y la
-conexión caída. Hay tests que intentan inyectar `user_id` por API y por formulario, y comprueban
-que se ignora.
+conexión caída; el webhook de los eventos se firma igual que lo haría el
+productor real (`Signature::sign`). Hay tests que intentan inyectar `user_id`
+por API y por formulario, y comprueban que se ignora. El receptor de eventos
+comprueba las cinco caras: firma rota `401`, headers viejos `401`, entrega
+válida `202` con job en la cola, tipo desconocido `204` y evento repetido que
+no duplica la factura (UNIQUE en `invoices`, con el job corriendo de verdad).
 
 Los paquetes de `packages/` también tienen cobertura propia, en
 `task-service/tests/Feature/UserServiceClientPackageTest.php`: tests sobre el cliente HTTP del
@@ -295,6 +362,23 @@ y `403` para "existe pero no es tuya": una fuga de información sobre tareas aje
 user-service para preguntar si el id existía. Ahora esa misma pregunta la contesta el middleware,
 en el mismo request. Preguntarlo dos veces es pagar la latencia dos veces.
 
+**El evento nace en un outbox, no en un webhook.** Un webhook directo en el
+mismo request es at-least-once al revés: nace-si-se-puede. Con la fila
+`outbox_events` en la misma transacción que la tarea, el evento vive si el
+negocio vivió. `outbox:dispatch` es el que cruza la red; con billing caído
+simplemente no cruza, y no hace daño.
+
+**El receptor resuelve "una o muchas veces".** Como el reparto es at-least-once,
+el mismo evento puede llegar dos veces. La cuenta la lleva billing: cache
+anti-replay por `event_id` y UNIQUE en `invoices.event_id`. La primera línea
+ahorra trabajo redundante; la última hace la garantía real. Con at-least-once
+al emisor y "exactamente una vez" al receptor el sistema queda usable.
+
+**La cola local gana para el primer capítulo.** Con `QUEUE_CONNECTION=database`
+cada servicio drena su propia tabla `jobs`, sin broker externo. Cuando el
+equipo ya tiene el patrón outbox y la idempotencia, migrar a RabbitMQ es
+cambiar el `config("queue")`: la aplicación no se entera.
+
 ---
 
 ## Estructura
@@ -321,15 +405,24 @@ demo-microservicios/
 │   │   └── src/
 │   │       ├── Http/Middleware/{EnsureRequestId,AttachLogContext}.php
 │   │       └── Http/Controllers/HealthController.php
-│   └── microservices-user-service-client/    ← la frontera de red con el user-service
-│       ├── src/Contracts/IdentityProvider.php
-│       ├── src/UserServiceClient.php         ← con reintentos y breaker en send()
-│       ├── src/Resiliency/CircuitBreaker.php  ← breaker respaldado por caché
-│       ├── src/AuthenticatedUser.php        ← la identidad que confirmó el peer
-│       ├── src/TokenSession.php             ← sesión web respaldada por token remoto
-│       ├── src/Http/Middleware/AuthenticateWithUserService.php  ← con caché de verificación
-│       ├── src/Exceptions/
-│       └── config/user-service-client.php
+│   ├── microservices-user-service-client/    ← la frontera de red con el user-service
+│   │   ├── src/Contracts/IdentityProvider.php
+│   │   ├── src/UserServiceClient.php         ← con reintentos y breaker en send()
+│   │   ├── src/Resiliency/CircuitBreaker.php  ← breaker respaldado por caché
+│   │   ├── src/AuthenticatedUser.php        ← la identidad que confirmó el peer
+│   │   ├── src/TokenSession.php             ← sesión web respaldada por token remoto
+│   │   ├── src/Http/Middleware/AuthenticateWithUserService.php  ← con caché de verificación
+│   │   ├── src/Exceptions/
+│   │   └── config/user-service-client.php
+│   └── microservices-events/                 ← la frontera asincrónica (b0.9)
+│       ├── src/Outbox/OutboxEvent.php         ← evento: emisión en la propia BD
+│       ├── src/Outbox/OutboxDelivery.php      ← intentos por receptor
+│       ├── src/Outbox/OutboxDispatcher.php    ← reparto firmado con reintentos
+│       ├── src/Outbox/Signature.php           ← HMAC SHA-256 del cuerpo
+│       ├── src/Http/Middleware/VerifyEventSignature.php  ← middleware receptor
+│       ├── src/Console/DispatchOutbox.php     ← comando outbox:dispatch
+│       ├── database/migrations/               ← outbox_events / outbox_deliveries
+│       └── config/events.php
 │
 ├── user-service/                     ← :8000 · db_users.sqlite · IdP
 │   ├── app/Models/{ApiToken,SsoTicket}.php
@@ -425,6 +518,18 @@ USER_SERVICE_JWKS_URL=http://127.0.0.1:8000/api/jwks.json
 USER_SERVICE_JWT_ISSUER=user-service
 USER_SERVICE_JWT_LEEWAY=10
 USER_SERVICE_JWKS_CACHE_TTL=3600
+
+# Colas de database b0.9: cada servicio drena su propia cola y ocupa su
+# propia tabla jobs. SYNC en esta caché local queda para tests.
+QUEUE_CONNECTION=database
+
+# Eventos (b0.9) en task-service (productor)…
+BILLING_EVENTS_URL=http://127.0.0.1:8002/api/events
+BILLING_EVENTS_SECRET=secreto-task-billing-local
+
+# …y en billing-service (receptor, con la misma semilla secreta).
+TASK_EVENTS_SECRET=secreto-task-billing-local
+BILLING_CHARGE_PER_TASK=10.00
 ```
 
 En el lado del IdP hay tres llaves más (`user-service/.env`):
@@ -446,6 +551,14 @@ middleware responde `401` en JSON, que es lo que necesita una API pura.
 
 > Ojo: `php artisan serve` **no propaga variables de entorno arbitrarias** al proceso hijo. Si
 > lanzas el servicio con `USER_SERVICE_URL=... php artisan serve`, seguirá leyendo el `.env`.
+
+### Secrets de los eventos
+
+Cada par productor↔receptor comparte su clave HMAC, con **nombres distintos en
+cada lado**: `BILLING_EVENTS_SECRET` es la que task usa para firmar,
+`TASK_EVENTS_SECRET` es la que billing usa para verificar. El valor es el
+mismo, pero el nombre es del lado que lo usa: el paquete no pisa la política
+de nombres de cada aplicación.
 
 ---
 
@@ -478,14 +591,14 @@ middleware responde `401` en JSON, que es lo que necesita una API pura.
 | 3 | `X-Request-Id` + health checks + logs con contexto | **Hecho** |
 | 4 | Código compartido empaquetado con Composer | **Hecho** |
 | 4b | SSO con IdP central + single logout | **Hecho** |
-| 5 | Circuit breaker + reintentos con backoff | Pendiente |
+| 5 | Circuit breaker + reintentos con backoff | **Hecho** |
 | 6 | Refresh tokens | Pendiente |
 | 7 | API versioning | Pendiente |
 | 8 | Contratos de consumidor en CI | Pendiente |
-| 9 | RabbitMQ (`user.deleted` → purgar tareas) | Pendiente |
+| 9a | Colas + eventos con outbox, webhook firmado y at-least-once idempotente | **Hecho** |
+| 9b | RabbitMQ/Kafka: el mismo patrón con mensajería dedicada | Pendiente |
 | 10 | Docker + despliegue | Pendiente |
 | 11 | Octane | Pendiente |
-| 12 | JWT o gateway | Pendiente |
 
 Los siguientes cuestan horas y evitan incidentes. El 11 puede esperar un año sin que nadie lo
 note.
@@ -504,6 +617,10 @@ note.
 | [`docs/03-rate-limit.html`](docs/03-rate-limit.html) | El rate limiting del login: el antes, el después y por qué dos límites |
 | [`docs/04-observabilidad.html`](docs/04-observabilidad.html) | Correlation ID, health checks y trazabilidad entre microservicios |
 | [`docs/05-modulos-composer.html`](docs/05-modulos-composer.html) | Cómo empaquetar el código compartido en paquetes Composer locales |
+| [`docs/08-que-se-hizo-sso.html`](docs/08-que-se-hizo-sso.html) | Recap del capítulo SSO: flujo, canje, cookie y logout central |
+| [`docs/09-resiliencia.html`](docs/09-resiliencia.html) | Recap del capítulo resiliencia: reintentos, breaker y caché |
+| [`docs/10-jwt-stateless.html`](docs/10-jwt-stateless.html) | Recap del capítulo JWT: firma del IdP, JWKS y verificación local |
+| [`docs/11-colas-y-eventos.html`](docs/11-colas-y-eventos.html) | Recap del capítulo colas: outbox, webhook firmado e idempotencia |
 | [`docs/01-estructura-base.html`](docs/01-estructura-base.html) | El proyecto entero en 14 diapositivas |
 
 ---

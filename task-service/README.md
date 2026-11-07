@@ -56,3 +56,41 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 ## License
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+
+---
+
+## Colas y agenda (b0.9)
+
+Con `QUEUE_CONNECTION=database` los jobs viven en la tabla `jobs` de esta
+misma base de datos: sin worker, esperan; esa es la gracia. En 
+**task-service** hay dos procesos locales (cada uno en su terminal, siempre
+desde este directorio):
+
+```bash
+# 1. El worker de la cola de mails (y default por si acaso)
+php artisan queue:work --queue=mails,default
+
+# 2. El "cron" local: cada minuto corre outbox:dispatch y reparte
+#    el evento task.completed al webhook de billing, firmado con HMAC
+php artisan schedule:work
+```
+
+El `schedule:work` ejecuta en primer plano el scheduler de
+`routes/console.php`, que lanza:
+
+```php
+Schedule::command(DispatchOutbox::class)->everyMinute()->withoutOverlapping();
+```
+
+Alternativas de mano para pruebas:
+
+```bash
+php artisan outbox:dispatch                                  # despacha el outbox ahora
+php artisan queue:work --queue=mails --stop-when-empty       # procesa y se apaga
+php artisan queue:failed                                     # ver los fallidos (failed_jobs)
+php artisan queue:retry                                      # reintentar fallidos
+php artisan queue:restart                                    # tras cambiar código
+```
+
+> Ojo: cada `queue:work` drena la tabla `jobs` del servicio donde corre.
+> Correrlo desde task-service no drena la cola de billing, ni al revés.

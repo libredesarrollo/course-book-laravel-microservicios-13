@@ -1,5 +1,6 @@
 <?php
 
+use App\Models\Invoice;
 use Demo\Microservices\UserServiceClient\TokenSession;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -53,15 +54,35 @@ it('shows invoices and user name when authenticated', function () {
         '*/api/user' => Http::response(['id' => 1, 'name' => 'Ana Torres', 'email' => 'ana.torres@example.com'], 200),
     ]);
 
+    Invoice::factory()->create([
+        'user_id' => 1,
+        'task_title' => 'Pintar la barda',
+        'amount' => 149.99,
+        'status' => Invoice::STATUS_PAID,
+    ]);
+    Invoice::factory()->create([
+        'user_id' => 1,
+        'task_title' => 'Riego por aspersión',
+        'amount' => 9.00,
+        'status' => Invoice::STATUS_PENDING,
+    ]);
+    Invoice::factory()->create([
+        'user_id' => 2,
+        'task_title' => 'De otro usuario',
+        'amount' => 1.00,
+    ]);
+
     $this->withSession([TokenSession::SESSION_KEY => $token])
         ->get('/facturas')
         ->assertStatus(200)
         ->assertSee('Ana Torres')
         ->assertSee('Mis facturas')
-        ->assertSee('#101')
+        ->assertSee('149.99')
         ->assertSee('Pagada')
-        ->assertSee('#102')
+        ->assertSee('9.00')
         ->assertSee('Pendiente');
+
+    expect(Invoice::query()->count())->toBe(3);
 });
 
 it('reaches facturas with an sso session', function () {

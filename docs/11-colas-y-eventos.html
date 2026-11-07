@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Colas y eventos en el demo de microservicios: el patrón outbox emite task.completed en la misma transacción de la tarea, un webhook firmado con HMAC cruza hacia billing con reintentos, y el receptor resuelve la idempotencia para que el at-least-once no duplique facturas.">
+<meta name="keywords" content="microservicios, laravel, colas, outbox, webhook, hmac, at-least-once, idempotencia, queue">
+<title>Colas y eventos: el outbox, el webhook firmado y la idempotencia — demo-microservicios</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Colas y eventos: el outbox, el webhook firmado y la idempotencia",
+  "about": ["outbox pattern", "queues", "webhooks", "hmac", "at-least-once", "idempotencia", "microservicios", "laravel"],
+  "inLanguage": "es"
+}
+</script>
+</head>
+<body>
+<article>
+
+<header>
+<h1>Colas y eventos: el outbox, el webhook firmado y la idempotencia</h1>
+<p><em>Capítulo de la serie de microservicios. Hasta b0.7 la comunicación entre servicios
+era 100% síncrona: cada request crítico pagaba su salto de red. Este capítulo introduce
+asincronía con colas locales de database y el patrón <strong>outbox</strong>: el evento
+<code>task.completed</code> nace en la misma transacción que la tarea, un despachador lo
+entrega por webhook firmado con HMAC (con reintentos y backoff), billing responde
+<code>202</code> y la factura se crea en su cola. Y como el reparto es
+<code>at-least-once</code>, el receptor carga con la <strong>idempotencia</strong>.</em></p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#problema">El problema: dos servicios que no se conocían</a></li>
+<li><a href="#principio">El principio: escribir antes, cruzar después</a></li>
+<li><a href="#paquete">El paquete demo/microservices-events</a></li>
+<li><a href="#productor">En task-service: emitir en la misma transacción</a></li>
+<li><a href="#receptor">En billing-service: recibir firmado, obrar en cola</a></li>
+<li><a href="#idempotencia">Las dos líneas de la idempotencia</a></li>
+<li><a href="#verificacion">Verificación real con los tres servicios</a></li>
+<li><a href="#config">Configuración</a></li>
+<li><a href="#elecciones">Elecciones y precios</a></li>
+</ol>
+</nav>
+
+<h2 id="problema">El problema: dos servicios que no se conocían</h2>
+<p>Hasta aquí, task-service y billing-service ni se hablaban. La frase "billing le factura al
+usuario por cada tarea completada" no existía en el sistema: billing tenía facturas quemadas
+a mano en un array PHP, sin tabla, y task-service nunca cruzó la frontera proactivamente —
+solo respondía requests. Y el mail de "tarea completada" corría pegado al request del
+usuario.</p>
+<p>Tres necesidades distintas, mismo capítulo:</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Necesidad</th><th>Instrumento</th><th>Quién decide</th></tr>
+<tr><td>El mail no debe retrasar la respuesta del usuario</td><td>Cola database + job <code>SendTaskCompletedEmail</code></td><td>task-service</td></tr>
+<tr><td>Billing caído, y el usuario igual completó su tarea</td><td>Outbox + webhook con reintentos</td><td>task-service dice a quién entregar: config <code>events.subscribers</code></td></tr>
+<tr><td>El evento puede llegar dos veces; la factura no se puede duplicar</td><td>UNIQUE en <code>invoices.event_id</code> + cache anti-replay</td><td>billing-service</td></tr>
+</table>
+
+<h2 id="principio">El principio: escribir antes, cruzar después</h2>
+<p>El antipatrón tentador:</p>
+<pre><code>// Mal: la tarea vive, el evento no.
+DB::transaction(function () use ($task) {
+    $task->update(['status' => 'completed']);
+});
+
+Http::post('http://127.0.0.1:8002/api/events', [...]);   // aquí puede morir la historia</code></pre>
+<p>Si el <code>Http::post</code> muere (billing caído, timeout, 500), el evento nunca cruzó:
+la tarea quedó a media historia. Llevarlo a una cola no resuelve la raíz: <strong>el mensaje
+puede perderse entre el commit y la cola</strong>.</p>
+<p>El patrón outbox invierte el orden. El evento nace <strong>dentro</strong> de la misma
+transacción, como una fila normal de la base de datos local — porque es negocio propio:</p>
+<pre><code>// task-service/app/Services/TaskCompletion.php (b0.9)
+DB::transaction(function () use ($task, $actor, $traceId) {
+    $task->update(['status' => 'completed']);
+
+    // Misma transacción: si la tarea no sobrevive, el evento tampoco.
+    OutboxEvent::record('task.completed', [
+        'task_id' => $task->id,
+        'task_title' => $task->title,
+        'user_id' => $task->user_id,
+        'actor' => $actor,
+    ], $traceId);
+});
+
+// La red va DESPUÉS, con la fila esperando:
+SendTaskCompletedEmail::dispatch($task->fresh(), $actor)->onQueue('mails');</code></pre>
+<p>Transacción confirmada = evento garantizado en tierra de origen. La red arranca después,
+con una fila en el outbox esperando; el despachador la cruza. Tarde, no nunca.</p>
+
+<h2 id="paquete">El paquete demo/microservices-events</h2>
+<p>La regla de la serie: la frontera es código compartido empaquetado. Y igual que en b0.5,
+<strong>mecanismo sin política</strong>: el paquete sabe firmar, reintentar y marcar como
+fallado; no sabe qué es <code>task.completed</code> ni que billing existe — eso vive en el
+<code>config/events.php</code> de cada aplicación.</p>
+<h3>Las dos tablas del outbox</h3>
+<pre><code>outbox_events:     id, event_id UNIQUE, type, payload, trace_id,
+                   occurred_at, available_at
+outbox_deliveries: outbox_event_id → outbox_events ON DELETE CASCADE,
+                   subscriber,    UNIQUE(event_id, subscriber),
+                   status pending|delivered|failed, attempts, last_error,
+                   available_at, delivered_at</code></pre>
+<p>Una fila de entrega por (evento, subscriptor): es el registro de con quién cruza y de los
+intentos que costó. <code>available_at</code> futuro significa "esperando el backoff", no
+perdida.</p>
+<h3>El despachador</h3>
+<p>El comando corre bajo el scheduler cada minuto (<code>withoutOverlapping</code>):</p>
+<pre><code>// task-service/routes/console.php
+Schedule::command(DispatchOutbox::class)->everyMinute()->withoutOverlapping();</code></pre>
+<p>y su núcleo recorre los eventos pendientes:</p>
+<pre><code>// packages/microservices-events/src/Outbox/OutboxDispatcher.php
+$events = OutboxEvent::query()
+    ->where('available_at', '<=', now())
+    ->orderBy('occurred_at')
+    ->limit($limit)
+    ->with('deliveries')
+    ->get();
+
+foreach ($events as $event) {
+    foreach ($this->subscribersFor($event->type) as $name => $subscriber) {
+        // firstOrCreate: no hay dos intentos en pie para (evento, receptor).
+        $delivery = OutboxDelivery::firstOrCreate([
+            'outbox_event_id' => $event->id,
+            'subscriber' => $name,
+        ]);
+
+        if ($delivery->delivered()) { continue; }   // ya cruzó
+        if ($delivery->failed()) { continue; }      // agotado su cuota
+        if ($delivery->available_at?->isFuture()) { continue; }  // en backoff
+
+        $this->deliverTo($event, $name, $subscriber, $delivery);
+    }
+}</code></pre>
+
+<h3>La entrega: firma y clasificación de los fallos</h3>
+<p>El cuerpo exacto que se manda es el mismo que se firma. Una conexión rechazada no se
+confunde con un 5xx del receptor: ambas anotan su <code>last_error</code> y vuelven por el
+backoff, y ninguna aborta el resto de entregas:</p>
+<pre><code>// packages/microservices-events/src/Outbox/OutboxDispatcher.php
+private function deliverTo(OutboxEvent $event, string $name, array $subscriber, OutboxDelivery $delivery): bool
+{
+    $delivery->forceFill(['attempts' => $delivery->attempts + 1])->save();
+
+    $body = (string) json_encode($this->manifest($event));
+    $signature = Signature::sign($body, (string) $subscriber['secret']);
+
+    try {
+        $response = Http::withHeaders([
+            'X-Event-Signature' => $signature,
+            'X-Event-Id' => $event->event_id,
+            'X-Event-Type' => $event->type,
+            'X-Event-Timestamp' => (string) now()->getTimestamp(),
+            'X-Request-Id' => $event->trace_id ?? '',
+        ])
+            ->acceptJson()
+            ->timeout((int) config('events.timeout', 3))
+            ->withBody($body, 'application/json')
+            ->post((string) $subscriber['url']);
+    } catch (ConnectionException $exception) {
+        $this->recordFailure($delivery, $name, $event, 'Conexión fallida');
+
+        return false;
+    }
+
+    if ($response->successful()) {
+        $delivery->forceFill(['status' => 'delivered', 'delivered_at' => now()])->save();
+
+        return true;
+    }
+
+    $this->recordFailure($delivery, $name, $event,
+        'HTTP '.$response->status().': '.substr($response->body() ?? '', 0, 256));
+
+    return false;
+}
+
+private function recordFailure(...): void
+{
+    // backoff [10, 30, 120] (el último se repite) y al agotar
+    // max_attempts (5): status 'failed' con su Log::error.
+    // Cada entrega lleva su propio reloj y su propia vida.
+}</code></pre>
+
+<h3>La firma</h3>
+<p>HMAC SHA-256 con hash_equals del lado receptor — la verificación en tiempo constante
+elimina los ataques de timing sobre la comparación:</p>
+<pre><code>// packages/microservices-events/src/Outbox/Signature.php
+public static function sign(string $body, string $secret): string
+{
+    return hash_hmac('sha256', $body, $secret);
+}
+
+public static function verify(string $body, string $signature, string $secret): bool
+{
+    $known = self::sign($body, $secret);
+
+    return is_string($signature) && hash_equals($known, $signature);
+}</code></pre>
+<h2 id="productor">En task-service: emitir en la misma transacción</h2>
+<p>El lugar que marca tareas completadas ya era único (b0.4: <code>TaskCompletion</code>).
+b0.9 le añade la emisión del evento en la misma transacción y el mail desacoplado en cola:</p>
+<pre><code>// task-service/app/Services/TaskCompletion.php
+public function complete(Task $task, array $actor, array $attributes, ?string $traceId): Task
+{
+    $completed = DB::transaction(function () use ($task, $attributes, $actor, $traceId) {
+        if ($task->status !== Task::STATUS_COMPLETED) {
+            $task->update($attributes);   // título extra si viene en el mismo PUT
+
+            OutboxEvent::record('task.completed', [
+                'task_id' => $task->id,
+                'task_title' => $task->title,
+                'user_id' => $task->user_id,
+                'actor' => $actor,
+            ], $traceId);
+        }
+
+        return $task->fresh();
+    });
+
+    // El mail va en cola, fuera de la transacción: no participa del commit.
+    SendTaskCompletedEmail::dispatch($completed, $actor)->onQueue('mails');
+
+    return $completed;
+}</code></pre>
+<p>Nota de política: el evento se emite solo en la transición
+(<code>pending → completed</code>). Un PUT repetido sobre una tarea ya completa no crea un
+segundo evento — el outbox no es un boletín de spam. El <code>trace_id</code> viene del
+<code>X-Request-Id</code> del middleware de observabilidad (b0.3) y viaja luego como
+<code>X-Request-Id</code> en el webhook: la traza cruza los servicios.</p>
+<h3>La config del productor</h3>
+<p>La única referencia a billing es la declarativa:</p>
+<pre><code>// task-service/config/events.php
+'subscribers' => [
+    'billing' => [
+        'url' => env('BILLING_EVENTS_URL'),
+        'secret' => env('BILLING_EVENTS_SECRET'),
+        'events' => ['task.completed'],
+    ],
+],</code></pre>
+<h3>El mail, también en cola</h3>
+<p>El <code>200</code> del usuario no espera al SMTP:</p>
+<pre><code>// task-service/app/Jobs/SendTaskCompletedEmail.php
+class SendTaskCompletedEmail implements ShouldQueue
+{
+    public int $tries = 3;
+    public array $backoff = [5, 15];
+
+    public function __construct(public readonly Task $task, public readonly array $actor) {}
+
+    public function handle(): void
+    {
+        Mail::to($this->actor['email'])->send(new TaskCompletedMail($this->task, $this->actor));
+    }
+}</code></pre>
+<p><em>Detallazo del capítulo: el <code>TaskCompletedMail</code> implementaba
+<code>ShouldQueue</code>, y con <code>Mail::send()</code> dentro de un job, el framework
+re-encolaba el Mailable — pero a la cola <code>default</code>, fuera de la política. La
+unidad de la cola es el servicio; el Mailable se envía en línea dentro del job.</em></p>
+
+<h2 id="receptor">En billing-service: recibir firmado, obrar en cola</h2>
+<h3>El middleware de verificación</h3>
+<p>Empieza rechazando barato y en orden: primero la configuración del receptor (un 500 sin
+HTTP de por medio), después firma, frescura y anti-replay:</p>
+<pre><code>// packages/microservices-events/src/Http/VerifyEventSignature.php
+public function handle(Request $request, Closure $next): Response
+{
+    $secret = (string) config('events.secret');
+
+    if ($secret === '') {
+        logger()->warning('VerifyEventSignature: el receptor no configuró events.secret');
+
+        return response()->json(['error' => 'Receptor no configurado'], 500);
+    }
+
+    $signature = (string) $request->header(Signature::HEADER);
+    $timestamp = (int) $request->header(Signature::HEADER_TIMESTAMP, '0');
+    $eventId   = (string) $request->header(Signature::HEADER_EVENT_ID);
+    $type      = (string) $request->header(Signature::HEADER_TYPE);
+
+    if ($this->tooOld($timestamp)) {
+        return response()->json(['error' => 'Evento fuera de la ventana de frescura'], 401);
+    }
+
+    if (! Signature::verify($request->getContent(), $secret, $signature)) {
+        return response()->json(['error' => 'Firma de evento inválida'], 401);
+    }
+
+    if ($this->alreadySeen($eventId)) {
+        // El emisor es at-least-once; esta re-entrega ya la procesamos.
+        // Responder 200 evita que el dispatcher la cuente como fallo.
+        return response()->json([
+            'received' => true,
+            'event_id' => $eventId,
+            'status' => 'duplicate',
+        ], 200);
+    }
+
+    $envelope = $request->json()->all();
+
+    $request->attributes->set('event_id', $eventId);
+    $request->attributes->set('event_type', $type);
+    $request->attributes->set('event_envelope', $envelope);
+    $request->attributes->set('event_payload', (array) ($envelope['payload'] ?? []));
+
+    return $next($request);
+}
+
+private function tooOld(int $timestamp): bool
+{
+    if ($timestamp <= 0) {
+        return true;    // sin header fresco: fuera
+    }
+
+    $maxAge = max(60, (int) config('events.max_age', 120));
+
+    return abs(now()->getTimestamp() - $timestamp) > $maxAge;
+}
+
+private function alreadySeen(string $eventId): bool
+{
+    // Cache::add es atómico: devuelve true solo la PRIMERA vez; las
+    // re-entregas concurrentes obtienen false. La ventana antireplay es
+    // 2x el max_age para cubrir más que la de los headers.
+    return ! Cache::add(
+        self::CACHE_PREFIX.$eventId,               // microservices-events.seen.{id}
+        now()->toIso8601String(),
+        now()->addSeconds(max(60, (int) config('events.max_age', 120)) * 2),
+    );
+}</code></pre>
+<h3>El receptor: el controlador decide</h3>
+<p>El endpoint responde <code>202</code> al instante y encola el trabajo pesado — el
+<code>202</code> es el código del contrato asincrónico:</p>
+<pre><code>// billing-service/app/Http/Controllers/Api/EventController.php
+public function __invoke(Request $request)
+{
+    $envelope = $request->attributes->get('event_envelope');
+
+    if ($request->attributes->get('event_type') !== 'task.completed') {
+        return response()->noContent();   // 204: recibido, no para mí
+    }
+
+    CreateInvoiceFromEvent::dispatch(
+        $request->attributes->get('event_id'),
+        $request->attributes->get('event_payload'),
+    )->onQueue('invoices');
+
+    return response()->json([
+        'received' => true,
+        'event_id' => $request->attributes->get('event_id'),
+    ], 202);
+}</code></pre>
+<h3>El job: la política de billing</h3>
+<p>Tres reglas del job: el evento que no trae <code>user_id</code> usable se registra y no
+factura; el evento repetido sale por el <code>exists</code>; y la carrera real entre dos
+workers la frena el UNIQUE:</p>
+<pre><code>// billing-service/app/Jobs/CreateInvoiceFromEvent.php
+public function handle(): void
+{
+    if (! $this->hasValidActor()) {
+        Log::warning('Evento sin actor utilizable, no factura', [
+            'event_id' => $this->eventId,
+        ]);
+
+        return;
+    }
+
+    if (Invoice::query()->where('event_id', $this->eventId)->exists()) {
+        Log::info('Evento ya facturado (idempotente por event_id)', [
+            'event_id' => $this->eventId,
+        ]);
+
+        return;   // at-least-once: segunda vez es camino feliz
+    }
+
+    try {
+        Invoice::create([
+            'user_id' => (int) $this->payload['user_id'],
+            'event_id' => $this->eventId,          // UNIQUE
+            'task_id' => $this->payload['task_id'],
+            'task_title' => (string) $this->payload['task_title'],
+            'amount' => (float) config('events.charge_per_task', 10.00),
+        ]);
+    } catch (UniqueConstraintViolationException) {
+        // Carrera perdida contra otra corrida del job: la factura ya
+        // existe. No es un error; es la garantía mostrando el múculo.
+        Log::info('Duplicación impedida por UNIQUE', ['event_id' => $this->eventId]);
+    }
+}</code></pre>
+
+<h2 id="idempotencia">Las dos líneas de la idempotencia</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Línea</th><th>Instrumento</th><th>Qué resuelve</th></tr>
+<tr><td><strong>Primera: cache anti-replay</strong></td><td><code>Cache::add()</code> atómico por <code>event_id</code> en el middleware</td><td>La re-entrega dentro de la ventana devuelve <code>200 duplicate</code> sin encolar jobs ni tocar tablas</td></tr>
+<tr><td><strong>Última: UNIQUE en el dominio</strong></td><td><code>invoices.event_id UNIQUE</code> + catch de <code>UniqueConstraintViolationException</code></td><td>La duplicidad real cuando el cache se evapora (driver <code>array</code> + deploy): la segunda factura nace imposible, sea quien sea el worker</td></tr>
+</table>
+<p>Principio de arquitectura: la garantía <strong>no vive en el webhook</strong>, vive en el
+<strong>dominio</strong> (una columna UNIQUE). Los middlewares y caches son aceleradores y
+cortocircuitos; el constraint en la tabla es la regla.</p>
+
+<h2 id="verificacion">Verificación real con los tres servicios</h2>
+<p>Con los tres servicios levantados, login JWT real de Ana, workers locales
+(<code>queue:work --queue=mails</code> / <code>--queue=invoices</code>) y un
+<code>kill -9</code> en medio:</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Escenario</th><th>Resultado</th></tr>
+<tr><td><code>PUT /api/tasks/{id}</code> con <strong>billing muerto</strong> (kill -9)</td><td><strong>200 en ~8 ms</strong> — el usuario ni se entera; el evento espera en el outbox</td></tr>
+<tr><td><code>outbox:dispatch</code> con billing vivo</td><td><code>delivered</code> en ~60 ms; en billing: <code>202</code> y 1 job en <code>jobs</code></td></tr>
+<tr><td>worker de billing</td><td><code>CreateInvoiceFromEvent .. DONE</code> — factura de <code>10.00</code></td></tr>
+<tr><td>re-despacho del evento ya entregado</td><td>sin nuevas entregas (la entrega ya está <code>delivered</code>)</td></tr>
+<tr><td>reenvío a mano del webhook firmado, <strong>dos veces</strong></td><td><strong>200 <code>{"status":"duplicate"}</code></strong> ambas — y sigue habiendo <strong>1 factura</strong></td></tr>
+<tr><td>billing muerto + <code>outbox:dispatch</code></td><td>intento anotado (<code>attempts=1</code>, pending, backoff a 10 s) y el comando <strong>no se cae</strong></td></tr>
+<tr><td>billing revive + <code>outbox:dispatch</code></td><td><code>delivered</code> con los 3 intentos en el historial; su worker factura</td></tr>
+<tr><td>mail en cola</td><td><code>SendTaskCompletedEmail .. DONE</code> — el usuario no pagó ningún SMTP en latencia</td></tr>
+</table>
+
+<h2 id="config">Configuración</h2>
+<p>Productor (<code>task-service/.env</code>):</p>
+<pre><code>QUEUE_CONNECTION=database
+BILLING_EVENTS_URL=http://127.0.0.1:8002/api/events
+BILLING_EVENTS_SECRET=secreto-task-billing-local</code></pre>
+<p>Receptor (<code>billing-service/.env</code>):</p>
+<pre><code>QUEUE_CONNECTION=database
+TASK_EVENTS_SECRET=secreto-task-billing-local   # la misma clave, nombre del lado propio
+BILLING_CHARGE_PER_TASK=10.00</code></pre>
+<p>Y en <code>routes/console.php</code> del productor el scheduler; en cada aplicación puede
+afinar <code>timeout</code>, <code>max_attempts</code>, <code>backoff</code> y
+<code>max_age</code> en <code>config/events.php</code>.</p>
+
+<h2 id="elecciones">Elecciones y precios</h2>
+<ul>
+<li><strong>Outbox en la misma BD, no una cola externa.</strong> El primer capítulo
+asincrónico usa colas de database sin broker. El precio: sin scheduler ni workers no hay
+asincronía — y esa es la lección del capítulo, no un bug.</li>
+<li><strong>Webhook firmado, no un broker, todavía.</strong> El webhook es el puente más
+simple: cero infra nueva. Cuando las cadenas de servicios (task → billing → notificaciones →
+reportes) se vuelvan grafos, un broker real es una decisión de infraestructura, no de código.</li>
+<li><strong>La firma cubre el body exacto; los headers van aparte.</strong> Firmar el string
+del JSON evita toda la guerra de "cómo serialicé esto al firmar". Los ids y la frescura viajan
+en headers, y el receptor los usa para la ventana anti-replay sin deserializar antes de
+verificar.</li>
+<li><strong>Reintentos separados por ubicación.</strong> Los reintentos de la <em>entrega</em>
+del webhook (backoff 10/30/120) son del dispatcher; los del <em>job</em> local
+(<code>tries</code>, <code>backoff</code>) son de cada cola. Un timeout de red no se confunde
+con un fallo de dominio.</li>
+<li><strong>La firma no es autenticación de usuario.</strong> Autentica al <em>servicio</em>
+emisor (clave compartida, según config), no a la persona. El <code>user_id</code> del payload
+es el actor de negocio del evento; los permisos son de la app receptora.</li>
+<li><strong>El anti-replay es de ventana limitada.</strong> Rechaza repetidos dentro de
+<code>max_age</code>; un replay a los 3 días ya le llegó pasado de frescura — el negocio para
+esto le pone UNIQUE al elemento, como lo demuestra el último test del receptor.</li>
+</ul>
+
+</article>
+</body>
+</html>
