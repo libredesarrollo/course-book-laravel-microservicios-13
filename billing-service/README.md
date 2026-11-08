@@ -88,3 +88,25 @@ php artisan queue:failed                                     # ver los fallidos 
 php artisan queue:retry                                      # reintentar fallidos
 php artisan queue:restart                                    # tras cambiar código
 ```
+
+## Colas y eventos con RabbitMQ (b0.10)
+
+Con `QUEUE_CONNECTION=rabbitmq` los jobs de `invoices` viven en el broker en
+lugar de la tabla `jobs`. Broker arriba, desde la raíz del repo:
+
+```bash
+# desde /Users/andrescruz/demo-microservicios (la raíz)
+docker compose up -d               # rabbitmq:4-management; UI http://127.0.0.1:15672
+docker exec demo-rabbitmq rabbitmqctl list_queues --quiet name messages_ready messages_unacknowledged
+```
+
+El worker es el mismo de siempre, con el broker arriba:
+
+```bash
+php artisan queue:work --queue=invoices   # QUEUE_CONNECTION=rabbitmq
+```
+
+Si el worker muere a mitad de job, el broker reencola el mensaje (queda en
+`ready` de nuevo cuando la conexión cae) — y la factura no sale doble: la
+UNIQUE de `invoices.event_id` manda igual que con database. Volver al mundo
+b0.9 es cambiar la llave a `QUEUE_CONNECTION=database`.

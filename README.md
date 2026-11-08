@@ -46,6 +46,7 @@ ya hay sesión SSO, el IdP emite un código de un solo uso y el RP lo canjea por
 - ✅ **JWT stateless (b0.7)**: el IdP firma con RS256 y publica `/api/jwks.json`; los RPs verifican localmente — **medido: IdP caído y el RP sigue autenticando con `200` en ~5 ms**
 - ✅ **Colas y eventos (b0.9)**: `task.completed` nace en el **outbox** dentro de la misma transacción que la tarea; `outbox:dispatch` lo entrega a billing por webhook firmado con HMAC (reintentos con backoff), billing responde `202` y la factura se crea en la cola `invoices` — **medido: `200 OK` al usuario en ~8 ms con billing muerto, y una única factura aunque el evento llegue dos veces**
 - ✅ Mails desacoplados en cola (`mails`) y facturas en cola (`invoices`), con `QUEUE_CONNECTION=database` local
+- ✅ **Broker real (b0.10)**: los mismos jobs viven en RabbitMQ con `QUEUE_CONNECTION=rabbitmq` (+ `docker compose up -d`) — **medido: el mensaje vuelve a `ready` tras `kill -9` de un consumidor y la factura no se duplica con el mismo `event_id`**
 - ✅ 173 tests / 488 asserts, sin levantar los otros servicios (`Http::fake()`)
 
 ## Requisitos
@@ -286,6 +287,22 @@ outbox a los webhooks subscriptores. Con `schedule:work` corre cada minuto
 Los tres README de los servicios documentan sus comandos en "Colas y eventos
 (b0.9)".
 
+### El broker de los b0.10 (RabbitMQ)
+
+Con `QUEUE_CONNECTION=rabbitmq` (b0.10) los mismos jobs viven en el
+broker y no en la tabla `jobs`. El broker se pone en pie con Docker en la raíz
+del repo:
+
+```bash
+docker compose up -d               # rabbitmq:4-management; UI en http://127.0.0.1:15672 (guest/guest)
+docker exec demo-rabbitmq rabbitmqctl list_queues --quiet name messages_ready messages_unacknowledged
+```
+
+Los comandos de worker **no cambian**: leen la conexión de `QUEUE_CONNECTION`;
+solo asegúrate de que el broker esté arriba (`docker compose up -d`) antes de
+arrancar workers. Sin broker en pie, vuelve a `QUEUE_CONNECTION=database` y el
+sistema drena como en b0.9 — la tabla `jobs` sigue en pie para eso.
+
 ---
 
 ## Tests
@@ -377,7 +394,8 @@ al emisor y "exactamente una vez" al receptor el sistema queda usable.
 **La cola local gana para el primer capítulo.** Con `QUEUE_CONNECTION=database`
 cada servicio drena su propia tabla `jobs`, sin broker externo. Cuando el
 equipo ya tiene el patrón outbox y la idempotencia, migrar a RabbitMQ es
-cambiar el `config("queue")`: la aplicación no se entera.
+cambiar el `config("queue")`: la aplicación no se entera — y b0.10 lo demostró
+con el driver swap a `QUEUE_CONNECTION=rabbitmq`.
 
 ---
 
@@ -386,7 +404,9 @@ cambiar el `config("queue")`: la aplicación no se entera.
 ```
 demo-microservicios/
 ├── .gitignore
+├── AGENTS.md                          ← mapa del proyecto y reglas compartidas (agentes)
 ├── README.md
+├── docker-compose.yml                  ← el broker de b0.10 (rabbitmq:4-management)
 ├── docs/                              ← toda la documentación
 │   ├── FLUJO-MICROSERVICIOS.md           ← la referencia completa (con roadmap)
 │   ├── FLUJO-MICROSERVICIOS.html         ← la misma, con diagrama y modo claro/oscuro
@@ -519,9 +539,16 @@ USER_SERVICE_JWT_ISSUER=user-service
 USER_SERVICE_JWT_LEEWAY=10
 USER_SERVICE_JWKS_CACHE_TTL=3600
 
-# Colas de database b0.9: cada servicio drena su propia cola y ocupa su
-# propia tabla jobs. SYNC en esta caché local queda para tests.
-QUEUE_CONNECTION=database
+# Colas: database (b0.9) drena la tabla jobs local; rabbitmq (b0.10)
+# depende del broker del docker-compose (host/port/user de Rabbit abajo).
+QUEUE_CONNECTION=rabbitmq
+
+# RabbitMQ b0.10 — defaults que coinciden con el docker-compose de la raíz
+RABBITMQ_HOST=127.0.0.1
+RABBITMQ_PORT=5672
+RABBITMQ_USER=guest
+RABBITMQ_PASSWORD=guest
+RABBITMQ_VHOST=/
 
 # Eventos (b0.9) en task-service (productor)…
 BILLING_EVENTS_URL=http://127.0.0.1:8002/api/events
@@ -596,7 +623,7 @@ de nombres de cada aplicación.
 | 7 | API versioning | Pendiente |
 | 8 | Contratos de consumidor en CI | Pendiente |
 | 9a | Colas + eventos con outbox, webhook firmado y at-least-once idempotente | **Hecho** |
-| 9b | RabbitMQ/Kafka: el mismo patrón con mensajería dedicada | Pendiente |
+| 9b | RabbitMQ/Kafka: el mismo patrón con mensajería dedicada | **Hecho** (b0.10: RabbitMQ, driver swap) |
 | 10 | Docker + despliegue | Pendiente |
 | 11 | Octane | Pendiente |
 
@@ -621,6 +648,7 @@ note.
 | [`docs/09-resiliencia.html`](docs/09-resiliencia.html) | Recap del capítulo resiliencia: reintentos, breaker y caché |
 | [`docs/10-jwt-stateless.html`](docs/10-jwt-stateless.html) | Recap del capítulo JWT: firma del IdP, JWKS y verificación local |
 | [`docs/11-colas-y-eventos.html`](docs/11-colas-y-eventos.html) | Recap del capítulo colas: outbox, webhook firmado e idempotencia |
+| [`docs/12-rabbitmq.html`](docs/12-rabbitmq.html) | Recap del capítulo b0.10: el broker con docker compose, el driver y la redelivery |
 | [`docs/01-estructura-base.html`](docs/01-estructura-base.html) | El proyecto entero en 14 diapositivas |
 
 ---

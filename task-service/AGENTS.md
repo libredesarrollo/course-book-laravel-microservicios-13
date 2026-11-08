@@ -157,3 +157,34 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 - Run `vendor/bin/pest` to call the test runner directly. It accepts the same file path and `--filter=testName` arguments.
 
 </laravel-boost-guidelines>
+
+# demo-microservicios — reglas de task-service
+
+El mapa del proyecto, los contratos (outbox, webhook, broker) y los pitfalls compartidos
+viven en el `AGENTS.md` de la **raíz del repo**; Boost manda dentro del servicio, esto
+añade lo específico de aquí.
+
+- **:8001** · health `GET /api/health` · BD `db_tasks.sqlite` (dev). Todo comando
+  artisan corre desde ESTE directorio: un worker drena la tabla jobs de donde arranca.
+- **Rol**: PRODUCTOR del evento `task.completed`. `TaskCompletion::complete()` es
+  idempotente y emite `OutboxEvent::record('task.completed', ...)` dentro de la misma
+  `DB::transaction` que la tarea; el mail (`SendTaskCompletedEmail`, cola `mails`) se
+  despacha FUERA de la transacción. `TaskCompletedMail` NO implementa `ShouldQueue`: el
+  job es la unidad de cola (encolarlo re-duplicaba el mail como job fantasma).
+- `complete()` espera `$actor` (array) como 3er argumento: `store()` web pasa `[]`,
+  `update()` pasa `$request->validated()` — meter `traceId()` ahí rompió una vez.
+- `config/events.php` solo define `subscribers` (url, secret, events); los defaults
+  operativos viven en el paquete. `BILLING_EVENTS_SECRET` (este .env) debe ser IGUAL a
+  `TASK_EVENTS_SECRET` del `.env` de billing-service.
+- Cron en dev: `php artisan schedule:work` corre `outbox:dispatch` cada minuto
+  (`withoutOverlapping`, `routes/console.php`). A mano: `php artisan outbox:dispatch`.
+- Colas: `php artisan queue:work --queue=mails,default`; con
+  `QUEUE_CONNECTION=rabbitmq` pide el broker arriba (`docker compose up -d` en la raíz).
+- Tests: 91/215 con `php artisan test --compact`; `EventOutboxTest` (tests del paquete
+  productor) corre con sqlite `:memory:` y `QUEUE_CONNECTION=sync`; HTTP saliente siempre
+  `Http::fake()`; ninguna prueba pide otro servicio ni el broker en pie.
+- Si editas migraciones del paquete
+  (`packages/microservices-events/database/migrations/…`), replica byte a byte la copia
+  publicada `database/migrations/2026_11_04_113649_create_outbox_tables.php` (y
+  viceversa).
+

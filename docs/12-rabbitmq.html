@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="RabbitMQ en el demo de microservicios: el mismo contrato de colas migrado a un broker real con el driver vladimir-yuldashev/laravel-queue-rabbitmq; docker compose con rabbitmq:4-management, colas durable, redelivery del broker tras la muerte del worker y la idempotencia de billing intacta.">
+<meta name="keywords" content="microservicios, laravel, rabbitmq, amqp, docker compose, redelivery, at-least-once, idempotencia, queue, outbox">
+<title>RabbitMQ: el mismo contrato, broker de verdad — demo-microservicios</title>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "RabbitMQ: el mismo contrato, broker de verdad",
+  "about": ["rabbitmq", "amqp", "queues", "docker compose", "redelivery", "at-least-once", "idempotencia", "microservicios", "laravel"],
+  "inLanguage": "es"
+}
+</script>
+</head>
+<body>
+<article>
+
+<header>
+<h1>RabbitMQ: el mismo contrato, broker de verdad</h1>
+<p><em>Capítulo de la serie de microservicios. En b0.9 el outbox y la idempotencia quedaron
+amarrados con colas de <code>database</code>: cada servicio drenaba su propia tabla
+<code>jobs</code>. Este capítulo compra la promesa de entonces — "migrar a RabbitMQ es cambiar
+el <code>config('queue')</code>, la aplicación no se entera" — y la cumple: los jobs viajan
+por un broker real, sin tocar una línea de dominio.</em></p>
+</header>
+
+<nav>
+<h2>Contenido</h2>
+<ol>
+<li><a href="#cambio">Lo que cambia y lo que no</a></li>
+<li><a href="#broker">El broker: docker compose con management UI</a></li>
+<li><a href="#paquete">El paquete del driver y su instalación</a></li>
+<li><a href="#config">La conexión <code>rabbitmq</code> en config/queue.php</a></li>
+<li><a href="#env">La llave .env que lo decide todo</a></li>
+<li><a href="#declaracion">Cómo declaran las colas a sí mismas</a></li>
+<li><a href="#evidencia">Verificación real: tres saltos y facturas</a></li>
+<li><a href="#redelivery">La prueba de honor: el worker muere, el mensaje vuelve</a></li>
+<li><a href="#idempotencia">La idempotencia no se compra; se mantiene</a></li>
+<li><a href="#precios">Elecciones y precios</a></li>
+</ol>
+</nav>
+
+<h2 id="cambio">Lo que cambia y lo que no</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Queda igual</th><th>Cambia</th></tr>
+<tr><td>El outbox: el evento <code>task.completed</code> sigue naciendo en la transacción de la tarea</td><td>El transporte de jobs: la tabla <code>jobs</code> de cada servicio deja de guardar mensajes</td></tr>
+<tr><td>El webhook firmado con HMAC y su middleware <code>events.verify</code></td><td>El <code>QUEUE_CONNECTION</code>: de <code>database</code> a <code>rabbitmq</code></td></tr>
+<tr><td><code>CreateInvoiceFromEvent</code>, <code>SendTaskCompletedEmail</code> y sus reintentos</td><td>El demonio local: RabbitMQ corre en Docker, no en el sqlite del servicio</td></tr>
+<tr><td>La idempotencia: cache anti-replay + UNIQUE en <code>invoices.event_id</code></td><td>Nada más. Ni exporters, ni interfaces, ni un solo método de dominio</td></tr>
+</table>
+<p>Esta es la tesis del capítulo: al comprar colas en b0.9, el sistema ya hablaba un contrato
+(at-least-once + reintentos + idempotencia en el receptor). El broker cumple ese mismo
+contrato por hardware; las aplicaciones no se enteran.</p>
+
+<h2 id="broker">El broker: docker compose con management UI</h2>
+<p>RabbitMQ puesto en pie en la raíz del proyecto:</p>
+
+<pre><code># docker-compose.yml (raíz del repo)
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: demo-rabbitmq
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # management UI (guest/guest)
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  rabbitmq-data:</code></pre>
+<p>El arranque requiere Docker Desktop encendido. Con el daemon vivo:</p>
+<pre><code>docker compose up -d
+# La UI queda en http://127.0.0.1:15672 (guest/guest)
+# Y el chequeo de vida:
+docker exec demo-rabbitmq rabbitmqctl list_queues --quiet name messages_ready messages_unacknowledged</code></pre>
+
+<h2 id="paquete">El paquete del driver y su instalación</h2>
+<p>El driver oficial para Laravel es
+<code>vladimir-yuldashev/laravel-queue-rabbitmq</code> — su <code>v15.0.2</code> exige
+<code>illuminate/queue ^13</code> y <code>php-amqplib 3.6</code>. En los dos servicios que
+hablan en colas (task y billing; el IdP no tiene):</p>
+
+<pre><code># task-service/ y billing-service/, por separado
+composer require vladimir-yuldashev/laravel-queue-rabbitmq:^15.0.2</code></pre>
+
+<p>El paquete registra su conector y hace <code>mergeConfigFrom</code> sobre
+<code>queue.connections.rabbitmq</code>, así que declarar la conexión en el propio
+<code>config/queue.php</code> del servicio es la forma cache-safe de explicitarla — y la forma
+que el curso usa.</p>
+
+<h2 id="config">La conexión <code>rabbitmq</code> en config/queue.php</h2>
+<p>Igual en task-service y billing-service:</p>
+<pre><code>// config/queue.php (ambos servicios)
+'rabbitmq' => [
+    'driver' => 'rabbitmq',
+    'queue' => env('RABBITMQ_QUEUE', 'default'),
+    'hosts' => [
+        [
+            'host' => env('RABBITMQ_HOST', '127.0.0.1'),
+            'port' => env('RABBITMQ_PORT', 5672),
+            'user' => env('RABBITMQ_USER', 'guest'),
+            'password' => env('RABBITMQ_PASSWORD', 'guest'),
+            'vhost' => env('RABBITMQ_VHOST', '/'),
+        ],
+    ],
+    'options' => [],
+    'worker' => env('RABBITMQ_WORKER', 'default'),
+],</code></pre>
+
+<h2 id="env">La llave .env que lo decide todo</h2>
+<pre><code># .env de task-service y billing-service
+QUEUE_CONNECTION=rabbitmq</code></pre>
+<p>Con eso, los comandos de siempre no cambian ni un carácter: el worker sigue siendo
+<code>php artisan queue:work</code> — ahora lee la conexión del env. Timeout de puerto
+5672 y UI de management quedan fuera del código. Para volver al mundo de b0.9 solo cambia la
+llave de vuelta (<code>QUEUE_CONNECTION=database</code>), porque la tabla <code>jobs</code> y
+el driver <code>database</code> siguen respaldados en la config.</p>
+
+<h2 id="declaracion">Cómo declaran las colas a sí mismas</h2>
+<p>El driver no necesita pre-crear colas a mano: el <code>pushRaw</code> de
+<code>RabbitMQQueue</code> llama <code>declareDestination</code>, y si la cola no existe la
+declara <strong>durable</strong> antes de publicar. Por eso, despachar
+<code>SendTaskCompletedEmail</code> a la cola <code>mails</code> sin worker en pie crea la cola
+en el broker y el mensaje sobrevive allí. La management UI lo muestra: colas
+<code>default</code>, <code>mails</code>, <code>invoices</code> y sus lateralidades
+<code>mails.delay.5000</code>, <code>mails.delay.15000</code> para reintentos con backoff —
+el driver implementa el <code>delay</code> de Laravel con colas de TTL y deadletter.</p>
+
+<h2 id="evidencia">Verificación real: tres saltos y facturas</h2>
+<ol>
+<li>Tarea <em>11</em> completada vía API con el JWT (<code>PUT /api/tasks/11</code>):
+<code>52.2 ms</code>, la respuesta no espera al email ni a billing.</li>
+<li><code>php artisan outbox:dispatch</code> en task-service:
+<code>Entregas nuevas: 1 (128 ms)</code> — webhook firmado de por medio; el flujo de b0.9
+intacto.</li>
+<li>El broker recibe: <code>mails 1</code> y <code>invoices 1</code> listas, las colas se
+declararon solas.</li>
+<li>Workers con el comando nuevo:
+<code>php artisan queue:work rabbitmq --queue=mails,default --stop-when-empty</code> en
+task-service → <code>SendTaskCompletedEmail DONE 44ms</code>; y
+<code>php artisan queue:work rabbitmq --queue=invoices --stop-when-empty</code> en
+billing-service → <code>CreateInvoiceFromEvent DONE 19ms</code> → factura
+<em>6</em> con <code>amount 10</code>.</li>
+</ol>
+<p>Y una trampa real del capítulo: el worker arrancado fuera del directorio del servicio no
+encuentra ni BD ni env — <code>php artisan queue:work</code> drena el sqlite del directorio
+donde esté parado. Los comandos corren <em>dentro</em> de cada servicio.</p>
+
+<h2 id="redelivery">La prueba de honor: el worker muere, el mensaje vuelve</h2>
+<p>El contrato del broker es at-least-once y aquí está la evidencia de laboratorio:</p>
+<ol>
+<li>Un mail real en la cola: <code>mails 1 ready</code>.</li>
+<li>Un consumidor que toma el mensaje y <strong>no</strong> lo reconoce: RabbitMQ lo marca
+<code>unacked</code> y no lo deja listo de nuevo mientras el consumidor viva.</li>
+<li><code>kill -9</code> al consumidor: al caer la conexión, RabbitMQ libera el mensaje →
+<code>mails: 0 unacked → 1 ready</code>. El mensaje no se perdió; el broker lo devolvió.</li>
+<li>El worker normal de Laravel lo procesa: <code>SendTaskCompletedEmail DONE 47.57ms</code> —
+el mail llega <strong>una</strong> vez.</li>
+</ol>
+<p>Un detalle que vale la nota al pie: esa redelivery no le incrementa los
+<code>attempts</code> del payload de Laravel — el contador de reintentos del job no se entera;
+es del broker. Los dos niveles (reintentos de job y redelivery de broker) viven por separado.</p>
+
+<h2 id="idempotencia">La idempotencia no se compra; se mantiene</h2>
+<p>Se re-despachó <code>CreateInvoiceFromEvent</code> con el mismo <code>event_id</code> ya
+facturado. El job corrió, respondió <code>DONE</code> en 14 ms y no creó factura doble: la
+<code>UNIQUE</code> en <code>invoices.event_id</code> más el catch de
+<code>UniqueConstraintViolationException</code> hicieron su trabajo bajo el broker, igual que
+con colas de database. La responsabilidad de "una sola vez" no migró al broker: sigue cargada
+en el receptor.</p>
+
+<h2 id="precios">Elecciones y precios</h2>
+<ul>
+<li><strong>Driver swap, motivo de este capítulo.</strong> Webhooks del paquete intactos;
+nadie del dominio lee RabbitMQ. El precio: para que valga aquí, RabbitMQ tiene que estar en
+pie — sin Docker el broker no existe y toca revolver de vuelta a
+<code>QUEUE_CONNECTION=database</code>.</li>
+<li><strong>Reintentos de job en el driver delay-queues.</strong> El backoff
+<code>[5, 15]</code> del mail se refleja como <code>mails.delay.5000</code> — no es una tabla
+<code>delayed</code> como en database; la cola lateral retiene el mensaje con TTL, y al
+expirar lo reenvía por su dead-letter a la cola de destino.</li>
+<li><strong>El <code>outbox:dispatch</code> no cambió.</strong> El webhook es HTTP, así que
+sus reintentos siguen siendo del despachador (config <code>events</code>). Publicar los
+eventos por un exchange AMQP — el broker gestionando la entrega del webhook — es un capítulo
+aparte: ahí sí el paquete de eventos cambia de forma.</li>
+<li><strong>Seguridad del broker queda para producción.</strong> <code>guest</code> en
+vhost <code>/</code> sirve para el demo: el cambio de usuario, TLS y virtual hosts por
+servicio no afecta el código de los jobs.</li>
+<li><strong>Los tests no necesitan broker.</strong> El <code>phpunit.xml</code> fija
+<code>QUEUE_CONNECTION=sync</code>; las suites de los tres servicios (91/215, 65/220,
+17/53) quedaron verdes sin tocar Docker — las pruebas ni se enteran de que el broker existe.</li>
+</ul>
+
+</article>
+</body>
+</html>

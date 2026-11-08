@@ -94,3 +94,26 @@ php artisan queue:restart                                    # tras cambiar cód
 
 > Ojo: cada `queue:work` drena la tabla `jobs` del servicio donde corre.
 > Correrlo desde task-service no drena la cola de billing, ni al revés.
+
+## Colas y eventos con RabbitMQ (b0.10)
+
+Con `QUEUE_CONNECTION=rabbitmq` los mismos jobs viven en el broker en vez de
+en la tabla `jobs`. El broker corre en Docker desde la **raíz** del repo:
+
+```bash
+# desde /Users/andrescruz/demo-microservicios (la raíz)
+docker compose up -d               # rabbitmq:4-management; UI http://127.0.0.1:15672
+```
+
+Aquí el comando del worker **no cambia de forma** (lee la conexión del env);
+solo pide el broker arriba:
+
+```bash
+php artisan queue:work --queue=mails,default   # QUEUE_CONNECTION=rabbitmq
+```
+
+El `outbox:dispatch`/`schedule:work` del capítulo b0.9 sigue idéntico: el
+webhook de los eventos es HTTP y no pasa por el broker. Bajar el broker o
+cambiar la llave de vuelta (`QUEUE_CONNECTION=database`) revierte el mundo sin
+tocar código. El driver declara las colas (`durable`) al despachar, y los
+reintentos con backoff aparecen como colas laterales `mails.delay.*`.

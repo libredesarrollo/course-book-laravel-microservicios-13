@@ -158,3 +158,24 @@ This project has domain-specific skills available in `**/skills/**`. You MUST ac
 - After the feature tests pass, ask the user to run the complete suite with `php artisan test --compact`.
 
 </laravel-boost-guidelines>
+
+# demo-microservicios — reglas de user-service
+
+El mapa del proyecto y los contratos compartidos viven en el `AGENTS.md` de la **raíz del
+repo**; Boost manda dentro del servicio, esto añade lo específico de aquí.
+
+- **:8000** · health `GET /api/health` · BD `db_users.sqlite` (dev). Todo comando artisan
+  corre desde ESTE directorio; un `serve` fuera de aquí responde con el health check de
+  otro servicio.
+- **Rol**: IdP de la serie. Autenticación de la serie: login rate-limited
+  (por cuenta y por IP), tokens con TTL (`expires_at`), JWT RS256 (`/api/jwks.json`),
+  SSO con canje de código y single logout; los RPs verifican localmente con la JWKS
+  (caché 3600 s, leeway 10, issuer `user-service`).
+- **No participa en colas ni eventos** (no tiene `jobs`): no añadir dependencias de
+  `microservices-events` ni drivers de cola aquí; el IdP queda fuera del grafo asíncrono.
+- Refresh de sesión web ya existe (b0.7); el refresh de tokens API sigue pendiente (no
+  iniciarlo sin pedirlo al usuario).
+- Tests: 65/220 con `php artisan test --compact`; contra task/billing solo con
+  `Http::fake()` del cliente del paquete `microservices-user-service-client` — ninguna
+  prueba pide otros servicios en pie.
+

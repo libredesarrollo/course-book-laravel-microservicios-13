@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="RabbitMQ en el demo de microservicios con Laravel: docker compose con rabbitmq:4-management, el driver vladimir-yuldashev/laravel-queue-rabbitmq y el swap de QUEUE_CONNECTION; el outbox y el webhook de b0.9 quedan intactos y el broker entrega los jobs con redelivery tras matar al worker.">
+<meta name="keywords" content="microservicios, laravel, rabbitmq, docker compose, colas, amqp, redelivery, at-least-once, idempotencia, queue">
+<title>RabbitMQ: los jobs salen de la tabla y van a un broker de verdad</title>
+</head>
+<body>
+<article>
+
+<h1>RabbitMQ: los jobs salen de la tabla y van a un broker de verdad</h1>
+
+<h2>De la promesa al capítulo</h2>
+
+<p>Recuerda que ya este es el video diez, en el cual estamos construyendo una aplicación
+sencilla de microservicios para conocer cómo funciona todo esto. Es necesario que sepas los
+conceptos anteriores; en este caso no voy a hacer un resumen porque se me va la mitad del
+video en eso, pero por aquí tienes enlaces, y con el código fuente al final, he etiquetado el
+video por partes para que lo tengas presente. Así que ahora sí vamos a comenzar, te voy a
+explicar un poco por encima lo más importante, y tú ya puedes profundizar un poquito más en
+el código.</p>
+
+<p>Este capítulo es la consecuencia directa del capítulo anterior. Primeramente te comento que
+previamente ya teníamos resuelto el objeto de este capítulo en el fondo: cuando una tarea
+está completada, se dispara un evento, que llega al servicio de billing, el cual crea una
+factura (invoice) por ese evento. Ese flujo <em>solo</em> es posible por el trabajo anterior:
+el patrón outbox, el webhook firmado con HMAC, los reintentos con backoff y, del lado del
+receptor, la idempotencia.</p>
+
+<p>Entonces, en el capítulo anterior los mensajes —los jobs de los correos, los de las
+facturas— se guardan en una tabla <code>jobs</code> en la base de datos de cada servicio, y
+el worker los drena de allí. Lo comentado antes fue: cuando el equipo tenga este patrón bien
+instalado y demostrado, migrar a un broker real es cambiar una llave de configuración — la
+aplicación no cambia de forma. Pues entonces, este es el capítulo donde lo hacemos: con
+RabbitMQ. Sin tocar nada de esa lógica, los jobs pasan a un broker de verdad, con Docker en
+piedra de demostración.</p>
+
+<h2>El paquete del driver (y los comandos de siempre)</h2>
+
+<p>Fíjate que aquí tienes el detalle completo en el documento que generó la inteligencia
+artificial: <a href="docs/12-rabbitmq.html"><code>docs/12-rabbitmq.html</code></a>. Y bueno,
+básicamente creamos el broker con Docker, instalamos el driver y cambiamos una llave.</p>
+
+<p>Primero, el broker. Aquí tienes el <code>docker-compose.yml</code> en la raíz del
+proyecto, el cual levanta RabbitMQ con su management UI:</p>
+
+<pre><code># docker-compose.yml (raíz del repo)
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: demo-rabbitmq
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # management UI (guest/guest)
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  rabbitmq-data:</code></pre>
+
+<p>Para que el broker esté en pie, tienes que tener Docker Desktop abierto (el demonio) y
+desde la raíz del repo ejecutas los siguientes comandos:</p>
+
+<pre><code>docker compose up -d
+docker exec demo-rabbitmq rabbitmqctl list_queues --quiet name messages_ready messages_unacknowledged</code></pre>
+
+<p>La UI queda en <code>http://127.0.0.1:15672</code> con <code>guest/guest</code>: ahí verás
+las colas y los contadores de mensajes.</p>
+
+<p>El driver: <code>vladimir-yuldashev/laravel-queue-rabbitmq</code>, que es el paquete
+oficial de Laravel para este broker; la versión <code>15.0.2</code> que exige
+<code>illuminate/queue ^13</code> y <code>php-amqplib 3.6</code>. En los dos servicios que
+hablan en colas (task y billing; el IdP no tiene):</p>
+
+<pre><code># task-service/ y billing-service/, por separado
+composer require vladimir-yuldashev/laravel-queue-rabbitmq:^15.0.2</code></pre>
+
+<p>Una clave aquí: el driver autodeclara las colas — el <code>pushRaw</code> llama
+<code>declareDestination</code> y, si la cola no existe, la declara <strong>durable</strong>
+antes de publicar. Por eso, despachar el mail a la cola <code>mails</code> sin ningún worker
+en pie ya crea la cola en el broker y el mensaje sobrevive allí.</p>
+
+<h2>La conexión 'rabbitmq' en el config</h2>
+
+<p>El paquete hace <code>mergeConfigFrom</code> sobre
+<code>queue.connections.rabbitmq</code>, así que declaro la conexión en el propio
+<code>config/queue.php</code> del servicio, que es a la vez cache-segura y autodocumentada.
+La conexión es idéntica en task-service y billing-service:</p>
+
+<pre><code>// config/queue.php (ambos servicios)
+'rabbitmq' => [
+    'driver' => 'rabbitmq',
+    'queue' => env('RABBITMQ_QUEUE', 'default'),
+    'hosts' => [
+        [
+            'host' => env('RABBITMQ_HOST', '127.0.0.1'),
+            'port' => env('RABBITMQ_PORT', 5672),
+            'user' => env('RABBITMQ_USER', 'guest'),
+            'password' => env('RABBITMQ_PASSWORD', 'guest'),
+            'vhost' => env('RABBITMQ_VHOST', '/'),
+        ],
+    ],
+    'options' => [],
+    'worker' => env('RABBITMQ_WORKER', 'default'),
+],</code></pre>
+
+<p>Y luego la llave que decide todo: en el <code>.env</code> de task-service y
+billing-service, la conexión de cola deja de ser la tabla de la BD:</p>
+
+<pre><code># .env (task-service y billing-service)
+QUEUE_CONNECTION=rabbitmq</code></pre>
+
+<p>¡Eso es todo el código! Ni exporters, ni interfaces, ni un solo método de dominio: el
+outbox sigue emitiendo el evento dentro de la transacción, el webhook sigue firmado con HMAC
+y con los reintentos del despachador, y la idempotencia del receptor no cambia. El cableado
+de todo esto es la propia llave de <code>QUEUE_CONNECTION</code>, y los comandos
+<code>queue:work</code> son los mismos de siempre: ahora leen la conexión del env.</p>
+
+<h2>La demo</h2>
+
+<p>Terminados los preparativos, vamos con la demo. Los comandos de worker no cambian; solo
+piden el broker arriba:</p>
+
+<pre><code># terminal task-service (cola de mails con el broker)
+php artisan queue:work --queue=mails,default
+
+# terminal billing-service (facturas con el broker)
+php artisan queue:work --queue=invoices</code></pre>
+
+<p>Para la demo, creé una tarea nueva vía API con el JWT y luego la marqué como completada
+con un <code>PUT /api/tasks/11</code>: <code>52 ms</code> para el usuario, como antes. Después
+corro el cartero (<code>php artisan outbox:dispatch</code> en task-service):
+<code>Entregas nuevas: 1 (128 ms)</code> — webhook firmado de por medio, el flujo de b0.9
+intacto. Y ahora sí: miro el broker:</p>
+
+<pre><code>name     messages_ready
+mails    1
+invoices 1</code></pre>
+
+<p>Las dos colas quedaron declaradas solas en el broker. Y entonces, el momento de la
+verdad: <strong>la factura nace en billing</strong>, con los jobs ya viajando por
+RabbitMQ:</p>
+
+<pre><code># task-service
+App\Jobs\SendTaskCompletedEmail .. DONE 44.34ms
+
+# billing-service
+App\Jobs\CreateInvoiceFromEvent .. DONE 19.06ms</code></pre>
+
+<p>En la base de datos de billing aparece la factura <em>6</em>, "Medir zookeeper con
+rabbitmq", con <code>amount 10</code>.</p>
+
+<h2>La prueba de honor: si el worker muere, el mensaje vuelve</h2>
+
+<p>La pregunta de honor aquí es: si el worker muere a mitad de un job, ¿qué pasa con el
+mensaje? La demostración que hice fue con un mail real en la cola (<code>mails 1
+ready</code>): un consumidor tomó el mensaje y no lo reconoció — quedó
+<code>unacknowledged</code>, retenido. Le hice <code>kill -9</code> a ese consumidor: al caer
+la conexión, RabbitMQ libera el mensaje. Ahí mismo se ve en el listado del broker:
+<code>unacked</code> pasa de <code>1</code> a <code>0</code> y el mensaje vuelve a
+<code>ready</code> (<code>mails 1</code>). Con el worker de siempre, el mensaje se procesa
+otra vez y el mail llega <strong>una</strong> vez.</p>
+
+<p>Y un detalle que vale la nota al pie: esa redelivery del broker no incrementa los
+<code>attempts</code> del payload de Laravel: el contador de reintentos del job no se entera;
+son dos niveles, y viven por separado. Los reintentos de Laravel (los
+<code>tries</code>/<code>backoff</code> de cada job) siguen existiendo — si el job falla, el
+driver lo devuelve con un <code>delay</code> que se materializa como colas laterales
+<code>mails.delay.5000</code> y <code>mails.delay.15000</code>, de modo que la cola
+lateral con TTL retiene el mensaje y, al expirar, lo reenvía a la cola de destino.</p>
+
+<h2>La idempotencia no se compra con el broker</h2>
+
+<p>Se re-despachó el mismo evento ya facturado (el mismo <code>event_id</code>). El job
+corrió, respondió <code>DONE</code>, y <strong>no</strong> se creó factura doble: la
+UNIQUE en <code>invoices.event_id</code> más el catch de
+<code>UniqueConstraintViolationException</code> siguen mandando. La responsabilidad de "una
+sola vez" no migró al broker — sigue cargada en el receptor.</p>
+
+<h2>Cierre</h2>
+
+<p>Con este capítulo, el sistema ya tiene su pieza asincrónica de verdad: los jobs viven en
+un broker, con su management UI y su redelivery, y el demo de colas locales de b0.9 convive
+con este — cambiar la llave del <code>env</code> te lleva del mundo local al broker y de
+vuelta. Y lo más bonito es lo que no tocamos: si en el futuro queremos publicar los eventos
+por un exchange de RabbitMQ y no solo los jobs, lo que toca añadir es una pieza nueva en el
+paquete de eventos, sin tocar las aplicaciones: la lección de siempre de esta serie.</p>
+
+<p>Sin más que decir, espero que al menos esto te resulte interesante. Un poco lo mencionado
+antes: mi propósito aquí no es hacer todo esto de gratis — realmente esto avanza de la mano
+con un curso completo —, sino explicar un poco más superficial cómo funciona esto, porque yo
+tampoco soy para nada experto en esto. Pero, me parece, por más que sea interesante practicar
+un poquito con esto, entenderlo al menos de manera superficial, y pues nada: ya sabes que
+cuando alguien te vaya a hablar de microservicios, puedes al menos saber a lo que te
+enfrentas.</p>
+
+<p>Sin más que decir: código fuente y los comandos de este capítulo — con el
+<code>composer require</code>, el <code>docker compose up -d</code> y los <code>queue:work</code>
+de cada servicio — los dejo en el <code>README</code> de cada uno de los servicios y en el
+documento <code>docs/12-rabbitmq.html</code>. Continuamos en la siguiente clase.</p>
+
+</article>
+</body>
+</html>
